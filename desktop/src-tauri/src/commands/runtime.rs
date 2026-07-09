@@ -187,8 +187,8 @@ pub(crate) async fn start_proxy(
     run_blocking(move || start_proxy_inner_cmd(app, state, lifecycle)).await
 }
 
-fn start_proxy_inner_cmd(
-    app: tauri::AppHandle,
+fn start_proxy_inner_cmd<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: SharedAppState,
     lifecycle: SharedLifecycle,
 ) -> Result<serde_json::Value, String> {
@@ -658,6 +658,28 @@ esac
         panic!("mock service on port {port} did not become reachable");
     }
 
+    fn wait_http_unreachable(port: u16) {
+        for _ in 0..50 {
+            if TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("mock service on port {port} remained reachable");
+    }
+
+    fn kill_tracked_proxy(state: &SharedAppState, proxy_port: u16) {
+        let mut proxy_child = {
+            let mut st = lock(state);
+            assert_eq!(st.proxy_port, proxy_port);
+            assert!(!st.secret.is_empty());
+            st.proxy.take().expect("proxy child should be tracked")
+        };
+        let _ = proxy_child.kill();
+        let _ = proxy_child.wait();
+        wait_http_unreachable(proxy_port);
+    }
+
     #[test]
     #[ignore = "explicit isolated runtime smoke; uses fake Science and local loopback ports"]
     fn isolated_one_click_reuse_status_smoke_with_fake_science() {
@@ -793,6 +815,170 @@ esac
         let opened = fs::read_to_string(&open_log).unwrap_or_default();
         assert!(!opened.contains(fake_key));
         assert!(!opened.contains(&secret));
+        for name in ["proxy.log", "sandbox.log", "operation.log"] {
+            let body = fs::read_to_string(config_dir.join("logs").join(name))
+                .unwrap_or_else(|e| panic!("expected {name} to exist: {e}"));
+            assert!(!body.contains(fake_key), "{name} leaked fake key");
+            assert!(!body.contains(&secret), "{name} leaked path secret");
+        }
+
+        {
+            let mut st = lock(&state);
+            let AppState {
+                sandbox,
+                sandbox_url,
+                ..
+            } = &mut *st;
+            let _ = science::stop_sandbox(&handle, sandbox, sandbox_url);
+            st.stop_proxy();
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[ignore = "explicit isolated recovery proof; uses fake Science and local loopback ports"]
+    fn isolated_manual_actions_recover_dead_proxy_with_fake_science() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let tmp = tmpdir("isolated-recovery-proof");
+        let home = tmp.join("home");
+        let bin_dir = tmp.join("bin");
+        fs::create_dir_all(&home).unwrap();
+        let fake_science = write_test_bins(&bin_dir);
+        let open_log = tmp.join("open.log");
+        let mock_upstream_port = start_mock_upstream();
+        let proxy_port = free_port();
+        let sandbox_port = free_port();
+        assert_ne!(proxy_port, sandbox_port);
+
+        let mut env_guard = EnvGuard::new();
+        env_guard.set("HOME", &home);
+        env_guard.set("CSSWITCH_REPO", &root);
+        env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
+        env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
+        env_guard.set(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                bin_dir.to_string_lossy()
+            ),
+        );
+
+        let fake_key = "csswitch-isolated-fake-key-never-log";
+        let profile = Profile {
+            id: "mock-relay".into(),
+            name: "Mock Relay".into(),
+            template_id: "custom".into(),
+            category: "custom".into(),
+            api_format: "anthropic".into(),
+            base_url: format!("http://127.0.0.1:{mock_upstream_port}/anthropic"),
+            api_key: fake_key.into(),
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        let cfg = Config {
+            profiles: vec![profile],
+            active_id: "mock-relay".into(),
+            proxy_port,
+            sandbox_port,
+            ..Default::default()
+        };
+        let config_dir = config::default_dir();
+        config::save_to(&config_dir, &cfg).unwrap();
+
+        let state: SharedAppState = Arc::new(Mutex::new(AppState::default()));
+        let lifecycle = Arc::new(lifecycle::Lifecycle::new());
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(lifecycle.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let handle = app.handle().clone();
+
+        let first =
+            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
+                .expect("first one-click should start proxy and sandbox");
+        assert_eq!(first["action"], "started");
+        assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        wait_http_health(proxy_port);
+        wait_http_health(sandbox_port);
+        let fake_state_dir = home
+            .join(".csswitch")
+            .join("sandbox")
+            .join("home")
+            .join(".claude-science")
+            .join("fake-science");
+        let first_pid = fs::read_to_string(fake_state_dir.join("pid")).unwrap();
+
+        kill_tracked_proxy(&state, proxy_port);
+
+        let down_status = super::status(app.state::<SharedAppState>());
+        assert_eq!(down_status["proxy"], "amber");
+        assert_eq!(down_status["sandbox"], "green");
+        assert_eq!(down_status["last_error"]["type"], "proxy_unhealthy");
+        assert_eq!(
+            down_status["last_error"]["message"],
+            "代理进程不可达或已退出，请点击「一键开始」或「启动代理」恢复。"
+        );
+        assert_eq!(down_status["last_error"]["port"], proxy_port);
+
+        let start_proxy_recovered =
+            super::start_proxy_inner_cmd(handle.clone(), state.clone(), lifecycle.clone())
+                .expect("start_proxy should manually recover a dead proxy");
+        assert_eq!(start_proxy_recovered["port"], proxy_port);
+        wait_http_health(proxy_port);
+
+        let start_proxy_status = super::status(app.state::<SharedAppState>());
+        assert_eq!(start_proxy_status["proxy"], "green");
+        assert_eq!(start_proxy_status["sandbox"], "green");
+        assert_eq!(start_proxy_status["upstream"], "green");
+        assert!(start_proxy_status["last_error"].is_null());
+
+        kill_tracked_proxy(&state, proxy_port);
+        let down_again_status = super::status(app.state::<SharedAppState>());
+        assert_eq!(down_again_status["proxy"], "amber");
+        assert_eq!(down_again_status["sandbox"], "green");
+        assert_eq!(down_again_status["last_error"]["type"], "proxy_unhealthy");
+
+        let recovered =
+            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
+                .expect("one-click should manually recover a dead proxy");
+        assert_eq!(recovered["action"], "reopened");
+        assert_eq!(
+            recovered["msg"],
+            "已用新配置重启代理，Science 沿用不变，已重新打开 Science。"
+        );
+        assert_eq!(recovered["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        wait_http_health(proxy_port);
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("pid")).unwrap(),
+            first_pid
+        );
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
+            "1"
+        );
+
+        let recovered_status = super::status(app.state::<SharedAppState>());
+        assert_eq!(recovered_status["proxy"], "green");
+        assert_eq!(recovered_status["sandbox"], "green");
+        assert_eq!(recovered_status["upstream"], "green");
+        assert!(recovered_status["last_error"].is_null());
+
+        let cfg_after = config::load_from(&config_dir).unwrap();
+        let secret = cfg_after.secret;
+        assert!(!secret.is_empty());
+        assert!(!down_status.to_string().contains(fake_key));
+        assert!(!down_status.to_string().contains(&secret));
+        assert!(!recovered.to_string().contains(fake_key));
+        assert!(!recovered.to_string().contains(&secret));
+        assert!(!recovered_status.to_string().contains(fake_key));
+        assert!(!recovered_status.to_string().contains(&secret));
         for name in ["proxy.log", "sandbox.log", "operation.log"] {
             let body = fs::read_to_string(config_dir.join("logs").join(name))
                 .unwrap_or_else(|e| panic!("expected {name} to exist: {e}"));
