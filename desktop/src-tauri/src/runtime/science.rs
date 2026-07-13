@@ -73,14 +73,6 @@ pub(crate) fn first_http_url(stdout: &str) -> Option<String> {
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .metadata()
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-}
-
-fn is_explicit_executable_file(path: &Path) -> bool {
     if !path.is_absolute() {
         return false;
     }
@@ -93,6 +85,14 @@ fn is_explicit_executable_file(path: &Path) -> bool {
             Err(_) => return false,
         }
     }
+    path.is_file()
+        && path
+            .metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+fn is_explicit_executable_file(path: &Path) -> bool {
     is_executable_file(path)
 }
 
@@ -302,10 +302,10 @@ fn science_status_value(out: &Output) -> Option<bool> {
 
 #[cfg(test)]
 fn trusted_science_status(out: &Output) -> Option<bool> {
-    if out.status.success() {
-        science_status_value(out)
-    } else {
-        None
+    match science_status_value(out) {
+        Some(false) => Some(false),
+        Some(true) if out.status.success() => Some(true),
+        _ => None,
     }
 }
 
@@ -389,10 +389,11 @@ fn listener_uses_runtime(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
     if !text_files.status.success() {
         return false;
     }
-    let expected = format!("n{}", expected.display());
-    String::from_utf8(text_files.stdout)
-        .ok()
-        .is_some_and(|stdout| stdout.lines().any(|line| line == expected))
+    String::from_utf8_lossy(&text_files.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter_map(|path| Path::new(path).canonicalize().ok())
+        .any(|path| path == expected)
 }
 
 /// Return the sandbox UI URL, falling back to the plain localhost port.
@@ -536,10 +537,9 @@ pub(crate) fn stop_sandbox<R: Runtime>(
                     Err(e) => err = Some(format!("调用停止沙箱脚本失败：{e}")),
                 }
             } else {
-                err = Some(format!(
-                    "找不到停止脚本 {}，无法确认沙箱已停止（沙箱可能仍在运行）。",
-                    stop.display()
-                ));
+                err = Some(
+                    "找不到打包的停止脚本，无法确认沙箱已停止（沙箱可能仍在运行）。".to_string(),
+                );
             }
         }
         None => {
@@ -677,7 +677,20 @@ mod tests {
         }
         assert_eq!(
             trusted_science_status(&status_output(1, r#"{"running":false}"#)),
-            None
+            Some(false),
+            "a stopped daemon may be reported with a non-zero CLI exit"
+        );
+    }
+
+    #[test]
+    fn known_runtime_state_requires_listener_binary_match() {
+        assert_eq!(
+            classify_known_runtime_state(Some(true), true, true, true),
+            SandboxScienceState::RunningHealthy
+        );
+        assert_eq!(
+            classify_known_runtime_state(Some(true), true, true, false),
+            SandboxScienceState::Unknown
         );
         assert_eq!(
             runtime_status_value(&status_output(1, r#"{"running":false}"#)),
@@ -801,6 +814,32 @@ mod tests {
             science_runtime_preflight_for_paths(&data_dir, None, &app_bin)?["status"],
             "missing"
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cached_runtime_symlink_is_never_offered_or_executed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_temp_dir("science-cache-symlink")?;
+        let data_dir = root.join("home").join(".claude-science");
+        let cached_bin = data_dir.join("bin").join("claude-science");
+        let target = root.join("target-claude-science");
+        let missing_app = root.join("missing-app-claude-science");
+        write_fake_version_bin(&target, 0o755, "fake-target-1")?;
+        fs::create_dir_all(cached_bin.parent().expect("cached parent"))?;
+        symlink(&target, &cached_bin)?;
+
+        let preflight = science_runtime_preflight_for_paths(&data_dir, None, &missing_app)?;
+        assert_eq!(preflight["status"], "missing");
+        assert!(select_science_runtime_for_paths(
+            &data_dir,
+            None,
+            &missing_app,
+            Some(CACHED_ONCE_CHOICE),
+        )
+        .is_err());
+
         fs::remove_dir_all(root)?;
         Ok(())
     }

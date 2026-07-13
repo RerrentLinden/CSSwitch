@@ -17,8 +17,10 @@ use crate::runtime::provider::{
     status_upstream_endpoint,
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
+use crate::runtime::remote_access::build_ssh_tunnel_plan;
 use crate::runtime::science::{
-    science_runtime_preflight as runtime_preflight, settings_change_needs_teardown, stop_sandbox,
+    probe_known_runtime, science_runtime_preflight as runtime_preflight,
+    settings_change_needs_teardown, stop_sandbox, SandboxScienceState, ScienceRuntimeIdentity,
     SCIENCE_DOWNLOAD_URL,
 };
 use crate::runtime::settings::validate_runtime_ports;
@@ -447,7 +449,6 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         object.insert(
             "runtime".into(),
             json!({
-                "path": runtime.path,
                 "source": runtime.source.code(),
                 "version": runtime.version,
             }),
@@ -474,6 +475,56 @@ pub(crate) fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
     let url = { lock(state.inner()).sandbox_url.clone() };
     let url = url.ok_or("还没有沙箱 URL，请先「一键开始」。")?;
     open_in_browser(&url)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SshTunnelReq {
+    target: String,
+    #[serde(default = "default_ssh_port")]
+    ssh_port: u16,
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+fn ssh_tunnel_info_inner(
+    req: SshTunnelReq,
+    runtime: ScienceRuntimeIdentity,
+) -> Result<serde_json::Value, String> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
+    let science_port = cfg.sandbox_port;
+    if probe_known_runtime(science_port, &runtime) != SandboxScienceState::RunningHealthy {
+        return Err("隔离 Science 尚未健康运行；请先完成「一键开始」。".to_string());
+    }
+    let plan = build_ssh_tunnel_plan(
+        &req.target,
+        req.ssh_port,
+        science_port,
+        cfg.proxy_port,
+        runtime.source,
+    )?;
+    Ok(json!({
+        "command": plan.command,
+        "login_command": plan.login_command,
+        "science_port": science_port,
+        "preview_port": plan.preview_port,
+        "gateway_forwarded": false,
+        "warning": "先在访问端终端保持隧道命令运行，再在另一个终端运行登录命令。一次性链接只会出现在访问端终端，不进入 CSSwitch 前端、配置或日志。",
+    }))
+}
+
+/// Generate client-side SSH forwarding instructions. CSSwitch never starts SSH or changes sshd.
+#[tauri::command]
+pub(crate) async fn ssh_tunnel_info(
+    state: State<'_, SharedAppState>,
+    req: SshTunnelReq,
+) -> Result<serde_json::Value, String> {
+    let runtime = lock(state.inner())
+        .science_runtime
+        .clone()
+        .ok_or("CSSwitch 尚未记录可验证的隔离 Science 运行时；请先完成「一键开始」。")?;
+    run_blocking(move || ssh_tunnel_info_inner(req, runtime)).await
 }
 
 #[tauri::command]
@@ -815,7 +866,10 @@ esac
         )
         .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
-        assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            first.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         wait_http_health(sandbox_port);
         let fake_state_dir = home
             .join(".csswitch")
@@ -837,7 +891,10 @@ esac
         )
         .expect("second one-click should reuse running sandbox");
         assert_eq!(second["action"], "reopened");
-        assert_eq!(second["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            second.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("pid")).unwrap(),
             first_pid
@@ -979,7 +1036,10 @@ esac
         )
         .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
-        assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            first.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         wait_http_health(proxy_port);
         wait_http_health(sandbox_port);
         let fake_state_dir = home
@@ -1033,7 +1093,10 @@ esac
             .unwrap()
             .starts_with("已用新配置重启代理，Science 沿用不变，已重新打开 Science。"));
         assert_eq!(recovered["external_skill_installer"]["status"], "WARNING");
-        assert_eq!(recovered["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            recovered.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         wait_http_health(proxy_port);
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("pid")).unwrap(),

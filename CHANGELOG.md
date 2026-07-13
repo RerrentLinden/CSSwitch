@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added an opt-in SSH client helper that generates loopback-only tunnel and login commands for the isolated Science UI and its explicitly assigned preview port. CSSwitch never obtains the short-lived Science login token: it appears only in the access-side terminal after the user runs the second command. CSSwitch does not start SSH, enable Remote Login, change `sshd`, or persist the SSH target or commands.
+
+### Changed
+
+- New isolated Science launches prefer the binary from the locally installed official Claude Science app. A readable retained sandbox binary is offered only as a one-launch fallback when the App is unavailable and the user explicitly authorizes it; the choice is not persisted.
+- Kept Science `--no-auto-update`: CSSwitch neither downloads Science nor calls its self-updater. Existing healthy daemons are reused and are never force-restarted merely because the installed app changed.
+
+### Safety
+
+- The CSSwitch Gateway and Science remain loopback-only by default. SSH instructions never forward the Gateway port, explicitly keep host-key checking enabled, and ignore SSH config files so hidden user-configured forwards cannot be activated by the helper.
+
 ## [0.4.4] — 2026-07-12
 
 ### Changed
