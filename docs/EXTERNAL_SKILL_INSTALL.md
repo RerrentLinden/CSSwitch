@@ -1,6 +1,6 @@
-# External Skill install bridge (0.4.5 local test build)
+# External Skill install bridge (0.5.0)
 
-This is a narrow bridge for a missing third-party-mode workflow. It is not a Skill Manager and is not part of the published 0.4.4 release.
+This is a narrow bridge for a missing third-party-mode workflow. It is not a Skill Manager.
 
 ## User behavior
 
@@ -108,7 +108,7 @@ An artifact can carry a prompt document and may imitate a prompt-only Skill when
 
 - Installer registration and every Skill failure are warning-only for CSSwitch startup.
 - A running Science instance is inspected read-only; changed MCP configuration requires a Science restart.
-- The fixed route is re-attached idempotently on one-click open when registration is already current. Route attachment failure remains warning-only.
+- Successful route reconciliation is persisted by Science version, connector registration, and CSSwitch route revision. Normal repeated one-click opens skip attach/readback while that marker remains current; first configuration, relevant version/registration changes, and explicit self-check reconcile again. Failure remains warning-only and never updates the marker.
 - Host-access denial is final for that request. The Agent must report it, not retry alternate paths or fall back to authoring/catalog APIs.
 - `.import-origin`, local MCP loading, the local nonce/CSRF Agent-Skill endpoint, and `host.agents.attach_skill/detach_skill` behavior are observed Science contracts. Re-run the focused E2E after every bundled Science upgrade.
 - CSSwitch does not pin a Science version in the persistent data-dir. Normal selection is a valid explicit development `SCIENCE_BIN` override or the currently installed Science App. If the App is missing, a readable cache requires explicit one-launch UI authorization and is never persisted as a preference.
@@ -120,6 +120,6 @@ An artifact can carry a prompt document and may imitate a prompt-only Skill when
 
 No OAuth or catalog emulation; no Science binary patch; no private Science bearer use; no direct database writes; no bundled `customize` modification; no general Science control client; no Skill Manager, store, inventory, catalog, deployer, sync, general backup, update/overwrite, permanent deletion, restore UI, version manager, private-repository credentials, Python/R environment management, or domain libraries.
 
-## Accurate 0.4.5 wording
+## Accurate 0.5.0 wording
 
-“CSSwitch 0.4.5 local test build inherits the user's currently installed Claude Science App and adds a fixed routing Skill plus scoped local install and uninstall connectors. In an isolated real-Science UI test with the Anthropic catalog degraded, a URL request installed a complete public GitHub Skill into the active organization through a user-approved bridge, attached and loaded it immediately, and loaded it again after restart. A later name-only uninstall request selected the CSSwitch route, quarantined only the CSSwitch-owned import, detached it, and verified it no longer loaded without catalog-gated delete or shell removal. App-missing cache use requires explicit one-launch authorization. Name-only web source selection remains provider-dependent; private repositories, updates, overwrite, permanent deletion/restore UI, and each Skill's own domain function execution are not claimed.”
+“CSSwitch 0.5.0 inherits the user's currently installed Claude Science App and adds a fixed routing Skill plus one combined local install/uninstall connector. A URL request can install a complete public GitHub Skill into the active organization through a user-approved bridge, then attach and load it with Science's native Agent APIs. Uninstall quarantines only CSSwitch-owned imports before native detachment, without catalog-gated delete or shell removal. App-missing cache use requires explicit one-launch authorization. Name-only web source selection remains provider-dependent; private repositories, updates, overwrite, permanent deletion/restore UI, and each Skill's own domain function execution are not claimed.”
