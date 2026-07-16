@@ -66,6 +66,24 @@ pub fn discovery_fallback_source(outcome: &ProbeOutcome) -> &'static str {
     }
 }
 
+/// Parse only the bounded, allowlisted error kind emitted by our own Gateway
+/// `/v1/models` endpoint. Never forward its free-form message or upstream body.
+pub fn gateway_models_error_kind(body: &str) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    match value
+        .get("error_kind")
+        .and_then(serde_json::Value::as_str)?
+    {
+        "protocol" => Some("protocol"),
+        "network" => Some("network"),
+        "upstream" => Some("upstream"),
+        "cache" => Some("cache"),
+        "cache_invalidated" => Some("cache_invalidated"),
+        "internal" => Some("internal"),
+        _ => None,
+    }
+}
+
 /// 取一个空闲端口：bind 127.0.0.1:0 让内核分配，随即释放（临时代理稍后 bind，有绑定重试兜底 TOCTOU）。
 pub fn pick_scratch_port() -> Option<u16> {
     use std::net::TcpListener;
@@ -512,6 +530,21 @@ mod tests {
             discovery_fallback_source(&ProbeOutcome::NoResponse),
             "network"
         );
+    }
+
+    #[test]
+    fn gateway_models_error_kind_is_allowlisted_and_ignores_messages() {
+        assert_eq!(
+            gateway_models_error_kind(
+                r#"{"error_kind":"protocol","message":"private upstream detail"}"#
+            ),
+            Some("protocol")
+        );
+        assert_eq!(
+            gateway_models_error_kind(r#"{"error_kind":"future-kind"}"#),
+            None
+        );
+        assert_eq!(gateway_models_error_kind("not-json"), None);
     }
 
     #[test]

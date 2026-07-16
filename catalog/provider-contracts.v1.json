@@ -150,7 +150,7 @@
       "api_key_env": null,
       "scratch_policy": "gateway_owned_auth",
       "thinking_policy": "",
-      "upstream_client_version": "0.144.2",
+      "upstream_client_version": "0.144.4",
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 300, "stale_ttl_seconds": 86400 }
     }

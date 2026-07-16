@@ -109,7 +109,7 @@ pub(crate) fn load_codex_runtime_contract() -> Result<CodexRuntimeContract, Stri
         || contract.api_key_env.is_some()
         || contract.scratch_policy != "gateway_owned_auth"
         || !contract.thinking_policy.is_empty()
-        || contract.upstream_client_version.as_deref() != Some("0.144.2")
+        || contract.upstream_client_version.as_deref() != Some("0.144.4")
         || contract.timeouts.connect_ms == 0
         || contract.timeouts.total_ms < contract.timeouts.connect_ms
         || contract.timeouts.read_idle_ms == 0
@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(contract.read_idle_timeout, Duration::from_secs(300));
         assert_eq!(contract.normal_ttl_seconds, 300);
         assert_eq!(contract.stale_ttl_seconds, 86_400);
-        assert_eq!(contract.model_catalog_client_version, "0.144.2");
+        assert_eq!(contract.model_catalog_client_version, "0.144.4");
     }
 
     #[test]

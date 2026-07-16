@@ -141,6 +141,8 @@ pub(crate) fn set_active_profile_txn(
             OperationStage::ScratchUpstreamProbe,
             format!("outcome={outcome:?}"),
         );
+        let codex_protocol_failure = scratch_plan.provider == "codex"
+            && scratch::gateway_models_error_kind(&res.body) == Some("protocol");
         match outcome {
             scratch::ProbeOutcome::Ok => true,
             scratch::ProbeOutcome::Auth(code) => {
@@ -152,6 +154,11 @@ pub(crate) fn set_active_profile_txn(
                 trace.finish(format!("model_error status={code}"));
                 return Ok(json!({ "committed": false,
                     "hint": format!("上游拒绝该模型（{code}），{verb}。请换一个模型或核对 base_url。") }));
+            }
+            scratch::ProbeOutcome::Ambiguous(_) if codex_protocol_failure => {
+                trace.finish("codex_protocol can_skip=true");
+                return Ok(json!({ "committed": false, "can_skip": true,
+                    "hint": format!("Codex 模型目录响应不兼容，{verb}。这不是网络繁忙；可重试，或用「跳过验证」仅启动链路。") }));
             }
             scratch::ProbeOutcome::Ambiguous(_)
             | scratch::ProbeOutcome::NoResponse

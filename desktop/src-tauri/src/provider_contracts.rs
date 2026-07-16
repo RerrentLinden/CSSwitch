@@ -317,7 +317,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 && contract.api_key_env.is_none()
                 && contract.scratch_policy == ScratchPolicy::GatewayOwnedAuth
                 && contract.thinking_policy.is_empty()
-                && contract.upstream_client_version.as_deref() == Some("0.144.2")
+                && contract.upstream_client_version.as_deref() == Some("0.144.4")
                 && contract.cache.normal_ttl_seconds == 300
                 && contract.cache.stale_ttl_seconds == 86_400;
             if !exact_codex_contract {

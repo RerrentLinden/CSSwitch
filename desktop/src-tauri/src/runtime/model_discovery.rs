@@ -121,8 +121,15 @@ fn build_fetch_models_contract_response(
             Err(format!("上游拒绝（{code}），key 或权限可能有误。"))
         }
         other => {
-            let source = scratch::discovery_fallback_source(other);
-            let error_kind = if source == "network" {
+            let gateway_error_kind = scratch::gateway_models_error_kind(body);
+            let source = if gateway_error_kind == Some("protocol") {
+                "protocol"
+            } else {
+                scratch::discovery_fallback_source(other)
+            };
+            let error_kind = if gateway_error_kind == Some("protocol") {
+                json!("protocol")
+            } else if source == "network" {
                 json!("network")
             } else {
                 json!(null)
@@ -251,7 +258,11 @@ pub(crate) fn fetch_models(
         // 非 200 且非 Auth：一律 builtin 兜底，但按语义分「发现不支持」(4xx) 与「网络/上游临时」(5xx/429/无响应)，
         // 供前端区分提示（spec v3 §3.4.3）。绝不把 Auth 混进来掩盖坏 key。
         other => {
-            let source = scratch::discovery_fallback_source(other);
+            let source = if scratch::gateway_models_error_kind(&res.body) == Some("protocol") {
+                "protocol"
+            } else {
+                scratch::discovery_fallback_source(other)
+            };
             trace.finish(format!("fallback source={source} outcome={other:?}"));
             build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)
         }
@@ -428,5 +439,16 @@ mod tests {
         assert_eq!(network["source"], "network");
         assert_eq!(network["error_kind"], "network");
         assert!(network["upstream_status"].is_null());
+
+        let protocol = build_fetch_models_contract_response(
+            &ProbeOutcome::Ambiguous(Some(502)),
+            Some(502),
+            r#"{"error_kind":"protocol","message":"private detail"}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(protocol["source"], "protocol");
+        assert_eq!(protocol["error_kind"], "protocol");
+        assert_eq!(protocol["upstream_status"], 502);
     }
 }

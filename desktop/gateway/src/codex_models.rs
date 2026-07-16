@@ -168,11 +168,6 @@ impl ModelsCacheFile {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct OfficialModelsResponse {
-    models: Vec<OfficialModel>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
 struct OfficialModel {
     slug: String,
     display_name: String,
@@ -963,15 +958,13 @@ fn parse_live_response(mut response: Response) -> Result<FetchResult, CodexModel
             "Codex model catalog response is too large",
         ));
     }
-    let official: OfficialModelsResponse = serde_json::from_slice(&bytes)
-        .map_err(|_| CodexModelsError::protocol("Codex model catalog response is invalid"))?;
-    if official.models.len() > MAX_MODELS {
+    let official = parse_official_models(&bytes)?;
+    if official.len() > MAX_MODELS {
         return Err(CodexModelsError::protocol(
             "Codex model catalog has too many entries",
         ));
     }
     let mut models: Vec<CachedModel> = official
-        .models
         .into_iter()
         .filter(|model| model.visibility == "list")
         .map(|model| CachedModel {
@@ -1004,8 +997,77 @@ fn parse_live_response(mut response: Response) -> Result<FetchResult, CodexModel
     };
     cache
         .validate()
-        .map_err(|_| CodexModelsError::protocol("Codex model catalog response is invalid"))?;
+        .map_err(|_| CodexModelsError::protocol("Codex model catalog metadata is invalid"))?;
     Ok(FetchResult::Live { models, etag })
+}
+
+fn parse_official_models(bytes: &[u8]) -> Result<Vec<OfficialModel>, CodexModelsError> {
+    let root: Value = serde_json::from_slice(bytes)
+        .map_err(|_| CodexModelsError::protocol("Codex model catalog response is not JSON"))?;
+    let entries = root
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CodexModelsError::protocol("Codex model catalog response has no models array")
+        })?;
+    entries
+        .iter()
+        .map(|entry| {
+            serde_json::from_value(entry.clone())
+                .map_err(|_| CodexModelsError::protocol(official_model_schema_error(entry)))
+        })
+        .collect()
+}
+
+fn official_model_schema_error(entry: &Value) -> &'static str {
+    let Some(object) = entry.as_object() else {
+        return "Codex model catalog contains a non-object entry";
+    };
+    for field in ["slug", "display_name", "visibility"] {
+        if !object.get(field).is_some_and(Value::is_string) {
+            return match field {
+                "slug" => "Codex model catalog slug field is invalid",
+                "display_name" => "Codex model catalog display_name field is invalid",
+                _ => "Codex model catalog visibility field is invalid",
+            };
+        }
+    }
+    if object
+        .get("priority")
+        .and_then(Value::as_i64)
+        .is_none_or(|priority| i32::try_from(priority).is_err())
+    {
+        return "Codex model catalog priority field is invalid";
+    }
+    if object
+        .get("default_reasoning_level")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return "Codex model catalog default reasoning field is invalid";
+    }
+    if let Some(levels) = object.get("supported_reasoning_levels") {
+        let Some(levels) = levels.as_array() else {
+            return "Codex model catalog reasoning levels field is invalid";
+        };
+        if levels.iter().any(|level| {
+            !level
+                .as_object()
+                .and_then(|object| object.get("effort"))
+                .is_some_and(Value::is_string)
+        }) {
+            return "Codex model catalog reasoning level entry is invalid";
+        }
+    }
+    for field in [
+        "supports_reasoning_summaries",
+        "supports_reasoning_summary_parameter",
+        "supports_parallel_tool_calls",
+    ] {
+        if object.get(field).is_some_and(|value| !value.is_boolean()) {
+            return "Codex model catalog capability field is invalid";
+        }
+    }
+    "Codex model catalog entry schema is incompatible"
 }
 
 fn snapshot_from_cache(
@@ -1171,7 +1233,10 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    use super::{CatalogSource, CodexModelCatalog, ModelsCacheFile, CACHE_EPOCH_FILE, CACHE_FILE};
+    use super::{
+        parse_official_models, CatalogSource, CodexModelCatalog, ModelsCacheFile, CACHE_EPOCH_FILE,
+        CACHE_FILE,
+    };
     use crate::codex_auth::InferenceSecrets;
 
     fn bind_loopback() -> TcpListener {
@@ -1244,6 +1309,45 @@ mod tests {
             })
             .collect();
         serde_json::to_vec(&json!({"models": models})).unwrap()
+    }
+
+    #[test]
+    fn official_catalog_parse_errors_are_bounded_and_field_typed() {
+        let not_json = parse_official_models(b"not-json").unwrap_err();
+        assert_eq!(not_json.detail, "Codex model catalog response is not JSON");
+
+        let missing_models = parse_official_models(br#"{"data":[]}"#).unwrap_err();
+        assert_eq!(
+            missing_models.detail,
+            "Codex model catalog response has no models array"
+        );
+
+        let invalid_display = serde_json::to_vec(&json!({"models": [{
+            "slug": "gpt-test",
+            "display_name": null,
+            "visibility": "list",
+            "priority": 1
+        }]}))
+        .unwrap();
+        let invalid_display = parse_official_models(&invalid_display).unwrap_err();
+        assert_eq!(
+            invalid_display.detail,
+            "Codex model catalog display_name field is invalid"
+        );
+
+        let invalid_levels = serde_json::to_vec(&json!({"models": [{
+            "slug": "gpt-test",
+            "display_name": "GPT Test",
+            "visibility": "list",
+            "priority": 1,
+            "supported_reasoning_levels": null
+        }]}))
+        .unwrap();
+        let invalid_levels = parse_official_models(&invalid_levels).unwrap_err();
+        assert_eq!(
+            invalid_levels.detail,
+            "Codex model catalog reasoning levels field is invalid"
+        );
     }
 
     type MockModelsServer = (
@@ -1395,7 +1499,7 @@ mod tests {
         let catalog = CodexModelCatalog::production(root.clone(), &contract).unwrap();
         assert_eq!(
             catalog.endpoint,
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.2"
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.144.4"
         );
         assert!(!catalog.endpoint.ends_with(env!("CARGO_PKG_VERSION")));
         let _ = fs::remove_dir_all(root);

@@ -1273,7 +1273,7 @@ function renderModelOptions(sel, models, sourceLabel) {
 
 const MODEL_SOURCE_LABELS = {
   live: "实时", "fresh-cache": "新鲜缓存", "revalidated-cache": "已重新验证缓存",
-  "stale-cache": "过期缓存", builtin: "内置", unsupported: "内置",
+  "stale-cache": "过期缓存", builtin: "内置", unsupported: "内置", protocol: "协议不兼容",
 };
 
 function modelSourceLabel(source) {
@@ -1303,6 +1303,8 @@ function renderCodexCatalog(meta, list, r) {
     : '<div class="codex-model-empty">账号目录当前没有可展示模型。</div>';
   if (source === "stale-cache" || (r && r.stale)) {
     setMsg("官方目录暂时不可达，当前展示过期缓存（年龄 " + compactAge(age) + "）。可用于识别已有模型，但请稍后刷新确认。", "err");
+  } else if (r && r.error_kind === "protocol") {
+    setMsg("Codex 模型目录响应与当前 CSSwitch 兼容基线不一致；这不是网络繁忙。没有模型被伪造或写入配置。", "err");
   } else if (r && r.error_kind === "network") {
     setMsg("官方 Codex 模型目录当前不可达，且没有可用缓存。没有模型被伪造或写入配置，请稍后重试。", "err");
   } else {
@@ -1326,6 +1328,8 @@ function applyFetchResult(sel, requiresOverride, r) {
     setMsg("该端点未提供模型列表，已用内置模型（可直接选择保存）。", "ok");
   } else if (src === "stale-cache" || (r && r.stale)) {
     setMsg("模型目录来自过期缓存（年龄 " + compactAge(r && r.age_seconds) + "），请稍后刷新确认。", "err");
+  } else if (r && r.error_kind === "protocol") {
+    setMsg("模型目录响应与当前 CSSwitch 兼容基线不一致；这不是网络繁忙。请更新兼容版本后重试。", "err");
   } else if (r && r.error_kind === "network") {
     setMsg("未能连上上游验证，已铺内置模型（标「未验证」）。可仍试保存或重试。", "err");
   } else {
