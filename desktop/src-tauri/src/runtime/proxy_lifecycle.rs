@@ -12,35 +12,47 @@ use crate::runtime::legacy_proxy::{stop_legacy_csswitch_python_on_port, LegacyPr
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
     assert_format_supported, current_shim_mode_for_adapter, is_native_adapter, is_openai_adapter,
-    normalize_shim_mode, proxy_args_for, proxy_fingerprint_with_runtime, ProxyLaunch,
+    normalize_shim_mode, proxy_args_for, proxy_fingerprint_with_runtime, FormalCredential,
+    FormalGatewayPlan,
 };
 use crate::runtime::proxy::{health_timeout_reason, should_write_back, ProxyAction};
 use crate::runtime::system::{asset_root, log_path, open_log, redact, repo_root, tail_file};
 use crate::{config, lifecycle, lock, proc, SharedAppState};
 
-fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
-    let native = is_native_adapter(&launch.adapter);
-    let mut env = vec![(launch.key_env, launch.key.clone())];
-    if !native {
+fn formal_proxy_env(launch: &FormalGatewayPlan) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::new();
+    if let FormalCredential::ApiKey { env: key, value } = &launch.credential {
+        env.push((key.clone(), value.clone()));
+    }
+    if launch.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired {
         if is_openai_adapter(&launch.adapter) {
-            env.push(("CSSWITCH_OPENAI_BASE_URL", launch.base_url.clone()));
-            if !launch.model.is_empty() {
-                env.push(("CSSWITCH_OPENAI_MODEL", launch.model.clone()));
+            env.push(("CSSWITCH_OPENAI_BASE_URL".into(), launch.endpoint.clone()));
+            if launch.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+                && !launch.model.is_empty()
+            {
+                env.push(("CSSWITCH_OPENAI_MODEL".into(), launch.model.clone()));
             }
         } else {
-            env.push(("CSSWITCH_RELAY_BASE_URL", launch.base_url.clone()));
-            if !launch.model.is_empty() {
-                env.push(("CSSWITCH_RELAY_MODEL", launch.model.clone()));
+            env.push(("CSSWITCH_RELAY_BASE_URL".into(), launch.endpoint.clone()));
+            if launch.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+                && !launch.model.is_empty()
+            {
+                env.push(("CSSWITCH_RELAY_MODEL".into(), launch.model.clone()));
             }
             if !launch.thinking_policy.is_empty() {
                 env.push((
-                    "CSSWITCH_RELAY_THINKING",
+                    "CSSWITCH_RELAY_THINKING".into(),
                     launch.thinking_policy.to_string(),
                 ));
             }
         }
     }
-    env
+    if let Some(route) = &launch.codex_network_route {
+        let encoded = csswitch_codex_network::encode_route(route)
+            .map_err(|_| "无法编码 Codex 网络路由。".to_string())?;
+        env.push((csswitch_codex_network::ROUTE_ENV.into(), encoded));
+    }
+    Ok(env)
 }
 
 pub(crate) fn configure_managed_proxy_command(
@@ -50,7 +62,7 @@ pub(crate) fn configure_managed_proxy_command(
     port: u16,
     secret: &str,
     launch_id: &str,
-) {
+) -> Result<(), String> {
     let shim_mode = normalize_shim_mode(provider, Some(shim_mode));
     cmd.arg("--provider")
         .arg(provider)
@@ -59,6 +71,13 @@ pub(crate) fn configure_managed_proxy_command(
         .env("CSSWITCH_AUTH_TOKEN", secret)
         .env("CSSWITCH_LAUNCH_ID", launch_id)
         .env("CSSWITCH_TOOLUSE_SHIM", shim_mode);
+    cmd.env_remove("CSSWITCH_PROVIDER_CONTRACT_ID")
+        .env_remove("CSSWITCH_PROVIDER_CONTRACT_DIGEST")
+        .env_remove(csswitch_codex_network::ROUTE_ENV);
+    if let Some(identity) = crate::provider_contracts::gateway_contract_identity(provider)? {
+        cmd.env("CSSWITCH_PROVIDER_CONTRACT_ID", identity.contract_id)
+            .env("CSSWITCH_PROVIDER_CONTRACT_DIGEST", identity.catalog_digest);
+    }
     // CSSWITCH_UPSTREAM_URL is a native-provider test/diagnostic override. A stale
     // value inherited from the desktop process must never replace a candidate relay
     // or custom OpenAI base URL (or receive that candidate's key). Apply this at the
@@ -66,6 +85,7 @@ pub(crate) fn configure_managed_proxy_command(
     if !is_native_adapter(provider) {
         cmd.env_remove("CSSWITCH_UPSTREAM_URL");
     }
+    Ok(())
 }
 
 pub(crate) fn skill_install_bridge_dir(secret: &str) -> Result<PathBuf, String> {
@@ -336,13 +356,22 @@ pub(crate) fn ensure_proxy<R: Runtime>(
     lifecycle: &lifecycle::Lifecycle,
     science_runtime: Option<&crate::runtime::science::ScienceRuntimeIdentity>,
     trace: Option<&OperationTrace>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<(u16, String, ProxyAction), String> {
     let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
     let profile = cfg
         .active_profile()
         .cloned()
         .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
-    start_proxy_for(app, state, lifecycle, &profile, science_runtime, trace)
+    start_proxy_for(
+        app,
+        state,
+        lifecycle,
+        &profile,
+        science_runtime,
+        trace,
+        auth_proof,
+    )
 }
 
 /// Start or reuse a proxy for a specific profile, without reading the active profile.
@@ -355,17 +384,30 @@ pub(crate) fn start_proxy_for<R: Runtime>(
     profile: &config::Profile,
     science_runtime: Option<&crate::runtime::science::ScienceRuntimeIdentity>,
     trace: Option<&OperationTrace>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<(u16, String, ProxyAction), String> {
     assert_format_supported(profile)?;
-    let launch = proxy_args_for(profile);
-    if launch.key.is_empty() {
+    let resolved = proxy_args_for(profile)?;
+    let mut launch = resolved.formal();
+    let dir = config::default_dir();
+    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    config::require_template_enabled(&cfg, &profile.template_id)?;
+    if launch.adapter == "codex" {
+        launch.codex_network_route = Some(
+            csswitch_codex_network::resolve_from_process(&cfg.codex_network)
+                .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?,
+        );
+    }
+    crate::commands::codex::require_provider_auth_proof(&launch.adapter, auth_proof)?;
+    if !launch.credential_configured() {
         return Err(format!(
-            "「{}」还没填 API key，请先在面板填写并保存。",
+            "「{}」还没配置凭据，请先在面板填写或登录。",
             profile.name
         ));
     }
-    let native = is_native_adapter(&launch.adapter);
-    if !native && launch.base_url.is_empty() {
+    if launch.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired
+        && launch.endpoint.is_empty()
+    {
         return Err(
             "该配置需要填 base_url（如 https://your-relay/claude），请先在面板填写并保存。".into(),
         );
@@ -373,8 +415,6 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
     let shim_mode = current_shim_mode_for_adapter(&launch.adapter);
     let gateway_kind = "rust";
-    let dir = config::default_dir();
-    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let port = cfg.proxy_port;
     let science_context = match science_runtime {
         Some(runtime) => Some(runtime.skill_install_host_context(cfg.sandbox_port)?),
@@ -504,7 +544,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             port,
             &secret,
             &launch_id,
-        );
+        )?;
         // The external-Skill bridge is optional. Unsafe or unwritable bridge
         // state disables only that bridge; it must never prevent the proxy (and
         // therefore Science) from starting.
@@ -516,7 +556,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             science_context.as_ref(),
         )
         .is_ok();
-        for (k, v) in formal_proxy_env(&launch) {
+        for (k, v) in formal_proxy_env(&launch)? {
             cmd.env(k, v);
         }
         let child = cmd
@@ -622,12 +662,15 @@ mod tests {
         configure_managed_proxy_command, find_gateway_in, formal_proxy_env, gateway_bin_path_from,
         skill_install_bridge_token,
     };
-    use crate::runtime::provider::ProxyLaunch;
+    use crate::provider_contracts::{
+        CachePolicy, EndpointPolicy, ModelPolicy, TimeoutPolicy, Transport,
+    };
+    use crate::runtime::provider::{FormalCredential, FormalGatewayPlan};
     use std::fs;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn launch(adapter: &str, model: &str) -> ProxyLaunch {
+    fn launch(adapter: &str, model: &str) -> FormalGatewayPlan {
         launch_with_thinking(adapter, model, "")
     }
 
@@ -635,29 +678,48 @@ mod tests {
         adapter: &str,
         model: &str,
         thinking_policy: &'static str,
-    ) -> ProxyLaunch {
-        ProxyLaunch {
+    ) -> FormalGatewayPlan {
+        FormalGatewayPlan {
             adapter: adapter.to_string(),
-            base_url: "https://upstream.example/api".to_string(),
+            endpoint: "https://upstream.example/api".to_string(),
             model: model.to_string(),
-            key: "test-key".to_string(),
-            key_env: if matches!(adapter, "openai-custom" | "openai-responses") {
-                "CSSWITCH_OPENAI_KEY"
-            } else {
-                "CSSWITCH_RELAY_KEY"
+            credential: FormalCredential::ApiKey {
+                env: if matches!(adapter, "openai-custom" | "openai-responses") {
+                    "CSSWITCH_OPENAI_KEY".into()
+                } else {
+                    "CSSWITCH_RELAY_KEY".into()
+                },
+                value: "test-key".into(),
             },
-            thinking_policy,
+            model_policy: ModelPolicy::RequiredFixed,
+            transport: if adapter == "openai-custom" {
+                Transport::OpenaiChat
+            } else {
+                Transport::AnthropicMessages
+            },
+            endpoint_policy: EndpointPolicy::ProfileRequired,
+            timeouts: TimeoutPolicy {
+                connect_ms: 10_000,
+                total_ms: 30_000,
+                read_idle_ms: 300_000,
+            },
+            cache: CachePolicy {
+                normal_ttl_seconds: 0,
+                stale_ttl_seconds: 0,
+            },
+            thinking_policy: thinking_policy.to_string(),
+            codex_network_route: None,
         }
     }
 
     #[test]
     fn formal_proxy_env_pins_relay_model_only_on_formal_launch() {
-        let env = formal_proxy_env(&launch("relay", "glm-5.2"));
+        let env = formal_proxy_env(&launch("relay", "glm-5.2")).unwrap();
         assert!(env.contains(&(
-            "CSSWITCH_RELAY_BASE_URL",
+            "CSSWITCH_RELAY_BASE_URL".to_string(),
             "https://upstream.example/api".to_string()
         )));
-        assert!(env.contains(&("CSSWITCH_RELAY_MODEL", "glm-5.2".to_string())));
+        assert!(env.contains(&("CSSWITCH_RELAY_MODEL".to_string(), "glm-5.2".to_string())));
     }
 
     #[test]
@@ -674,6 +736,8 @@ mod tests {
             ("openai-responses", "off", "off", true),
             ("relay", "rewrite", "off", true),
             ("relay", "off", "off", true),
+            ("codex", "rewrite", "off", true),
+            ("codex", "off", "off", true),
         ] {
             let mut cmd = Command::new("csswitch-gateway");
             configure_managed_proxy_command(
@@ -683,7 +747,8 @@ mod tests {
                 18991,
                 fake_secret,
                 "fake-launch-id",
-            );
+            )
+            .unwrap();
             let args: Vec<String> = cmd
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -724,30 +789,61 @@ mod tests {
                     "native provider {provider} must preserve the explicit override contract"
                 );
             }
+            let contract_id = cmd
+                .get_envs()
+                .find(|(key, _)| *key == "CSSWITCH_PROVIDER_CONTRACT_ID")
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned());
+            let contract_digest = cmd
+                .get_envs()
+                .find(|(key, _)| *key == "CSSWITCH_PROVIDER_CONTRACT_DIGEST")
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned());
+            if provider == "codex" {
+                let identity = crate::provider_contracts::gateway_contract_identity("codex")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(contract_id.as_deref(), Some(identity.contract_id.as_str()));
+                assert_eq!(
+                    contract_digest.as_deref(),
+                    Some(identity.catalog_digest.as_str())
+                );
+            } else {
+                assert_eq!(contract_id, None);
+                assert_eq!(contract_digest, None);
+            }
         }
     }
 
     #[test]
     fn formal_proxy_env_pins_openai_model_only_on_formal_launch() {
-        let env = formal_proxy_env(&launch("openai-custom", "gpt-5.2"));
+        let env = formal_proxy_env(&launch("openai-custom", "gpt-5.2")).unwrap();
         assert!(env.contains(&(
-            "CSSWITCH_OPENAI_BASE_URL",
+            "CSSWITCH_OPENAI_BASE_URL".to_string(),
             "https://upstream.example/api".to_string()
         )));
-        assert!(env.contains(&("CSSWITCH_OPENAI_MODEL", "gpt-5.2".to_string())));
+        assert!(env.contains(&("CSSWITCH_OPENAI_MODEL".to_string(), "gpt-5.2".to_string())));
     }
 
     #[test]
     fn formal_proxy_env_native_adapter_only_sets_native_key() {
         let mut native = launch("deepseek", "");
-        native.key_env = "DEEPSEEK_API_KEY";
-        let env = formal_proxy_env(&native);
-        assert_eq!(env, vec![("DEEPSEEK_API_KEY", "test-key".to_string())]);
+        native.credential = FormalCredential::ApiKey {
+            env: "DEEPSEEK_API_KEY".into(),
+            value: "test-key".into(),
+        };
+        native.endpoint_policy = EndpointPolicy::GatewayManagedOfficial;
+        native.model_policy = ModelPolicy::OptionalFixed;
+        let env = formal_proxy_env(&native).unwrap();
+        assert_eq!(
+            env,
+            vec![("DEEPSEEK_API_KEY".to_string(), "test-key".to_string())]
+        );
     }
 
     #[test]
     fn formal_proxy_env_empty_model_does_not_pin_model() {
-        let env = formal_proxy_env(&launch("relay", ""));
+        let env = formal_proxy_env(&launch("relay", "")).unwrap();
         assert!(env.iter().any(|(k, _)| *k == "CSSWITCH_RELAY_BASE_URL"));
         assert!(!env.iter().any(|(k, _)| *k == "CSSWITCH_RELAY_MODEL"));
         assert!(!env.iter().any(|(k, _)| *k == "CSSWITCH_OPENAI_MODEL"));
@@ -755,8 +851,32 @@ mod tests {
 
     #[test]
     fn formal_proxy_env_preserves_relay_thinking_policy() {
-        let env = formal_proxy_env(&launch_with_thinking("relay", "glm-5.2", "enabled"));
-        assert!(env.contains(&("CSSWITCH_RELAY_THINKING", "enabled".to_string())));
+        let env = formal_proxy_env(&launch_with_thinking("relay", "glm-5.2", "enabled")).unwrap();
+        assert!(env.contains(&("CSSWITCH_RELAY_THINKING".to_string(), "enabled".to_string())));
+    }
+
+    #[test]
+    fn formal_proxy_env_injects_only_a_validated_codex_route() {
+        let mut codex = launch("codex", "");
+        codex.codex_network_route = Some(
+            csswitch_codex_network::resolve(
+                &csswitch_codex_network::CodexNetworkSettings {
+                    mode: csswitch_codex_network::CodexNetworkMode::Custom,
+                    proxy_url: "socks5h://127.0.0.1:7890".into(),
+                },
+                &csswitch_codex_network::EnvironmentSnapshot::default(),
+            )
+            .unwrap(),
+        );
+        let env = formal_proxy_env(&codex).unwrap();
+        let encoded = env
+            .iter()
+            .find(|(key, _)| key == csswitch_codex_network::ROUTE_ENV)
+            .map(|(_, value)| value)
+            .unwrap();
+        let decoded = csswitch_codex_network::decode_route(encoded).unwrap();
+        assert_eq!(decoded.source, csswitch_codex_network::RouteSource::Custom);
+        assert_eq!(decoded.proxy_scheme.as_deref(), Some("socks5h"));
     }
 
     #[test]

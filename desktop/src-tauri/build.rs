@@ -32,17 +32,25 @@ fn stage_gateway_sidecar() {
         gateway_dir.join("src").display()
     );
     println!("cargo:rerun-if-env-changed=CSSWITCH_SKIP_GATEWAY_STAGE");
-    if std::env::var("CSSWITCH_SKIP_GATEWAY_STAGE").is_ok() {
-        return;
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ACCEPTANCE_BUILD");
+    let acceptance_build = std::env::var_os("CARGO_FEATURE_ACCEPTANCE_BUILD").is_some();
+    if std::env::var_os("CSSWITCH_SKIP_GATEWAY_STAGE").is_some() {
+        panic!(
+            "CSSwitch builds cannot skip Gateway staging; Desktop and Gateway build variants must match"
+        );
     }
 
-    let status = Command::new(&cargo)
+    let mut command = Command::new(&cargo);
+    command
         .current_dir(&gateway_dir)
         .arg("build")
         .arg("--release")
         .arg("--target")
-        .arg(&target)
-        .status();
+        .arg(&target);
+    if acceptance_build {
+        command.arg("--features").arg("acceptance-build");
+    }
+    let status = command.status();
     if !matches!(status, Ok(s) if s.success()) {
         panic!("failed to build csswitch-gateway sidecar for target {target}");
     }

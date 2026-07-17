@@ -6,11 +6,13 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::runtime::operation::{self, OperationStage, OperationTrace};
 
 /// 探测类型：Models 验端点+鉴权（透传预设保存/获取模型）；Message 验具体模型（选了模型时）。
+#[derive(Clone, Copy)]
 pub enum ProbeKind {
     Models,
     Message,
@@ -65,6 +67,24 @@ pub fn discovery_fallback_source(outcome: &ProbeOutcome) -> &'static str {
     }
 }
 
+/// Parse only the bounded, allowlisted error kind emitted by our own Gateway
+/// `/v1/models` endpoint. Never forward its free-form message or upstream body.
+pub fn gateway_models_error_kind(body: &str) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    match value
+        .get("error_kind")
+        .and_then(serde_json::Value::as_str)?
+    {
+        "protocol" => Some("protocol"),
+        "network" => Some("network"),
+        "upstream" => Some("upstream"),
+        "cache" => Some("cache"),
+        "cache_invalidated" => Some("cache_invalidated"),
+        "internal" => Some("internal"),
+        _ => None,
+    }
+}
+
 /// 取一个空闲端口：bind 127.0.0.1:0 让内核分配，随即释放（临时代理稍后 bind，有绑定重试兜底 TOCTOU）。
 pub fn pick_scratch_port() -> Option<u16> {
     use std::net::TcpListener;
@@ -114,7 +134,10 @@ pub fn scratch_env(
     model: Option<&str>,
     relay_thinking: &str,
 ) -> Vec<(String, String)> {
-    let mut v = vec![(key_env.to_string(), key.to_string())];
+    let mut v = Vec::new();
+    if !key_env.is_empty() {
+        v.push((key_env.to_string(), key.to_string()));
+    }
     if !base_url.is_empty() {
         let env = if matches!(provider, "openai-custom" | "openai-responses") {
             "CSSWITCH_OPENAI_BASE_URL"
@@ -158,6 +181,7 @@ pub struct ScratchTarget<'a> {
 pub struct ScratchBackend {
     bin: PathBuf,
     shim_mode: String,
+    codex_network_route: Option<csswitch_codex_network::ResolvedCodexNetworkRoute>,
 }
 
 pub(crate) fn backend_for_app<R: tauri::Runtime>(
@@ -168,9 +192,20 @@ pub(crate) fn backend_for_app<R: tauri::Runtime>(
     let bin = crate::runtime::proxy_lifecycle::gateway_bin_path(app).ok_or(
         "找不到 csswitch-gateway 二进制；请重新安装完整应用，开发态可设置绝对 CSSWITCH_GATEWAY_BIN。",
     )?;
+    let codex_network_route = if adapter == "codex" {
+        let cfg = crate::config::load_from(&crate::config::default_dir())
+            .map_err(|error| error.to_string())?;
+        Some(
+            csswitch_codex_network::resolve_from_process(&cfg.codex_network)
+                .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?,
+        )
+    } else {
+        None
+    };
     Ok(ScratchBackend {
         bin,
         shim_mode: shim_mode.to_string(),
+        codex_network_route,
     })
 }
 
@@ -192,7 +227,15 @@ pub fn scratch_probe(
     target: &ScratchTarget,
     kind: ProbeKind,
     trace: Option<&OperationTrace>,
+    cancel: Option<&AtomicBool>,
 ) -> ProbeResult {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+    if cancelled() {
+        return ProbeResult {
+            status: None,
+            body: "临时探测已取消".into(),
+        };
+    }
     let port = match pick_scratch_port() {
         Some(p) => p,
         None => {
@@ -232,14 +275,19 @@ pub fn scratch_probe(
             ),
         );
     }
-    crate::runtime::proxy_lifecycle::configure_managed_proxy_command(
+    if let Err(error) = crate::runtime::proxy_lifecycle::configure_managed_proxy_command(
         &mut cmd,
         target.provider,
         backend.shim_mode(),
         port,
         &secret,
         &launch_id,
-    );
+    ) {
+        return ProbeResult {
+            status: None,
+            body: error,
+        };
+    }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     // key/base_url/model 经 env 注入（绝不进 argv，避免 ps 泄露）；native 不带 relay base。
     for (k, v) in scratch_env(
@@ -251,6 +299,25 @@ pub fn scratch_probe(
         target.relay_thinking,
     ) {
         cmd.env(k, v);
+    }
+    if let Some(route) = &backend.codex_network_route {
+        match csswitch_codex_network::encode_route(route) {
+            Ok(encoded) => {
+                cmd.env(csswitch_codex_network::ROUTE_ENV, encoded);
+            }
+            Err(_) => {
+                return ProbeResult {
+                    status: None,
+                    body: "Codex 网络路由编码失败".into(),
+                };
+            }
+        }
+    }
+    if cancelled() {
+        return ProbeResult {
+            status: None,
+            body: "临时探测已取消".into(),
+        };
     }
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -266,7 +333,19 @@ pub fn scratch_probe(
     let mut alive = false;
     let mut early_exit = None;
     for _ in 0..(operation::SCRATCH_READY_BUDGET_MS / operation::POLL_INTERVAL_MS) {
+        if cancelled() {
+            return ProbeResult {
+                status: None,
+                body: "临时探测已取消".into(),
+            };
+        }
         std::thread::sleep(Duration::from_millis(operation::POLL_INTERVAL_MS));
+        if cancelled() {
+            return ProbeResult {
+                status: None,
+                body: "临时探测已取消".into(),
+            };
+        }
         match guard.liveness() {
             crate::proc::ChildLiveness::Exited(status) => {
                 early_exit = Some(format!(
@@ -321,16 +400,28 @@ pub fn scratch_probe(
             body: error,
         };
     }
+    if cancelled() {
+        return ProbeResult {
+            status: None,
+            body: "临时探测已取消".into(),
+        };
+    }
     match kind {
         ProbeKind::Models => {
             if let Some(t) = trace {
                 t.stage(OperationStage::ScratchUpstreamProbe, "GET /v1/models");
             }
-            match crate::proc::http_get_body(
+            let timeout_ms = if target.provider == "codex" {
+                operation::CODEX_MODELS_PROBE_TIMEOUT_MS
+            } else {
+                operation::UPSTREAM_PROBE_TIMEOUT_MS
+            };
+            match crate::proc::http_get_body_cancellable(
                 port,
                 Some(&secret),
                 "/v1/models",
-                operation::UPSTREAM_PROBE_TIMEOUT_MS,
+                timeout_ms,
+                cancel,
             ) {
                 Some((code, body)) => ProbeResult {
                     status: Some(code),
@@ -378,6 +469,32 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn cancelled_probe_never_spawns_the_scratch_gateway() {
+        let cancel = AtomicBool::new(true);
+        let backend = ScratchBackend {
+            bin: PathBuf::from("/definitely/missing/csswitch-gateway"),
+            shim_mode: "off".into(),
+            codex_network_route: None,
+        };
+        let result = scratch_probe(
+            &backend,
+            &ScratchTarget {
+                provider: "codex",
+                key_env: "",
+                base_url: "",
+                key: "",
+                model: None,
+                relay_thinking: "",
+            },
+            ProbeKind::Models,
+            None,
+            Some(&cancel),
+        );
+        assert_eq!(result.status, None);
+        assert_eq!(result.body, "临时探测已取消");
+    }
+
+    #[test]
     fn scratch_probe_can_use_rust_backend_for_message_probe() {
         let bin = std::env::var_os("CSSWITCH_GATEWAY_BIN")
             .map(PathBuf::from)
@@ -423,6 +540,7 @@ mod tests {
         let backend = ScratchBackend {
             bin,
             shim_mode: "off".into(),
+            codex_network_route: None,
         };
         let result = scratch_probe(
             &backend,
@@ -435,6 +553,7 @@ mod tests {
                 relay_thinking: "",
             },
             ProbeKind::Message,
+            None,
             None,
         );
         assert_eq!(result.status, Some(200));
@@ -477,6 +596,21 @@ mod tests {
             discovery_fallback_source(&ProbeOutcome::NoResponse),
             "network"
         );
+    }
+
+    #[test]
+    fn gateway_models_error_kind_is_allowlisted_and_ignores_messages() {
+        assert_eq!(
+            gateway_models_error_kind(
+                r#"{"error_kind":"protocol","message":"private upstream detail"}"#
+            ),
+            Some("protocol")
+        );
+        assert_eq!(
+            gateway_models_error_kind(r#"{"error_kind":"future-kind"}"#),
+            None
+        );
+        assert_eq!(gateway_models_error_kind("not-json"), None);
     }
 
     #[test]
@@ -612,6 +746,12 @@ mod tests {
             "",
         );
         assert!(!env.iter().any(|(k, _)| k == "CSSWITCH_RELAY_THINKING"));
+    }
+
+    #[test]
+    fn scratch_env_gateway_owned_auth_never_invents_a_key_env() {
+        let env = scratch_env("codex", "", "", "", None, "");
+        assert!(env.is_empty());
     }
 
     #[test]
