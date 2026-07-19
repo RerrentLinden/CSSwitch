@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.8.0] — 2026-07-19
+
+### Added
+
+- Added ordered multi-model catalogs for API-key providers. A profile can use one model for every Science role or separate Quality, Balanced, Fast, and Fable models, including exact manually entered upstream IDs.
+- Added strict selector-to-upstream routing for static providers. Science now sees the configured model names, while unknown selectors fail closed instead of silently falling back to a different Qwen or DeepSeek model.
+- Added a real Skill & MCP page that lists the active Science organization's Skills, sources, and attachment states without exposing private paths.
+
+### Changed
+
+- Rebuilt the desktop UI around four focused pages—Model connections, Skill & MCP, Status, and Settings—with a 920×650.5 default window and compact right-corner runtime notifications.
+- Restart Science only when the visible catalog, default model, role bindings, or runtime binding changes. Key, endpoint, or same-selector upstream changes restart only the Gateway.
+- Simplified provider editing to four freely editable model fields. Discovery is optional, Codex keeps its dynamic account catalog, and the Codex edit action remains visibly disabled.
+- Migrated v3 configuration atomically to schema v4 with non-overwriting backups while preserving active profiles, unknown fields, ports, and the existing Science data directory.
+
+### Fixed
+
+- Removed the `default` pseudo-model label from static provider catalogs and kept the selected upstream model name visible in Science.
+- Made browser-open failures return a copyable fallback URL and ensured every runtime operation clears its loading state.
+- Made interrupted Gateway recovery fail closed when the journal target no longer matches the active profile, leaving the listener and journal untouched for explicit recovery.
+
+### Safety and upgrade notes
+
+- Version 0.8.0 remains macOS Apple Silicon only, ad-hoc signed, and not notarized.
+- Before rolling back to 0.7.0 or earlier, use 0.8.0's explicit export-and-downgrade flow to schema v2, or restore a compatible versioned backup after every CSSwitch process has stopped.
+- Automated and loopback gates do not claim exhaustive live-provider, real-account, Developer ID, notarization, or Gatekeeper verification.
+
 ## [0.7.0] — 2026-07-17
 
 ### Added
