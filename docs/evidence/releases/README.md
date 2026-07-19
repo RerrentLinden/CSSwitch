@@ -1,5 +1,6 @@
 # 发布证据索引
 
+- [v0.8.0](v0.8.0.md)：新 UI、schema v4、最终 source / DMG 与公开附件复核。
 - [v0.7.0](v0.7.0.md)：Codex 实验桥接、最终 source / DMG、公开附件与 Acceptance live 证据边界。
 - [v0.6.0](v0.6.0.md)：最终 source、附件、Acceptance 安装与公开分发证据。
 - [v0.5.0](v0.5.0.md)：已发布附件与 2026-07-14 独立复核。

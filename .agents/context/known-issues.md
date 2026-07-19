@@ -1,18 +1,18 @@
 # 当前已知问题与证据缺口
 
-最后整理：2026-07-17。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
+最后整理：2026-07-19。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
 
 ## 分发
 
-- v0.7.0 公开附件只有 ad-hoc seal，没有 Developer ID 团队身份、notarization 或 stapled ticket；Gatekeeper 对包内 app 的评估为 `rejected`。首次打开可能需要用户右键选择“打开”。
+- v0.8.0 公开附件只有经过完整性验证的 ad-hoc seal，没有建立 Developer ID、notarization、stapled ticket 或 Gatekeeper acceptance 证据。首次打开可能需要用户右键选择“打开”。
 
 ## Codex
 
 - Codex 是默认关闭的实验能力。上游账号权限、动态模型目录和 Responses 协议可能变化；单账号、浏览器登录、macOS Apple Silicon 是当前边界。
 - 不支持设备码、多账号、代理认证、PAC、自定义 CA、系统代理自动发现或 TUN 检测；Finder 启动的环境变量与终端可能不同，`direct` 也可能仍由系统 TUN 接管。
-- v0.7.0 的浏览器失败页在有效 callback 之后仍可能只显示 `Codex sign-in could not be completed safely.`，不能区分 token exchange 与本地认证提交。当前没有足够受影响样本确认代理、上游响应或本地提交中的具体根因。
-- Acceptance 候选已有真实 CSSwitch OAuth、模型和 Science 最小文本成功证据，但最终公开 v0.7.0 DMG 没有重新执行真实 OAuth / 模型 / 推理；两者不能合并为同一层证据。
-- v3 配置回滚到 v0.6.0 前必须先在 v0.7.0 导出并降级到 v2，或停止全部 CSSwitch 进程后恢复 v2 备份；删除 Codex profile 本身不会降低 schema。
+- v0.7.0 曾观察到浏览器失败页在有效 callback 后只显示通用安全错误；v0.8.0 增加了结构化通知与浏览器 fallback，但最终公开 DMG 未重跑该真实账号失败路径，不能据此宣布上游或本地提交根因已被穷尽。
+- 历史 Acceptance 候选已有真实 CSSwitch OAuth、模型和 Science 最小文本成功证据，但最终公开 v0.8.0 DMG 没有重新执行真实 OAuth / 模型 / 推理；两者不能合并为同一层证据。
+- v4 配置回滚到 v0.7.0 或更早版本前，必须先在 v0.8.0 导出并降级到 v2，或停止全部 CSSwitch 进程后恢复兼容备份；删除 profile 本身不会降低 schema。
 
 ## Science / Skill / SSH
 
@@ -24,4 +24,4 @@
 
 ## 测试
 
-- 真机验收矩阵描述应执行的场景，不表示最终 v0.7.0 DMG 已逐项全部执行。每次验收必须绑定 exact artifact，并把通过、失败、环境阻塞与未执行分开记录。
+- 真机验收矩阵描述应执行的场景，不表示最终 v0.8.0 DMG 已逐项全部执行。每次验收必须绑定 exact artifact，并把通过、失败、环境阻塞与未执行分开记录。
