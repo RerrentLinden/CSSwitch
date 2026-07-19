@@ -42,6 +42,8 @@ Codex OAuth 与 Gateway 不要求 Apple Developer 身份、Developer ID、Team I
 
 计算最终 DMG 的大小和 SHA-256，之后任何重建都视为新 artifact，需重跑后续层。
 
+DMG 必须从一次性创建的空 staging 目录生成，只复制本次 clean build 的正式 app；禁止把持久化 `target/release/bundle/macos` 或其他可能含历史产物的目录整体作为 DMG 输入。
+
 ## 4. 临时安装与 runtime
 
 只读挂载 DMG，把 app 复制到隔离位置或使用独立 bundle ID；未经授权不覆盖 `/Applications/CSSwitch.app`。
@@ -60,7 +62,12 @@ Codex OAuth 与 Gateway 不要求 Apple Developer 身份、Developer ID、Team I
 
 分别执行并记录：
 
-至少记录最终附件 SHA-256、包内 Desktop/Gateway hash、版本和安装/runtime 结果。如果维护者选择公开 macOS 分发签名，再单独记录 Developer ID、notarization、stapled ticket 与 Gatekeeper 结果；本项目不提供或强制一个固定 Team ID，也不把这些分发证据当作 Codex 功能本身的前置。
+- `hdiutil verify` 通过，并只读挂载最终 DMG；
+- 排除 `.DS_Store`、`.VolumeIcon.icns` 等预期镜像元数据后，根目录精确白名单只能包含一个正式 app 和一个 Applications 链接；
+- app 名称、bundle ID、版本、架构与发布输入完全一致，Applications 链接精确指向 `/Applications`；
+- `.app` 数量必须等于 1；任何 Test、Acceptance、历史 app 或其他非白名单载荷都阻断发布。
+
+至少记录最终附件 SHA-256、包内 Desktop/Gateway hash、版本和安装/runtime 结果。上述根目录白名单必须同时对本地候选和从公开 release 重新下载的附件执行。如果维护者选择公开 macOS 分发签名，再单独记录 Developer ID、notarization、stapled ticket 与 Gatekeeper 结果；本项目不提供或强制一个固定 Team ID，也不把这些分发证据当作 Codex 功能本身的前置。
 
 ## 6. 发布与回读
 
