@@ -802,8 +802,14 @@ function setBusy(on, op) {
     els.runtimeUseCacheBtn, els.runtimeDownloadBtn, els.runtimeChoiceCancelBtn,
     els.wizSaveBtn, els.wizFetchBtn, els.wizCancelBtn,
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
-    els.wizModel, els.wizRoleQuality, els.wizRoleFast, els.wizRoleFable,
-    els.connModel, els.connRoleQuality, els.connRoleFast, els.connRoleFable,
+    els.wizModel, els.wizModelDisplayName,
+    els.wizRoleQuality, els.wizRoleQualityDisplayName,
+    els.wizRoleFast, els.wizRoleFastDisplayName,
+    els.wizRoleFable, els.wizRoleFableDisplayName,
+    els.connModel, els.connModelDisplayName,
+    els.connRoleQuality, els.connRoleQualityDisplayName,
+    els.connRoleFast, els.connRoleFastDisplayName,
+    els.connRoleFable, els.connRoleFableDisplayName,
     els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
     els.codexEnabled, els.codexStatusBtn, els.codexLoginBtn, els.codexRepairProfileBtn,
     els.codexCancelBtn, els.codexLogoutBtn, els.codexNetworkMode, els.codexProxyUrl,
@@ -1702,11 +1708,15 @@ function editorState(kind) {
   const wizard = kind === "wizard";
   return {
     model: wizard ? els.wizModel : els.connModel,
+    modelDisplay: wizard ? els.wizModelDisplayName : els.connModelDisplayName,
     staticRoot: wizard ? els.wizStaticCatalog : els.connStaticCatalog,
     warning: wizard ? els.wizCatalogWarning : els.connCatalogWarning,
     quality: wizard ? els.wizRoleQuality : els.connRoleQuality,
+    qualityDisplay: wizard ? els.wizRoleQualityDisplayName : els.connRoleQualityDisplayName,
     fast: wizard ? els.wizRoleFast : els.connRoleFast,
+    fastDisplay: wizard ? els.wizRoleFastDisplayName : els.connRoleFastDisplayName,
     fable: wizard ? els.wizRoleFable : els.connRoleFable,
+    fableDisplay: wizard ? els.wizRoleFableDisplayName : els.connRoleFableDisplayName,
     get catalog() { return wizard ? wizardCatalog : connectionCatalog; },
     set catalog(value) { if (wizard) wizardCatalog = value; else connectionCatalog = value; },
     get refs() { return wizard ? wizardRoleRefs : connectionRoleRefs; },
@@ -1735,9 +1745,13 @@ function initializeCatalogEditor(kind, routes, defaultRef, bindings, { dynamic =
   if (dynamic) {
     editor.catalog = [];
     editor.model.value = "";
+    editor.modelDisplay.value = "";
     editor.quality.value = "";
+    editor.qualityDisplay.value = "";
     editor.fast.value = "";
+    editor.fastDisplay.value = "";
     editor.fable.value = "";
+    editor.fableDisplay.value = "";
     return;
   }
   editor.catalog = mergeCatalogCandidates([], (routes || []).map((route) => ({ ...route, enabled: true })), { enableNew: true });
@@ -1745,9 +1759,13 @@ function initializeCatalogEditor(kind, routes, defaultRef, bindings, { dynamic =
   editor.refs = roleReferences(bindings, fallback, defaultRef || fallback);
   const fields = projectSimpleModelFields(editor.catalog, editor.refs.default, bindings);
   editor.model.value = fields.default_model;
+  editor.modelDisplay.value = fields.default_display_name;
   editor.quality.value = fields.quality_model;
+  editor.qualityDisplay.value = fields.quality_display_name;
   editor.fast.value = fields.fast_model;
+  editor.fastDisplay.value = fields.fast_display_name;
   editor.fable.value = fields.fable_model;
+  editor.fableDisplay.value = fields.fable_display_name;
   renderModelOptions(editor.model, editor.catalog.map((item) => ({
     id: item.upstream_model,
     supports_tools: item.supports_tools,
@@ -1755,16 +1773,20 @@ function initializeCatalogEditor(kind, routes, defaultRef, bindings, { dynamic =
   const preservesLegacyBalanced = kind === "connection" && editor.refs.balanced !== editor.refs.default;
   editor.warning.textContent = preservesLegacyBalanced
     ? "这个旧配置曾单独保存均衡映射：不修改默认模型时会原样保留；修改默认模型后，均衡会随默认更新。"
-    : "可以选择推荐模型，也可以直接填写供应商或中转站提供的精确模型 ID。";
+    : "模型 ID 用于上游请求；显示名称用于 Science 模型菜单（对应 display_name），留空则使用模型 ID。";
 }
 
 function catalogSubmission(kind) {
   const editor = editorState(kind);
   return buildSimpleModelSubmission({
     default_model: editor.model.value,
+    default_display_name: editor.modelDisplay.value,
     quality_model: editor.quality.value,
+    quality_display_name: editor.qualityDisplay.value,
     fast_model: editor.fast.value,
+    fast_display_name: editor.fastDisplay.value,
     fable_model: editor.fable.value,
+    fable_display_name: editor.fableDisplay.value,
   }, {
     existing_routes: editor.catalog,
     existing_references: editor.refs,
@@ -2512,9 +2534,9 @@ function wire() {
     "codexNetworkMode", "codexProxyUrl", "codexNetworkResolved", "codexNetworkSaveBtn", "codexDowngradeBox", "codexDowngradeBtn",
     "connectionOverview", "listSec", "profileList", "newBtn", "skipActivateBtn",
     "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBaseGroup", "wizBase", "wizBaseHint",
-    "wizModelGroup", "wizModelLabel", "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelHint", "wizCodexCatalog", "wizCodexCatalogMeta", "wizCodexCatalogList", "wizStaticCatalog", "wizRoleQuality", "wizRoleFast", "wizRoleFable", "wizCatalogWarning", "wizKeyGroup", "wizKey", "wizSaveBtn", "wizCancelBtn",
+    "wizModelGroup", "wizModelLabel", "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelDisplayName", "wizModelHint", "wizCodexCatalog", "wizCodexCatalogMeta", "wizCodexCatalogList", "wizStaticCatalog", "wizRoleQuality", "wizRoleQualityDisplayName", "wizRoleFast", "wizRoleFastDisplayName", "wizRoleFable", "wizRoleFableDisplayName", "wizCatalogWarning", "wizKeyGroup", "wizKey", "wizSaveBtn", "wizCancelBtn",
     "connSec", "connTitle", "connBaseGroup", "connBase", "connBaseHint", "connFetchBtn",
-    "connModelGroup", "connModelLabel", "connModelInfo", "connModel", "connModelHint", "connCodexCatalog", "connCodexCatalogMeta", "connCodexCatalogList", "connStaticCatalog", "connRoleQuality", "connRoleFast", "connRoleFable", "connCatalogWarning", "connKeyGroup", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
+    "connModelGroup", "connModelLabel", "connModelInfo", "connModel", "connModelDisplayName", "connModelHint", "connCodexCatalog", "connCodexCatalogMeta", "connCodexCatalogList", "connStaticCatalog", "connRoleQuality", "connRoleQualityDisplayName", "connRoleFast", "connRoleFastDisplayName", "connRoleFable", "connRoleFableDisplayName", "connCatalogWarning", "connKeyGroup", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
     "metaSec", "metaName", "metaNotes", "metaSaveBtn", "metaCancelBtn",
     "themeBtn", "pageEyebrow", "pageTitle", "pageSubtitle",
     "currentProfileIcon", "currentProfileName", "currentProfileState", "currentRouteMode", "currentProfileModel", "currentProfileMeta",
@@ -2589,13 +2611,15 @@ function wire() {
     const chip = e.target.closest(".chip");
     if (chip) selectWizTemplate(chip.getAttribute("data-tid"));
   });
-  [els.wizModel, els.wizRoleQuality, els.wizRoleFast, els.wizRoleFable]
+  [els.wizModel, els.wizModelDisplayName, els.wizRoleQuality, els.wizRoleQualityDisplayName,
+    els.wizRoleFast, els.wizRoleFastDisplayName, els.wizRoleFable, els.wizRoleFableDisplayName]
     .forEach((input) => input.addEventListener("input", () => catalogRolesChanged("wizard")));
   els.wizFetchBtn.addEventListener("click", wizFetch);
   els.wizSaveBtn.addEventListener("click", wizSave);
   els.wizCancelBtn.addEventListener("click", cancelForm);
 
-  [els.connModel, els.connRoleQuality, els.connRoleFast, els.connRoleFable]
+  [els.connModel, els.connModelDisplayName, els.connRoleQuality, els.connRoleQualityDisplayName,
+    els.connRoleFast, els.connRoleFastDisplayName, els.connRoleFable, els.connRoleFableDisplayName]
     .forEach((input) => input.addEventListener("input", () => catalogRolesChanged("connection")));
   els.connFetchBtn.addEventListener("click", connFetch);
   els.connSaveBtn.addEventListener("click", connSave);
