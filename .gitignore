@@ -38,6 +38,11 @@ scratchpad/
 # Local Claude Code session config.
 .claude/
 
+# Local agent workflow state and generated helpers.
+/.agents/skills/
+/.codex/
+/.trellis/
+
 # Local seed files.
 .seed
 

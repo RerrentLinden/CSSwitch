@@ -50,6 +50,12 @@
 | Skill | 已支持 | 查看当前 Science 组织中的 Skill，从本地包导入，或让 Agent 从准确的公开 GitHub URL 安装。 |
 | MCP | 即将支持 | v0.8.0 尚未提供面向用户的通用 MCP 添加、配置和运行管理；后续版本会继续完善。 |
 
+## 社区
+
+<p align="center">
+  <img src="docs/assets/wechat-group.jpg" alt="CSSwitch 社区微信群二维码" width="420">
+</p>
+
 ## 安装与启动
 
 需要一台 Apple Silicon Mac、已安装的 [Claude Science](https://claude.com/download)，以及可用的第三方模型 API Key 或 Codex 账号。
