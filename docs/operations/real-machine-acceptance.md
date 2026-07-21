@@ -71,11 +71,12 @@ DASHSCOPE_API_KEY='csswitch-migration-fixture-qwen' \
 eval "$(bash test/real_machine_guard.sh env)"
 ```
 
-验证 SSH opt-in 时，在这个隔离 HOME 内创建空的普通 config fixture；它只用于 wrapper / fail-closed 合同，不证明真实服务器连通：
+验证 SSH opt-in 时，在这个隔离 HOME 内创建只含假 alias 的普通 config fixture；它用于 Host 枚举、wrapper 和 fail-closed 合同，不证明真实服务器连通：
 
 ```bash
 install -d -m 700 "$HOME/.ssh"
-install -m 600 /dev/null "$HOME/.ssh/config"
+printf 'Host acceptance-fixture\n  HostName 127.0.0.1\n  Port 9\n' > "$HOME/.ssh/config"
+chmod 600 "$HOME/.ssh/config"
 ```
 
 启动独立 Test app：
@@ -132,7 +133,7 @@ RM-01～RM-34 保留历史编号；Codex 场景从 RM-35 继续，0.8.1 新增 p
 | RM-23 | 外部 Skill 安装 | 精确公开 GitHub URL | connector -> host approval -> commit -> native attach -> `skill()` load，各阶段分开记录 |
 | RM-24 | Skill 重启 / 卸载 | 同 data-dir 重启，再卸载 | 重启仍 load；只 quarantine 有 marker 的导入；native detach；不走 catalog / shell |
 | RM-25 | 运行中 Skill 配置漂移 | Science 运行时改变 MCP / route 预期 | 只读检查并返回 `RESTART_REQUIRED`；不并发改写；普通 Science 继续 |
-| RM-26 | 系统 SSH 默认 / opt-in | 无 fixture、创建 fixture、再移除 fixture | 默认关闭不阻断；启用时 wrapper 使用 `/usr/bin/ssh -F`；启用后 config / wrapper 缺失必须 fail closed |
+| RM-26 | 系统 SSH 默认 / opt-in | 无 fixture、创建假 alias fixture、再移除 fixture | 默认关闭不阻断；启用后 Science 能枚举 `acceptance-fixture`，sandbox config 不含 HostName / Port，wrapper 使用 `/usr/bin/ssh -F`；config / alias 投影 / wrapper 缺失或不安全必须 fail closed |
 | RM-27 | SSH 非目标 | 检查文件与监听状态 | 不复制 `.ssh`、不启动 `sshd`、不改防火墙、不监听 `0.0.0.0`；真实 server 另行授权 |
 | RM-28 | GitHub 单请求进度 | 固定 commit 的慢速 bundle 安装 | 只生成一个 request；archive / fallback 复用同一 ID；进度持续更新；最终 response 唯一；status 与 `.processing` 清理 |
 | RM-29 | GitHub 重复复用 | 再安装 RM-28 的同一 URL | 返回 verified reuse；不重新下载、不重复提交、不覆盖已装内容；OPERON 绑定回读仍正确 |

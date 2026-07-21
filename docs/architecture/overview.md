@@ -66,7 +66,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 
 ### 系统 SSH bridge
 
-默认关闭。启用后先用只含绝对 `Include` 的隔离 config stub 满足 Science 的 Host 前置校验，再通过窄 wrapper 执行 `/usr/bin/ssh -F <real-home>/.ssh/config`。不复制 `.ssh` 或真实 config 内容、不启动服务、不开放监听；stub、真实 config 或 wrapper 校验失败会 fail closed。详见[系统 SSH 文档](../features/system-ssh.md)。
+默认关闭。启用后，隔离 config stub 以绝对 `Include` 保留 OpenSSH 语义，并只投影真实顶层 config 中安全的显式 Host alias，供不展开 Include 的 Science UI 枚举；窄 wrapper 仍执行 `/usr/bin/ssh -F <real-home>/.ssh/config`。不复制 `.ssh` 或真实连接参数、不启动服务、不开放监听；stub、alias 提取、真实 config 或 wrapper 校验失败会 fail closed。详见[系统 SSH 文档](../features/system-ssh.md)。
 
 ### Codex 实验能力
 
