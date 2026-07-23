@@ -34,7 +34,8 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 |---|---|---|
 | provider profiles 与 CSSwitch settings | `~/.csswitch/` 配置 | CSSwitch |
 | Gateway 生命周期与本地路由 | CSSwitch runtime state | CSSwitch |
-| 已安装 Science executable | `/Applications/Claude Science.app/.../claude-science` | 用户 / Science installer |
+| Science executable 候选 | 通过 CSSwitch 固定路径、文件安全与 embedded metadata 本地校验的 `~/.claude-science/bin/claude-science`，或 `/Applications/Claude Science.app/.../claude-science` | 用户 / Science updater / installer |
+| updater runtime snapshot | `<CSSwitch data root>/runtime-snapshots/science/claude-science-<sha256>` | CSSwitch |
 | 持久 Science 状态 | `~/.csswitch/sandbox/home/.claude-science` | Science |
 | 版本 runtime 资源 | `<data-dir>/runtime/<version>/` | Science |
 | 组织与 Skills | `<data-dir>/orgs/<active-org>/...` | Science 组织 |
@@ -44,7 +45,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 | Codex OAuth / thinking / generation records | CSSwitch data root 下的私有 `codex-*.v1.json` | CSSwitch Gateway |
 | v0.4.2 / v0.4.3 legacy Skill store / inventory | 原样保留但不参与当前 runtime | 非当前运行路径 |
 
-持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先只读复用官方 updater 已下载并通过预检的 `~/.claude-science/bin/claude-science`，不可用时回退当前 App；历史缓存只有在二者都不可用、版本可读且用户仅本次授权时才可使用。详见 [Science runtime 合同](science-runtime.md)。
+持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先把通过本地路径、文件安全与 embedded metadata 校验的 updater executable 固化为 CSSwitch 私有内容寻址 snapshot，再使用当前安装的 App；CSSwitch 隔离 data-dir 内的历史缓存只有在前两者不可用、版本可读且用户仅本次授权时才可使用。embedded metadata 不是官方来源的密码学认证。详见 [Science runtime 合同](science-runtime.md)。
 
 ## 组件边界
 
@@ -58,7 +59,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 
 ### Science runtime
 
-新启动显式传入 data-dir、`--host 127.0.0.1`、独立 `--sandbox-port` 和 `--no-auto-update`。CSSwitch 记录实际 binary path、来源和版本；启动、复用、恢复与停止边界另结合监听 PID、canonical executable 和 data-dir CLI 结果做强身份判断。高频 UI `status` 只做 HTTP health，并返回内存中的 runtime metadata，不能凭它证明端口属于本沙箱。
+新启动显式传入 data-dir、`--host 127.0.0.1`、独立 `--sandbox-port` 和 `--no-auto-update`。updater 来源实际执行 CSSwitch 私有、只读、内容寻址的 snapshot，避免 source 在运行中更新后破坏 stop/recovery 身份。CSSwitch 记录实际 binary path、来源、版本和含 SHA-256 的文件指纹；启动、复用、恢复与停止边界另结合监听 PID、canonical executable 和 data-dir CLI 结果做强身份判断。高频 UI `status` 只做 HTTP health，并返回内存中的 runtime metadata，不能凭它证明端口属于本沙箱。
 
 ### 外部 Skill bridge
 
@@ -66,7 +67,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 
 ### 系统 SSH bridge
 
-默认关闭。启用后，隔离 config stub 以绝对 `Include` 保留 OpenSSH 语义，并只投影真实顶层 config 中安全的显式 Host alias，供不展开 Include 的 Science UI 枚举；窄 wrapper 仍执行 `/usr/bin/ssh -F <real-home>/.ssh/config`。不复制 `.ssh` 或真实连接参数、不启动服务、不开放监听；stub、alias 提取、真实 config 或 wrapper 校验失败会 fail closed。详见[系统 SSH 文档](../features/system-ssh.md)。
+默认关闭。启用后先用只含绝对 `Include` 的隔离 config stub 满足 Science 的 Host 前置校验，再通过窄 wrapper 执行 `/usr/bin/ssh -F <real-home>/.ssh/config`。不复制 `.ssh` 或真实 config 内容、不启动服务、不开放监听；stub、真实 config 或 wrapper 校验失败会 fail closed。详见[系统 SSH 文档](../features/system-ssh.md)。
 
 ### Codex 实验能力
 
@@ -78,7 +79,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 - Science preview port 由 CSSwitch 显式分配并检查冲突、保留端口和溢出。
 - 原始 Science `serve` 输出可能含 data-dir 或一次性 URL，因此不直接进入 CSSwitch 日志。
 - 一次性 Science URL、nonce 与 CSRF 状态只在 backend 内存和限界控制流中使用，不序列化到普通 Tauri status。
-- 第三方模式不读取或复制真实 Claude 登录数据；只按 runtime 合同校验和执行精确官方 downloaded executable，并为其注入独立 HOME/data-dir。
+- 第三方模式不读取或复制真实 Claude 登录数据。
 - 系统浏览器使用自身网络配置；CSSwitch 的 Codex route 只控制 sidecar / Gateway 的 HTTPS socket，不声称检测系统 TUN。
 
 ## 失败边界

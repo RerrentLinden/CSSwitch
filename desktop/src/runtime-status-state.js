@@ -31,10 +31,10 @@ export function scienceRuntimeStatusText(science) {
     ? runtime.version.trim()
     : "版本未知";
   switch (runtime.source) {
-    case "official_downloaded":
-      return `官方已下载 Runtime · ${version}；隔离实例仅复用程序文件。`;
+    case "official_updated":
+      return `官方 Updater Runtime 快照 · ${version}；隔离实例使用已校验的私有快照。`;
     case "installed_app":
-      return `App 内置备用 Runtime · ${version}；官方下载 Runtime 当前不可用。`;
+      return `App 内置备用 Runtime · ${version}；Updater Runtime 当前不可用。`;
     case "explicit":
       return `开发 Override Runtime · ${version}；更新不由隔离实例管理。`;
     case "cached_once":

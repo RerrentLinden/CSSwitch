@@ -343,7 +343,7 @@ function mockInvoke(cmd, args) {
     case "science_runtime_preflight":
       return Promise.resolve(PREVIEW_RUNTIME_CACHE
         ? { status: "cached_choice_required", selected_source: null, selected_version: null, cached_version: "0.0.0-preview-cache", download_url: "https://claude.com/download" }
-        : { status: "installed_ready", selected_source: "official_downloaded", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
+        : { status: "installed_ready", selected_source: "official_updated", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
     case "install_local_skill_package":
       if (!mockImportedSkills.some((item) => item.skill_id === "demo-reader")) {
         mockImportedSkills.push({ skill_id: "demo-reader", display_name: "Demo reader", description: "刚刚从本地包导入的示例 Skill。", source_kind: "csswitch_local", bundle_name: "demo-bundle", attachment_state: "attached" });
@@ -356,9 +356,9 @@ function mockInvoke(cmd, args) {
       return Promise.resolve(null);
     case "status":
       if (QUERY.get("status") === "error") return Promise.reject(new Error("预览注入：运行状态查询失败"));
-      if (QUERY.get("status") === "partial") return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "amber", science: { runtime: { source: "official_downloaded", version: "claude-science preview" } } });
+      if (QUERY.get("status") === "partial") return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "amber", science: { runtime: { source: "official_updated", version: "claude-science preview" } } });
       if (QUERY.get("status") === "stopped") return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber", science: {} });
-      return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "green", science: { runtime: { source: "official_downloaded", version: "claude-science preview" } } });
+      return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "green", science: { runtime: { source: "official_updated", version: "claude-science preview" } } });
     case "boot_error":
       return Promise.resolve(null);
     case "app_version":
@@ -1847,6 +1847,7 @@ function catalogSubmission(kind) {
     candidate_routes: editor.discovered,
     existing_references: editor.refs,
     preserve_existing_sonnet: kind === "connection",
+    prune_replaced_bindings: kind === "connection",
   });
 }
 

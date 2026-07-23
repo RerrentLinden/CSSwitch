@@ -155,10 +155,15 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("runtime_choice: Option<String>", runtime)
         self.assertIn("choice == Some(CACHED_ONCE_CHOICE)", science)
         self.assertIn("fn safe_science_version(path: &Path)", science)
-        self.assertIn("version_cache.version(app_bin)", science)
+        self.assertIn("official_updated_science_bin()", science)
+        self.assertIn("ScienceRuntimeSource::OfficialUpdated", science)
+        self.assertIn("OFFICIAL_SCIENCE_IDENTIFIER", science)
+        self.assertIn("OFFICIAL_SCIENCE_TEAM_ID", science)
+        self.assertIn("sha256: [u8; 32]", science)
+        self.assertIn("runtime_identity_is_current", science)
         self.assertIn('"cached_choice_required"', science)
 
-    def test_official_downloaded_runtime_is_first_choice_without_sharing_data(self):
+    def test_official_updated_runtime_is_first_choice_without_sharing_data(self):
         science = (ROOT / "desktop/src-tauri/src/runtime/science.rs").read_text()
         launch = (ROOT / "scripts/launch-virtual-sandbox.sh").read_text()
         status_state = (ROOT / "desktop/src/runtime-status-state.js").read_text()
@@ -167,19 +172,21 @@ class SkillRuntimeBoundary(unittest.TestCase):
             "pub(crate) fn select_science_runtime_cached", 1
         )[0]
         self.assertLess(
-            selection.index("ScienceRuntimeSource::OfficialDownloaded"),
+            selection.index("ScienceRuntimeSource::OfficialUpdated"),
             selection.index("ScienceRuntimeSource::InstalledApp"),
         )
         candidates = science.split("fn runtime_probe_candidates", 1)[1].split(
             "fn science_status_value", 1
         )[0]
         self.assertLess(
-            candidates.index("ScienceRuntimeSource::OfficialDownloaded"),
+            candidates.index("ScienceRuntimeSource::OfficialUpdated"),
             candidates.index("ScienceRuntimeSource::InstalledApp"),
         )
         self.assertIn('join(".claude-science")', science)
         self.assertIn('join("bin")', science)
         self.assertIn('join("claude-science")', science)
+        self.assertIn("OFFICIAL_UPDATED_SNAPSHOT_DIR", science)
+        self.assertIn("secure_runtime_snapshot_root", science)
         self.assertIn('.env("HOME", sandbox_home())', science)
         self.assertIn("--no-auto-update", launch)
         self.assertIn("隔离实例不登录或检查更新", status_state)
@@ -258,7 +265,9 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("setBusy(false)", one_click)
         self.assertIn("setBrowserFallback(r.fallback_url)", one_click)
 
-        gateway_ready = session.index("verify_gateway_model_catalog(pport, &secret, active_profile)?")
+        gateway_ready = session.index(
+            "verify_gateway_model_catalog_traced(&trace, pport, &secret, active_profile)?"
+        )
         science_spawn = session.index('Command::new("zsh")', gateway_ready)
         self.assertLess(gateway_ready, science_spawn)
         for stage in ("start_gateway", "start_science", "verify_science_catalog"):
@@ -286,6 +295,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("probe_known_runtime(sport, &runtime)", session)
         self.assertIn("sandbox_listener_matches_runtime(sport, &launch_runtime)", session)
         self.assertIn("sandbox_url(sport, &launch_runtime)", session)
+        self.assertIn("runtime_identity_is_current(&launch_runtime)", session)
         self.assertIn('.env("SCIENCE_BIN", &runtime.path)', science)
         self.assertIn('"source": runtime.source.code()', runtime)
 

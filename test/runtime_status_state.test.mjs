@@ -59,15 +59,15 @@ test("未知状态保持中性，明确失败才变红", () => {
 test("隔离 Science 只展示 runtime 来源且不声称自己检查更新", () => {
   assert.equal(
     scienceRuntimeStatusText({
-      runtime: { source: "official_downloaded", version: "claude-science 0.1.15" },
+      runtime: { source: "official_updated", version: "claude-science 0.1.20" },
     }),
-    "官方已下载 Runtime · claude-science 0.1.15；隔离实例仅复用程序文件。",
+    "官方 Updater Runtime 快照 · claude-science 0.1.20；隔离实例使用已校验的私有快照。",
   );
   assert.match(
     scienceRuntimeStatusText({
       runtime: { source: "installed_app", version: "claude-science 0.1.0" },
     }),
-    /App 内置备用 Runtime.*官方下载 Runtime 当前不可用/,
+    /App 内置备用 Runtime.*Updater Runtime 当前不可用/,
   );
   assert.match(scienceRuntimeStatusText(null), /隔离实例不登录或检查更新/);
   assert.doesNotMatch(scienceRuntimeStatusText(null), /已是最新|up to date/i);

@@ -3,7 +3,7 @@
 # Safety boundaries:
 #   - 独立 HOME + 独立 data-dir + 独立端口，绝不修改/删除真实 ~/.claude-science，绝不用端口 8765
 #   - data-dir 只承载持久化状态；不从真实 Science HOME 读取或复制 runtime 或用户数据
-#   - 系统 SSH 仅在显式授权时投影安全 Host alias；连接仍由 OpenSSH 读取真实配置
+#   - 系统 SSH 配置仅在用户显式授权时读取具体 Host alias；不复制 Host block、密钥或整个 ~/.ssh
 #   - 只使用应用在隔离目录中生成的本地状态，与真实账号无关
 #   - 使用独立的本地钥匙串
 #
@@ -22,15 +22,14 @@ REAL_DATA_DIR="$REAL_HOME/.claude-science"
 APP_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
 BIN="${SCIENCE_BIN:-}"
 REUSE_SYSTEM_SSH="${CSSWITCH_REUSE_SYSTEM_SSH:-0}"
+SYSTEM_SSH_HOSTS="${CSSWITCH_SYSTEM_SSH_HOSTS:-}"
 SYSTEM_SSH_CONFIG="$REAL_HOME/.ssh/config"
 SSH_BRIDGE_DIR="$PROJ/scripts/ssh-bridge"
 SSH_BRIDGE_BIN="$SSH_BRIDGE_DIR/ssh"
 SANDBOX_SSH_DIR="$SANDBOX_HOME/.ssh"
 SANDBOX_SSH_CONFIG="$SANDBOX_SSH_DIR/config"
-SSH_STUB_V1_MARKER="# CSSwitch managed system SSH config bridge v1"
-SSH_STUB_V2_MARKER="# CSSwitch managed system SSH config bridge v2"
-SSH_STUB_MAX_ALIASES=512
-SSH_STUB_MAX_BYTES=65536
+SSH_STUB_MARKER_V1="# CSSwitch managed system SSH config bridge v1"
+SSH_STUB_MARKER="# CSSwitch managed system SSH config bridge v2"
 PORT=8990
 PROXY_URL="${CSSWITCH_PROXY_URL:-http://127.0.0.1:18991}"
 EMAIL="virtual@localhost.invalid"
@@ -57,86 +56,24 @@ path_contains_symlink() {
   return 1
 }
 
-escaped_system_ssh_include() {
-  local escaped
-  escaped="$(printf '%s' "$SYSTEM_SSH_CONFIG" | /usr/bin/sed 's/\\/\\\\/g; s/"/\\"/g')"
-  printf 'Include "%s"\n' "$escaped"
-}
-
-is_managed_ssh_stub_v1() {
-  local target="$1" expected_include
-  expected_include="$(escaped_system_ssh_include)"
-  printf '%s\n%s\n' "$SSH_STUB_V1_MARKER" "$expected_include" | /usr/bin/cmp -s - "$target"
-}
-
-is_managed_ssh_stub_v2() {
-  local target="$1" expected_include last_byte size
-  size="$(/usr/bin/stat -f '%z' "$target" 2>/dev/null)" || return 1
-  [[ "$size" =~ ^[0-9]+$ ]] || return 1
-  (( 10#${size} <= SSH_STUB_MAX_BYTES )) || return 1
-  last_byte="$(/usr/bin/tail -c 1 "$target" 2>/dev/null | /usr/bin/od -An -tuC | /usr/bin/tr -d '[:space:]')"
-  [[ "$last_byte" == "10" ]] || return 1
-  expected_include="$(escaped_system_ssh_include)"
-  LC_ALL=C /usr/bin/awk \
-    -v marker="$SSH_STUB_V2_MARKER" \
-    -v include="$expected_include" \
-    -v max_aliases="$SSH_STUB_MAX_ALIASES" '
-      NR == 1 { if ($0 != marker) exit 1; next }
-      NR == 2 { if ($0 != include) exit 1; next }
-      {
-        if ($0 !~ /^Host [-A-Za-z0-9._:@%+]+$/) exit 1
-        alias = substr($0, 6)
-        if (seen[alias]++) exit 1
-        count++
-        if (count > max_aliases) exit 1
-      }
-      END { if (NR < 2) exit 1 }
-    ' "$target" >/dev/null 2>&1
-}
-
 is_managed_ssh_stub() {
-  local target="$1"
+  local target="$1" escaped first second third fourth host
   [[ -f "$target" && ! -L "$target" ]] || return 1
   [[ "$(/usr/bin/stat -f '%u' "$target" 2>/dev/null)" == "$(/usr/bin/id -u)" ]] || return 1
-  is_managed_ssh_stub_v1 "$target" || is_managed_ssh_stub_v2 "$target"
-}
-
-append_projected_ssh_aliases() {
-  local target="$1"
-  LC_ALL=C /usr/bin/awk -v max_aliases="$SSH_STUB_MAX_ALIASES" '
-    function emit(candidate) {
-      if (candidate !~ /^[-A-Za-z0-9._:@%+]+$/) return
-      if (seen[candidate]) return
-      seen[candidate] = 1
-      count++
-      if (count > max_aliases) {
-        overflow = 1
-        exit 42
-      }
-      print "Host " candidate
-    }
-    {
-      line = $0
-      sub(/^[[:space:]]+/, "", line)
-      if (line == "" || substr(line, 1, 1) == "#") next
-      fields = split(line, token, /[[:space:]]+/)
-      keyword = tolower(token[1])
-      start = 0
-      if (keyword == "host") {
-        start = 2
-      } else if (substr(keyword, 1, 5) == "host=") {
-        emit(substr(token[1], 6))
-        start = 2
-      } else {
-        next
-      }
-      for (i = start; i <= fields; i++) {
-        if (substr(token[i], 1, 1) == "#") break
-        emit(token[i])
-      }
-    }
-    END { if (overflow) exit 42 }
-  ' "$SYSTEM_SSH_CONFIG" >> "$target"
+  escaped="$(printf '%s' "$SYSTEM_SSH_CONFIG" | /usr/bin/sed 's/\\/\\\\/g; s/"/\\"/g')"
+  {
+    IFS= read -r first || return 1
+    IFS= read -r second || return 1
+    IFS= read -r third || third=""
+    IFS= read -r fourth || fourth=""
+  } < "$target"
+  if [[ "$first" == "$SSH_STUB_MARKER_V1" && "$second" == "Include \"$escaped\"" && -z "$third" && -z "$fourth" ]]; then
+    return 0
+  fi
+  [[ "$first" == "$SSH_STUB_MARKER" && "$second" == "Host "* && "$third" == "Include \"$escaped\"" && -z "$fourth" ]] || return 1
+  for host in ${(z)second#Host }; do
+    [[ "$host" =~ '^[A-Za-z0-9._:@%+-]{1,255}$' && "$host" != -* ]] || return 1
+  done
 }
 
 prepare_sandbox_ssh_config() {
@@ -162,8 +99,8 @@ prepare_sandbox_ssh_config() {
       return 1
     fi
   fi
-  local expected_include size tmp
-  expected_include="$(escaped_system_ssh_include)"
+  local escaped tmp
+  escaped="$(printf '%s' "$SYSTEM_SSH_CONFIG" | /usr/bin/sed 's/\\/\\\\/g; s/"/\\"/g')"
   tmp="$(/usr/bin/mktemp "$SANDBOX_SSH_DIR/.csswitch-config.XXXXXX" 2>/dev/null)" || {
     echo "拒绝：无法创建隔离 SSH 临时配置"
     return 1
@@ -173,26 +110,11 @@ prepare_sandbox_ssh_config() {
     echo "拒绝：无法收紧隔离 SSH 临时配置权限"
     return 1
   }
-  printf '%s\n%s\n' "$SSH_STUB_V2_MARKER" "$expected_include" > "$tmp" 2>/dev/null || {
+  printf '%s\nHost %s\nInclude "%s"\n' "$SSH_STUB_MARKER" "$SYSTEM_SSH_HOSTS" "$escaped" > "$tmp" 2>/dev/null || {
     /bin/rm -f "$tmp" 2>/dev/null || true
     echo "拒绝：无法写入隔离 SSH 配置"
     return 1
   }
-  if ! append_projected_ssh_aliases "$tmp"; then
-    /bin/rm -f "$tmp" 2>/dev/null || true
-    echo "拒绝：无法安全提取系统 SSH Host alias"
-    return 1
-  fi
-  size="$(/usr/bin/stat -f '%z' "$tmp" 2>/dev/null)" || {
-    /bin/rm -f "$tmp" 2>/dev/null || true
-    echo "拒绝：无法检查隔离 SSH 配置大小"
-    return 1
-  }
-  if [[ ! "$size" =~ ^[0-9]+$ ]] || (( 10#${size} > SSH_STUB_MAX_BYTES )); then
-    /bin/rm -f "$tmp" 2>/dev/null || true
-    echo "拒绝：隔离 SSH Host alias 索引超出安全上限"
-    return 1
-  fi
   /bin/mv -f "$tmp" "$SANDBOX_SSH_CONFIG" 2>/dev/null || {
     /bin/rm -f "$tmp" 2>/dev/null || true
     echo "拒绝：无法提交隔离 SSH 配置"
@@ -261,6 +183,16 @@ if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
     echo "拒绝：CSSwitch SSH bridge 不存在或不是安全的可执行文件"
     exit 1
   fi
+  if [[ -z "$SYSTEM_SSH_HOSTS" ]]; then
+    echo "拒绝：未准备可供 Science 校验的具体 SSH Host alias"
+    exit 1
+  fi
+  for _ssh_host in ${(z)SYSTEM_SSH_HOSTS}; do
+    if [[ ! "$_ssh_host" =~ '^[A-Za-z0-9._:@%+-]{1,255}$' || "$_ssh_host" == -* ]]; then
+      echo "拒绝：SSH Host alias 不符合安全格式"
+      exit 1
+    fi
+  done
 fi
 _dd_real="${DATA_DIR:A}"; _real_real="${REAL_DATA_DIR:A}"
 if [[ "$_dd_real" == "$_real_real" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
@@ -336,7 +268,7 @@ echo "  端口     = $PORT   （真实实例 8765 不受影响）"
 echo "  预览端口 = $PREVIEW_PORT   （显式固定，供本机 Science 预览使用）"
 echo "  二进制   = $BIN_SOURCE"
 if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
-  echo "  系统 SSH = 已显式授权（仅投影 Host alias；连接由 OpenSSH 读取真实配置）"
+  echo "  系统 SSH = 已显式授权（Science 校验具体 alias；OpenSSH 读取 ~/.ssh/config）"
 else
   echo "  系统 SSH = 未授权"
 fi
