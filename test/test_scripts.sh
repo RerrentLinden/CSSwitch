@@ -99,6 +99,26 @@ if [ $rc_ssh -eq 0 ] && echo "$out_ssh" | grep -qx 'hostname 127.0.0.1'; then ok
 if [ ! -e "$T/vh-capture/.claude-science/runtime/real-user-sentinel" ]; then ok "launch never copies real Science runtime data"; else no "launch copied real Science data into sandbox"; fi
 if ! echo "$out" | grep -Fq "$T/vh-capture" && ! echo "$out" | grep -Fq "$FAKE_CAPTURE"; then ok "launch log redacts sandbox and binary paths"; else no "launch log exposed sensitive paths: $out"; fi
 
+LEGACY_SANDBOX="$T/vh-legacy-ssh"
+LEGACY_SANDBOX_CONFIG="$LEGACY_SANDBOX/.ssh/config"
+mkdir -p "$LEGACY_SANDBOX/.ssh"
+printf '# CSSwitch managed system SSH config bridge v2\nInclude \"%s\"\nHost test-only\nHost second-alias\n' "$OUTER_HOME/.ssh/config" > "$LEGACY_SANDBOX_CONFIG"
+chmod 600 "$LEGACY_SANDBOX_CONFIG"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$LEGACY_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=1 CSSWITCH_SYSTEM_SSH_HOSTS="test-only second-alias" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9945 --skip-oauth-forge 2>&1)"; rc=$?
+EXPECTED_UPSTREAM_STUB="$T/expected-upstream-ssh-stub"
+printf '# CSSwitch managed system SSH config bridge v2\nHost test-only second-alias\nInclude \"%s\"\n' "$OUTER_HOME/.ssh/config" > "$EXPECTED_UPSTREAM_STUB"
+if [ $rc -eq 0 ] && cmp -s "$EXPECTED_UPSTREAM_STUB" "$LEGACY_SANDBOX_CONFIG"; then ok "legacy fork v2 SSH stub migrates to upstream v0.8.2 format"; else no "legacy fork v2 SSH stub was not migrated safely (rc=$rc): $out"; fi
+
+MALFORMED_LEGACY_SANDBOX="$T/vh-malformed-legacy-ssh"
+MALFORMED_LEGACY_CONFIG="$MALFORMED_LEGACY_SANDBOX/.ssh/config"
+MALFORMED_LEGACY_COPY="$T/malformed-legacy-copy"
+mkdir -p "$MALFORMED_LEGACY_SANDBOX/.ssh"
+printf '# CSSwitch managed system SSH config bridge v2\nInclude \"%s\"\nHost test-only\nUser must-survive\n' "$OUTER_HOME/.ssh/config" > "$MALFORMED_LEGACY_CONFIG"
+chmod 600 "$MALFORMED_LEGACY_CONFIG"
+cp "$MALFORMED_LEGACY_CONFIG" "$MALFORMED_LEGACY_COPY"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$MALFORMED_LEGACY_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 CSSWITCH_SYSTEM_SSH_HOSTS="test-only" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9947 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && cmp -s "$MALFORMED_LEGACY_COPY" "$MALFORMED_LEGACY_CONFIG"; then ok "malformed legacy v2 SSH stub is preserved and rejected"; else no "malformed legacy v2 SSH stub was accepted or changed (rc=$rc): $out"; fi
+
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=0 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && [ ! -e "$SANDBOX_SSH_CONFIG" ] && [ ! -L "$SANDBOX_SSH_CONFIG" ]; then ok "disabling SSH removes only the managed sandbox config"; else no "disabling SSH left the managed sandbox config or failed (rc=$rc): $out"; fi
 

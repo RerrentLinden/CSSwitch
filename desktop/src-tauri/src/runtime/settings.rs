@@ -1,9 +1,39 @@
+use std::collections::HashSet;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const SSH_STUB_MARKER: &str = "# CSSwitch managed system SSH config bridge v1";
 const SSH_STUB_MARKER_V2: &str = "# CSSwitch managed system SSH config bridge v2";
+const LEGACY_SSH_STUB_MAX_ALIASES: usize = 512;
+const LEGACY_SSH_STUB_MAX_BYTES: usize = 65_536;
+
+fn legacy_fork_v2_ssh_stub_text(text: &str, escaped_system_config: &str) -> bool {
+    // Fork 242c4b2 reused the upstream v2 marker for an Include-first,
+    // one-alias-per-line shape. This predicate proves only file ownership for
+    // migration/revocation; running-stub validation still requires upstream v2.
+    if text.len() > LEGACY_SSH_STUB_MAX_BYTES || !text.ends_with('\n') {
+        return false;
+    }
+    let expected_include = format!("Include \"{escaped_system_config}\"");
+    let mut lines = text.lines();
+    if lines.next() != Some(SSH_STUB_MARKER_V2) || lines.next() != Some(expected_include.as_str()) {
+        return false;
+    }
+    let mut aliases = HashSet::new();
+    for line in lines {
+        let Some(alias) = line.strip_prefix("Host ") else {
+            return false;
+        };
+        if !crate::runtime::ssh_bridge::is_concrete_alias(alias)
+            || !aliases.insert(alias)
+            || aliases.len() > LEGACY_SSH_STUB_MAX_ALIASES
+        {
+            return false;
+        }
+    }
+    true
+}
 
 fn managed_ssh_stub_text(text: &str, expected_system_config: &Path) -> bool {
     let escaped = expected_system_config
@@ -14,7 +44,7 @@ fn managed_ssh_stub_text(text: &str, expected_system_config: &Path) -> bool {
         return true;
     }
     let lines = text.lines().collect::<Vec<_>>();
-    lines.len() == 3
+    (lines.len() == 3
         && lines[0] == SSH_STUB_MARKER_V2
         && lines[1].strip_prefix("Host ").is_some_and(|hosts| {
             let aliases = hosts.split_ascii_whitespace().collect::<Vec<_>>();
@@ -23,7 +53,8 @@ fn managed_ssh_stub_text(text: &str, expected_system_config: &Path) -> bool {
                     .iter()
                     .all(|alias| crate::runtime::ssh_bridge::is_concrete_alias(alias))
         })
-        && lines[2] == format!("Include \"{escaped}\"")
+        && lines[2] == format!("Include \"{escaped}\""))
+        || legacy_fork_v2_ssh_stub_text(text, &escaped)
 }
 
 fn system_ssh_config_path_for_home(home: &Path) -> Result<PathBuf, String> {
@@ -198,9 +229,9 @@ mod tests {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     use super::{
-        remove_managed_sandbox_ssh_stub_for_config, system_ssh_config_path_for_home,
-        validate_managed_sandbox_ssh_stub_for_config, validate_runtime_ports, SSH_STUB_MARKER,
-        SSH_STUB_MARKER_V2,
+        legacy_fork_v2_ssh_stub_text, remove_managed_sandbox_ssh_stub_for_config,
+        system_ssh_config_path_for_home, validate_managed_sandbox_ssh_stub_for_config,
+        validate_runtime_ports, SSH_STUB_MARKER, SSH_STUB_MARKER_V2,
     };
 
     #[test]
@@ -269,6 +300,18 @@ mod tests {
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::write(
             &config,
+            format!(
+                "{SSH_STUB_MARKER_V2}\nInclude \"{}\"\nHost alpha\nHost beta-2\n",
+                expected_system_config.display()
+            ),
+        )
+        .unwrap();
+        remove_managed_sandbox_ssh_stub_for_config(&home, &expected_system_config).unwrap();
+        assert!(!config.exists());
+
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            &config,
             format!("{SSH_STUB_MARKER}\nInclude \"/different/config\"\n\nHost foreign\n"),
         )
         .unwrap();
@@ -279,6 +322,33 @@ mod tests {
             .unwrap()
             .contains("Host foreign"));
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn legacy_fork_v2_stub_ownership_is_strict() {
+        let expected = "/tmp/real-home/.ssh/config";
+        let valid =
+            format!("{SSH_STUB_MARKER_V2}\nInclude \"{expected}\"\nHost alpha\nHost beta-2\n");
+        assert!(legacy_fork_v2_ssh_stub_text(&valid, expected));
+
+        for invalid in [
+            format!("{SSH_STUB_MARKER_V2}\nInclude \"/different/config\"\nHost alpha\n"),
+            format!("{SSH_STUB_MARKER_V2}\nInclude \"{expected}\"\nHost alpha\nHost alpha\n"),
+            format!("{SSH_STUB_MARKER_V2}\nInclude \"{expected}\"\nHost -unsafe\n"),
+            format!("{SSH_STUB_MARKER_V2}\nInclude \"{expected}\"\nHost *.example\n"),
+            format!("{SSH_STUB_MARKER_V2}\nInclude \"{expected}\"\nHost alpha\nUser foreign\n"),
+            format!("{SSH_STUB_MARKER_V2}\nInclude \"{expected}\"\nHost alpha"),
+        ] {
+            assert!(!legacy_fork_v2_ssh_stub_text(&invalid, expected));
+        }
+
+        let too_many_aliases = (0..=super::LEGACY_SSH_STUB_MAX_ALIASES)
+            .map(|index| format!("Host alias-{index}\n"))
+            .collect::<String>();
+        assert!(!legacy_fork_v2_ssh_stub_text(
+            &format!("{SSH_STUB_MARKER_V2}\nInclude \"{expected}\"\n{too_many_aliases}"),
+            expected
+        ));
     }
 
     #[test]
@@ -314,6 +384,22 @@ mod tests {
         )
         .is_err());
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_managed_sandbox_ssh_stub_for_config(
+            &home,
+            &expected_system_config,
+            &expected
+        )
+        .is_err());
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        std::fs::write(
+            &config,
+            format!(
+                "{SSH_STUB_MARKER_V2}\nInclude \"{}\"\nHost alpha\nHost beta\n",
+                expected_system_config.display()
+            ),
+        )
+        .unwrap();
         assert!(validate_managed_sandbox_ssh_stub_for_config(
             &home,
             &expected_system_config,

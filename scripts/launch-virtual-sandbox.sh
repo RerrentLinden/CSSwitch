@@ -30,6 +30,8 @@ SANDBOX_SSH_DIR="$SANDBOX_HOME/.ssh"
 SANDBOX_SSH_CONFIG="$SANDBOX_SSH_DIR/config"
 SSH_STUB_MARKER_V1="# CSSwitch managed system SSH config bridge v1"
 SSH_STUB_MARKER="# CSSwitch managed system SSH config bridge v2"
+LEGACY_SSH_STUB_MAX_ALIASES=512
+LEGACY_SSH_STUB_MAX_BYTES=65536
 PORT=8990
 PROXY_URL="${CSSWITCH_PROXY_URL:-http://127.0.0.1:18991}"
 EMAIL="virtual@localhost.invalid"
@@ -56,6 +58,58 @@ path_contains_symlink() {
   return 1
 }
 
+is_legacy_managed_ssh_stub_v2() {
+  # Fork 242c4b2 used the same v2 marker as upstream but wrote Include first
+  # and one Host alias per line. Recognize only that bounded, data-only shape
+  # so prepare_sandbox_ssh_config can atomically replace it with upstream v2.
+  local target="$1" escaped size last_byte
+  size="$(/usr/bin/stat -f '%z' "$target" 2>/dev/null)" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] || return 1
+  (( 10#${size} <= LEGACY_SSH_STUB_MAX_BYTES )) || return 1
+  last_byte="$(/usr/bin/tail -c 1 "$target" 2>/dev/null | /usr/bin/od -An -tuC | /usr/bin/tr -d '[:space:]')"
+  [[ "$last_byte" == "10" ]] || return 1
+  escaped="$(printf '%s' "$SYSTEM_SSH_CONFIG" | /usr/bin/sed 's/\\/\\\\/g; s/"/\\"/g')"
+  LC_ALL=C /usr/bin/awk \
+    -v marker="$SSH_STUB_MARKER" \
+    -v include="Include \"$escaped\"" \
+    -v max_aliases="$LEGACY_SSH_STUB_MAX_ALIASES" '
+      NR == 1 {
+        if ($0 != marker) {
+          valid = 0
+          exit
+        }
+        next
+      }
+      NR == 2 {
+        if ($0 != include) {
+          valid = 0
+          exit
+        }
+        next
+      }
+      {
+        if ($0 !~ /^Host [A-Za-z0-9._:@%+-]+$/) {
+          valid = 0
+          exit
+        }
+        alias = substr($0, 6)
+        if (length(alias) > 255 || substr(alias, 1, 1) == "-" || seen[alias]++) {
+          valid = 0
+          exit
+        }
+        count++
+        if (count > max_aliases) {
+          valid = 0
+          exit
+        }
+      }
+      BEGIN { valid = 1 }
+      END {
+        if (!valid || NR < 2) exit 1
+      }
+    ' "$target" >/dev/null 2>&1
+}
+
 is_managed_ssh_stub() {
   local target="$1" escaped first second third fourth host
   [[ -f "$target" && ! -L "$target" ]] || return 1
@@ -70,10 +124,13 @@ is_managed_ssh_stub() {
   if [[ "$first" == "$SSH_STUB_MARKER_V1" && "$second" == "Include \"$escaped\"" && -z "$third" && -z "$fourth" ]]; then
     return 0
   fi
-  [[ "$first" == "$SSH_STUB_MARKER" && "$second" == "Host "* && "$third" == "Include \"$escaped\"" && -z "$fourth" ]] || return 1
-  for host in ${(z)second#Host }; do
-    [[ "$host" =~ '^[A-Za-z0-9._:@%+-]{1,255}$' && "$host" != -* ]] || return 1
-  done
+  if [[ "$first" == "$SSH_STUB_MARKER" && "$second" == "Host "* && "$third" == "Include \"$escaped\"" && -z "$fourth" ]]; then
+    for host in ${(z)second#Host }; do
+      [[ "$host" =~ '^[A-Za-z0-9._:@%+-]{1,255}$' && "$host" != -* ]] || return 1
+    done
+    return 0
+  fi
+  is_legacy_managed_ssh_stub_v2 "$target"
 }
 
 prepare_sandbox_ssh_config() {
