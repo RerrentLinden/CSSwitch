@@ -35,7 +35,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 | provider profiles 与 CSSwitch settings | `~/.csswitch/` 配置 | CSSwitch |
 | Gateway 生命周期与本地路由 | CSSwitch runtime state | CSSwitch |
 | Science executable 候选 | 通过 CSSwitch 固定路径、文件安全与 embedded metadata 本地校验的 `~/.claude-science/bin/claude-science`，或 `/Applications/Claude Science.app/.../claude-science` | 用户 / Science updater / installer |
-| updater runtime snapshot | `<CSSwitch data root>/runtime-snapshots/science/claude-science-<sha256>` | CSSwitch |
+| updater runtime snapshot | `<CSSwitch data root>/runtime-snapshots/science/sha256-<sha256>/claude-science` | CSSwitch |
 | 持久 Science 状态 | `~/.csswitch/sandbox/home/.claude-science` | Science |
 | 版本 runtime 资源 | `<data-dir>/runtime/<version>/` | Science |
 | 组织与 Skills | `<data-dir>/orgs/<active-org>/...` | Science 组织 |

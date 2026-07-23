@@ -28,6 +28,8 @@ const OFFICIAL_SCIENCE_TEAM_ID: &str = "Q6L2SF6YDW";
 const MIN_SCIENCE_BINARY_SIZE: u64 = 1024 * 1024;
 const MAX_SCIENCE_BINARY_SIZE: u64 = 512 * 1024 * 1024;
 const OFFICIAL_UPDATED_SNAPSHOT_DIR: &str = "runtime-snapshots/science";
+const OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE: &str = "claude-science";
+const OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX: &str = "sha256-";
 const SCIENCE_VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 static SCIENCE_VERSION_OUTPUT_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -482,6 +484,110 @@ fn secure_runtime_snapshot_root(root: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn valid_snapshot_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn secure_runtime_snapshot_version_dir(
+    snapshot_root: &Path,
+    sha256: &str,
+    create: bool,
+) -> Result<PathBuf, String> {
+    if !valid_snapshot_sha256(sha256) {
+        return Err("Science runtime snapshot SHA-256 非法".into());
+    }
+    let version_dir = snapshot_root.join(format!(
+        "{OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX}{sha256}"
+    ));
+    match version_dir.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            match fs::create_dir(&version_dir) {
+                Ok(()) => fs::set_permissions(&version_dir, fs::Permissions::from_mode(0o700))
+                    .map_err(|error| {
+                        format!("收紧 Science runtime snapshot 版本目录权限失败：{error}")
+                    })?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!(
+                        "创建 Science runtime snapshot 版本目录失败：{error}"
+                    ))
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err("Science runtime snapshot 版本目录不存在".into())
+        }
+        Err(error) => {
+            return Err(format!(
+                "检查 Science runtime snapshot 版本目录失败：{error}"
+            ))
+        }
+    }
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let uid = unsafe { libc::geteuid() };
+    let metadata = version_dir
+        .symlink_metadata()
+        .map_err(|error| format!("读取 Science runtime snapshot 版本目录失败：{error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o077 != 0
+        || version_dir.parent() != Some(snapshot_root)
+        || version_dir.canonicalize().ok().as_deref() != Some(version_dir.as_path())
+    {
+        return Err("Science runtime snapshot 版本目录身份或权限不安全".into());
+    }
+    Ok(version_dir)
+}
+
+fn official_updated_snapshot_sha_for_path(
+    snapshot_root: &Path,
+    path: &Path,
+) -> Result<Option<String>, String> {
+    if path.parent() == Some(snapshot_root) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("Science runtime snapshot 文件名不可识别")?;
+        let Some(sha256) = name.strip_prefix("claude-science-") else {
+            return Ok(None);
+        };
+        if !valid_snapshot_sha256(sha256) {
+            return Err("Science runtime snapshot 文件名 SHA-256 非法".into());
+        }
+        return Ok(Some(sha256.to_string()));
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some(OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE)
+    {
+        return Ok(None);
+    }
+    let Some(version_dir) = path.parent() else {
+        return Ok(None);
+    };
+    if version_dir.parent() != Some(snapshot_root) {
+        return Ok(None);
+    }
+    let name = version_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Science runtime snapshot 版本目录名不可识别")?;
+    let Some(sha256) = name.strip_prefix(OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX) else {
+        return Ok(None);
+    };
+    if !valid_snapshot_sha256(sha256) {
+        return Err("Science runtime snapshot 版本目录 SHA-256 非法".into());
+    }
+    let secured = secure_runtime_snapshot_version_dir(snapshot_root, sha256, false)?;
+    if secured != version_dir {
+        return Err("Science runtime snapshot 版本目录身份不一致".into());
+    }
+    Ok(Some(sha256.to_string()))
+}
+
 fn official_updated_snapshot_from_process_paths(
     snapshot_root: &Path,
     process_paths: &[PathBuf],
@@ -503,24 +609,17 @@ fn official_updated_snapshot_from_process_paths(
     {
         return Err("Science runtime snapshot 目录身份或权限不安全".into());
     }
-    let mut matching = process_paths
-        .iter()
-        .filter(|path| path.parent() == Some(snapshot_root));
-    let Some(path) = matching.next() else {
+    let mut matching = Vec::new();
+    for path in process_paths {
+        if let Some(sha256) = official_updated_snapshot_sha_for_path(snapshot_root, path)? {
+            matching.push((path, sha256));
+        }
+    }
+    let Some((path, expected_sha)) = matching.pop() else {
         return Ok(None);
     };
-    if matching.next().is_some() {
+    if !matching.is_empty() {
         return Err("Science listener 映射到多个 runtime snapshot，已拒绝恢复".into());
-    }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("Science runtime snapshot 文件名不可识别")?;
-    let Some(expected_sha) = name.strip_prefix("claude-science-") else {
-        return Err("Science listener executable 不是内容寻址 snapshot".into());
-    };
-    if expected_sha.len() != 64 || !expected_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("Science runtime snapshot 文件名 SHA-256 非法".into());
     }
     let metadata = path
         .symlink_metadata()
@@ -537,7 +636,7 @@ fn official_updated_snapshot_from_process_paths(
     }
     let fingerprint =
         science_executable_fingerprint(path).ok_or("Science runtime snapshot 内容无法确认")?;
-    if fingerprint_sha256_hex(&fingerprint) != expected_sha.to_ascii_lowercase() {
+    if fingerprint_sha256_hex(&fingerprint) != expected_sha {
         return Err("Science runtime snapshot 文件名与内容 SHA-256 不一致".into());
     }
     if verify_local_identity {
@@ -663,7 +762,8 @@ fn official_updated_snapshot_for_home(
 
         let sha256: [u8; 32] = digest.finalize().into();
         let name: String = sha256.iter().map(|byte| format!("{byte:02x}")).collect();
-        let snapshot = snapshot_root.join(format!("claude-science-{name}"));
+        let version_dir = secure_runtime_snapshot_version_dir(&snapshot_root, &name, true)?;
+        let snapshot = version_dir.join(OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE);
         match fs::hard_link(&temporary, &snapshot) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1593,17 +1693,21 @@ pub(crate) fn stop_sandbox<R: Runtime>(
             );
         }
     }
-    if err.is_none() && loopback_port_accepts_tcp(sandbox_port) {
-        match listener_before_stop {
-            Some(pid) if listener_runtime_pid(sandbox_port, runtime) == Some(pid) => {
-                // Some upstream Science builds return success and remove their
-                // lockfile without terminating the daemon. The user requested
-                // stop, so signal only the exact PID whose listener and
-                // canonical executable were proved both before and after CLI.
+    if loopback_port_accepts_tcp(sandbox_port) {
+        match exact_stop_fallback_pid(
+            listener_before_stop,
+            listener_runtime_pid(sandbox_port, runtime),
+        ) {
+            Some(pid) => {
+                // Some upstream Science builds either return success without
+                // terminating or reject a CSSwitch legacy flat snapshot name.
+                // The user requested stop, so signal only the exact PID whose
+                // listener and canonical executable were proved before and
+                // after the CLI attempt.
                 // SAFETY: kill does not dereference pointers. PID > 1 and exact
                 // listener identity were checked immediately above.
                 if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
-                    err = Some("Science stop 返回成功但精确 daemon 无法接收 TERM。".into());
+                    err = Some("Science stop 后精确 daemon 无法接收 TERM。".into());
                 } else {
                     for _ in 0..50 {
                         if !loopback_port_accepts_tcp(sandbox_port) {
@@ -1624,17 +1728,17 @@ pub(crate) fn stop_sandbox<R: Runtime>(
                     }
                     if loopback_port_accepts_tcp(sandbox_port) {
                         err = Some(
-                            "Science stop 返回成功，但端口仍被占用；已拒绝把未知监听者当作停止成功。"
-                                .into(),
+                            "Science stop 后端口仍被占用；已拒绝把未知监听者当作停止成功。".into(),
                         );
+                    } else {
+                        err = None;
                     }
                 }
             }
             _ => {
-                err = Some(
-                    "Science stop 返回成功，但停止后的监听身份与启动记录不一致；未发送信号。"
-                        .into(),
-                );
+                if err.is_none() {
+                    err = Some("Science stop 后监听身份与启动记录不一致；未发送信号。".into());
+                }
             }
         }
     }
@@ -1643,6 +1747,13 @@ pub(crate) fn stop_sandbox<R: Runtime>(
     match err {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+fn exact_stop_fallback_pid(before: Option<u32>, after: Option<u32>) -> Option<u32> {
+    match (before, after) {
+        (Some(before), Some(after)) if before > 1 && before == after => Some(before),
+        _ => None,
     }
 }
 
@@ -1656,14 +1767,14 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     use super::{
-        classify_known_runtime_state, classify_sandbox_state, first_http_url,
-        isolate_sandbox_browser_origin, official_science_identity_from_codesign_output,
-        official_updated_science_bin_for_home, official_updated_snapshot_for_home,
-        official_updated_snapshot_from_process_paths, parse_official_science_identity,
-        parse_unique_listener_pid, runtime_identity_is_current, runtime_status_value,
-        safe_science_version_with_timeout, sandbox_home, sandbox_running_ours, sandbox_url,
-        science_executable_fingerprint, science_runtime_preflight_for_paths,
-        science_runtime_preflight_for_paths_cached,
+        classify_known_runtime_state, classify_sandbox_state, exact_stop_fallback_pid,
+        fingerprint_sha256_hex, first_http_url, isolate_sandbox_browser_origin,
+        official_science_identity_from_codesign_output, official_updated_science_bin_for_home,
+        official_updated_snapshot_for_home, official_updated_snapshot_from_process_paths,
+        parse_official_science_identity, parse_unique_listener_pid, runtime_identity_is_current,
+        runtime_status_value, safe_science_version_with_timeout, sandbox_home,
+        sandbox_running_ours, sandbox_url, science_executable_fingerprint,
+        science_runtime_preflight_for_paths, science_runtime_preflight_for_paths_cached,
         science_runtime_preflight_for_paths_with_updated, science_status_running,
         secure_runtime_snapshot_root, select_science_runtime_for_paths,
         select_science_runtime_for_paths_cached, select_science_runtime_for_paths_with_updated,
@@ -1672,6 +1783,7 @@ mod tests {
         OfficialScienceIdentityError, SandboxScienceState, ScienceRuntimeIdentity,
         ScienceRuntimeSource, ScienceVersionCache, CACHED_ONCE_CHOICE,
         OFFICIAL_SCIENCE_IDENTIFIERS, OFFICIAL_SCIENCE_TEAM_ID,
+        OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE, OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -2009,6 +2121,15 @@ mod tests {
     }
 
     #[test]
+    fn stop_fallback_requires_the_same_exact_listener_pid() {
+        assert_eq!(exact_stop_fallback_pid(Some(42), Some(42)), Some(42));
+        assert_eq!(exact_stop_fallback_pid(Some(42), Some(43)), None);
+        assert_eq!(exact_stop_fallback_pid(None, Some(42)), None);
+        assert_eq!(exact_stop_fallback_pid(Some(42), None), None);
+        assert_eq!(exact_stop_fallback_pid(Some(1), Some(1)), None);
+    }
+
+    #[test]
     fn known_runtime_state_requires_listener_binary_match() {
         assert_eq!(
             classify_known_runtime_state(Some(true), true, true, true),
@@ -2184,6 +2305,15 @@ mod tests {
         )?
         .expect("updated snapshot");
         assert_ne!(snapshot, updated_bin);
+        assert_eq!(
+            snapshot.file_name().and_then(|name| name.to_str()),
+            Some(OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE)
+        );
+        assert!(snapshot
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX)));
 
         let preflight = science_runtime_preflight_for_paths_with_updated(
             &data_dir,
@@ -2278,7 +2408,7 @@ mod tests {
                 &[unrelated, snapshot_a.clone()],
                 false,
             )?,
-            Some(snapshot_a),
+            Some(snapshot_a.clone()),
             "recovery validates only the executable reported for the live listener"
         );
         assert_eq!(
@@ -2288,6 +2418,21 @@ mod tests {
                 false,
             )?,
             Some(snapshot_b)
+        );
+
+        let legacy_sha = fingerprint_sha256_hex(
+            &science_executable_fingerprint(&snapshot_a).expect("snapshot fingerprint"),
+        );
+        let legacy_flat = snapshots.join(format!("claude-science-{legacy_sha}"));
+        fs::hard_link(&snapshot_a, &legacy_flat)?;
+        assert_eq!(
+            official_updated_snapshot_from_process_paths(
+                &snapshots,
+                std::slice::from_ref(&legacy_flat),
+                false,
+            )?,
+            Some(legacy_flat),
+            "an already-running legacy flat snapshot remains recoverable for safe teardown"
         );
         fs::remove_dir_all(root)?;
         Ok(())
@@ -2321,6 +2466,23 @@ mod tests {
             0o755
         );
         assert!(ancestor_target.read_dir()?.next().is_none());
+
+        let snapshots = root.join("snapshots");
+        fs::create_dir(&snapshots)?;
+        let version_target = root.join("version-target");
+        fs::create_dir(&version_target)?;
+        let version_link = snapshots.join(format!(
+            "{OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX}{}",
+            "a".repeat(64)
+        ));
+        symlink(&version_target, &version_link)?;
+        assert!(official_updated_snapshot_from_process_paths(
+            &snapshots,
+            &[version_link.join(OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE)],
+            false,
+        )
+        .is_err());
+        assert!(version_target.read_dir()?.next().is_none());
         fs::remove_dir_all(root)?;
         Ok(())
     }
