@@ -23,7 +23,7 @@ pub(crate) const SCIENCE_BIN: &str =
 pub(crate) const SCIENCE_DOWNLOAD_URL: &str = "https://claude.com/download";
 pub(crate) const CACHED_ONCE_CHOICE: &str = "cached_once";
 const OFFICIAL_UPDATED_RUNTIME_RELATIVE: &str = ".claude-science/bin/claude-science";
-const OFFICIAL_SCIENCE_IDENTIFIER: &str = "com.anthropic.operon.cli";
+const OFFICIAL_SCIENCE_IDENTIFIERS: &[&str] = &["com.anthropic.operon", "com.anthropic.operon.cli"];
 const OFFICIAL_SCIENCE_TEAM_ID: &str = "Q6L2SF6YDW";
 const MIN_SCIENCE_BINARY_SIZE: u64 = 1024 * 1024;
 const MAX_SCIENCE_BINARY_SIZE: u64 = 512 * 1024 * 1024;
@@ -243,30 +243,119 @@ fn is_explicit_executable_file(path: &Path) -> bool {
     is_executable_file(path)
 }
 
-fn official_updated_identity_metadata_matches(path: &Path) -> bool {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OfficialScienceEmbeddedIdentity {
+    identifier: String,
+    team_identifier: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OfficialScienceIdentityError {
+    NotMachO,
+    CodesignUnavailable,
+    CodesignFailed,
+    CodesignOutputTooLarge,
+    MissingIdentifier,
+    DuplicateIdentifier,
+    MissingTeamIdentifier,
+    DuplicateTeamIdentifier,
+    UnsupportedIdentifier,
+    UnexpectedTeamIdentifier,
+}
+
+impl OfficialScienceIdentityError {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::NotMachO => "不是受支持的 Mach-O",
+            Self::CodesignUnavailable => "embedded metadata 检查命令不可用",
+            Self::CodesignFailed => "embedded metadata 检查失败",
+            Self::CodesignOutputTooLarge => "embedded metadata 输出超出安全上限",
+            Self::MissingIdentifier => "embedded identifier 缺失",
+            Self::DuplicateIdentifier => "embedded identifier 重复",
+            Self::MissingTeamIdentifier => "Team ID 缺失",
+            Self::DuplicateTeamIdentifier => "Team ID 重复",
+            Self::UnsupportedIdentifier => "embedded identifier 不受支持",
+            Self::UnexpectedTeamIdentifier => "Team ID 不匹配",
+        }
+    }
+}
+
+fn parse_unique_codesign_field(
+    details: &str,
+    prefix: &str,
+    missing: OfficialScienceIdentityError,
+    duplicate: OfficialScienceIdentityError,
+) -> Result<String, OfficialScienceIdentityError> {
+    let mut values = details.lines().filter_map(|line| line.strip_prefix(prefix));
+    let value = values.next().ok_or(missing)?;
+    if values.next().is_some() {
+        return Err(duplicate);
+    }
+    if value.is_empty() {
+        return Err(missing);
+    }
+    Ok(value.to_string())
+}
+
+fn parse_official_science_identity(
+    details: &str,
+) -> Result<OfficialScienceEmbeddedIdentity, OfficialScienceIdentityError> {
+    Ok(OfficialScienceEmbeddedIdentity {
+        identifier: parse_unique_codesign_field(
+            details,
+            "Identifier=",
+            OfficialScienceIdentityError::MissingIdentifier,
+            OfficialScienceIdentityError::DuplicateIdentifier,
+        )?,
+        team_identifier: parse_unique_codesign_field(
+            details,
+            "TeamIdentifier=",
+            OfficialScienceIdentityError::MissingTeamIdentifier,
+            OfficialScienceIdentityError::DuplicateTeamIdentifier,
+        )?,
+    })
+}
+
+fn official_science_identity_from_codesign_output(
+    output: &Output,
+) -> Result<OfficialScienceEmbeddedIdentity, OfficialScienceIdentityError> {
+    if output.stderr.len() > 64 * 1024 {
+        return Err(OfficialScienceIdentityError::CodesignOutputTooLarge);
+    }
+    if !output.status.success() {
+        return Err(OfficialScienceIdentityError::CodesignFailed);
+    }
+    parse_official_science_identity(&String::from_utf8_lossy(&output.stderr))
+}
+
+fn validate_official_science_identity(
+    identity: &OfficialScienceEmbeddedIdentity,
+) -> Result<(), OfficialScienceIdentityError> {
+    if !OFFICIAL_SCIENCE_IDENTIFIERS.contains(&identity.identifier.as_str()) {
+        return Err(OfficialScienceIdentityError::UnsupportedIdentifier);
+    }
+    if identity.team_identifier != OFFICIAL_SCIENCE_TEAM_ID {
+        return Err(OfficialScienceIdentityError::UnexpectedTeamIdentifier);
+    }
+    Ok(())
+}
+
+fn inspect_official_science_identity(
+    path: &Path,
+) -> Result<OfficialScienceEmbeddedIdentity, OfficialScienceIdentityError> {
     // Current upstream Science updater binaries expose the same embedded
-    // identifier and Team ID as the App seed, but fail strict cryptographic
-    // `codesign --verify`. Treat these fields only as format/identity guards;
-    // the local trust boundary is the fixed user-owned path plus SHA-256-bound
-    // runtime identity below, not a claim of verified official provenance.
+    // Team ID as the App seed, but the updater and App CLI use different known
+    // identifiers and may fail strict cryptographic `codesign --verify`. Treat
+    // these fields only as format/identity guards; the local trust boundary is
+    // the fixed user-owned path plus SHA-256-bound runtime identity below, not
+    // a claim of verified official provenance.
     let output = Command::new("/usr/bin/codesign")
         .args(["-d", "--verbose=4"])
         .arg(path)
         .stdout(Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() || output.stderr.len() > 64 * 1024 {
-        return false;
-    }
-    let details = String::from_utf8_lossy(&output.stderr);
-    details
-        .lines()
-        .any(|line| line == format!("Identifier={OFFICIAL_SCIENCE_IDENTIFIER}"))
-        && details
-            .lines()
-            .any(|line| line == format!("TeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}"))
+        .output()
+        .map_err(|_| OfficialScienceIdentityError::CodesignUnavailable)?;
+    official_science_identity_from_codesign_output(&output)
 }
 
 fn file_is_macho(path: &Path) -> bool {
@@ -292,6 +381,16 @@ fn file_is_macho(path: &Path) -> bool {
             | [0xca, 0xfe, 0xba, 0xbf]
             | [0xbf, 0xba, 0xfe, 0xca]
     )
+}
+
+fn validate_official_updated_local_identity(
+    path: &Path,
+) -> Result<(), OfficialScienceIdentityError> {
+    if !file_is_macho(path) {
+        return Err(OfficialScienceIdentityError::NotMachO);
+    }
+    let identity = inspect_official_science_identity(path)?;
+    validate_official_science_identity(&identity)
 }
 
 fn official_updated_science_bin_for_home(
@@ -328,8 +427,7 @@ fn official_updated_science_bin_for_home(
     }
     if verify_local_identity
         && (!(MIN_SCIENCE_BINARY_SIZE..=MAX_SCIENCE_BINARY_SIZE).contains(&metadata.len())
-            || !file_is_macho(&candidate)
-            || !official_updated_identity_metadata_matches(&candidate))
+            || validate_official_updated_local_identity(&candidate).is_err())
     {
         return None;
     }
@@ -442,10 +540,13 @@ fn official_updated_snapshot_from_process_paths(
     if fingerprint_sha256_hex(&fingerprint) != expected_sha.to_ascii_lowercase() {
         return Err("Science runtime snapshot 文件名与内容 SHA-256 不一致".into());
     }
-    if verify_local_identity
-        && (!file_is_macho(path) || !official_updated_identity_metadata_matches(path))
-    {
-        return Err("Science runtime snapshot 未通过 Mach-O/embedded metadata 复核".into());
+    if verify_local_identity {
+        validate_official_updated_local_identity(path).map_err(|error| {
+            format!(
+                "Science runtime snapshot {}；已拒绝恢复",
+                error.diagnostic()
+            )
+        })?;
     }
     Ok(Some(path.clone()))
 }
@@ -551,14 +652,13 @@ fn official_updated_snapshot_for_home(
         }
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o500))
             .map_err(|error| format!("收紧 Science runtime snapshot 权限失败：{error}"))?;
-        if verify_local_identity
-            && (!file_is_macho(&temporary)
-                || !official_updated_identity_metadata_matches(&temporary))
-        {
-            return Err(
-                "updater Science executable 未通过 Mach-O/embedded metadata 本地校验；已拒绝静默回退旧 App"
-                    .into(),
-            );
+        if verify_local_identity {
+            validate_official_updated_local_identity(&temporary).map_err(|error| {
+                format!(
+                    "updater Science executable {}；已拒绝静默回退旧 App",
+                    error.diagnostic()
+                )
+            })?;
         }
 
         let sha256: [u8; 32] = digest.finalize().into();
@@ -1557,8 +1657,9 @@ mod tests {
 
     use super::{
         classify_known_runtime_state, classify_sandbox_state, first_http_url,
-        isolate_sandbox_browser_origin, official_updated_science_bin_for_home,
-        official_updated_snapshot_for_home, official_updated_snapshot_from_process_paths,
+        isolate_sandbox_browser_origin, official_science_identity_from_codesign_output,
+        official_updated_science_bin_for_home, official_updated_snapshot_for_home,
+        official_updated_snapshot_from_process_paths, parse_official_science_identity,
         parse_unique_listener_pid, runtime_identity_is_current, runtime_status_value,
         safe_science_version_with_timeout, sandbox_home, sandbox_running_ours, sandbox_url,
         science_executable_fingerprint, science_runtime_preflight_for_paths,
@@ -1567,8 +1668,10 @@ mod tests {
         secure_runtime_snapshot_root, select_science_runtime_for_paths,
         select_science_runtime_for_paths_cached, select_science_runtime_for_paths_with_updated,
         settings_change_needs_teardown, stop_runtime_from_probe, trusted_science_status,
-        SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource, ScienceVersionCache,
-        CACHED_ONCE_CHOICE,
+        validate_official_science_identity, validate_official_updated_local_identity,
+        OfficialScienceIdentityError, SandboxScienceState, ScienceRuntimeIdentity,
+        ScienceRuntimeSource, ScienceVersionCache, CACHED_ONCE_CHOICE,
+        OFFICIAL_SCIENCE_IDENTIFIERS, OFFICIAL_SCIENCE_TEAM_ID,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -1590,6 +1693,102 @@ mod tests {
             settings_change_needs_teardown(18991, 19000, 8990, 9000),
             "都变 → 拆"
         );
+    }
+
+    #[test]
+    fn official_science_identity_accepts_known_app_and_updater_identifiers() {
+        for identifier in OFFICIAL_SCIENCE_IDENTIFIERS {
+            let details =
+                format!("Identifier={identifier}\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n");
+            let identity = parse_official_science_identity(&details).unwrap();
+            assert_eq!(identity.identifier, *identifier);
+            assert_eq!(identity.team_identifier, OFFICIAL_SCIENCE_TEAM_ID);
+            assert_eq!(validate_official_science_identity(&identity), Ok(()));
+        }
+    }
+
+    #[test]
+    fn official_science_identity_rejects_unknown_identifier_and_team() {
+        let unknown_identifier = parse_official_science_identity(&format!(
+            "Identifier=com.anthropic.operon.unknown\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            validate_official_science_identity(&unknown_identifier),
+            Err(OfficialScienceIdentityError::UnsupportedIdentifier)
+        );
+
+        let wrong_team = parse_official_science_identity(
+            "Identifier=com.anthropic.operon\nTeamIdentifier=WRONGTEAM1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_official_science_identity(&wrong_team),
+            Err(OfficialScienceIdentityError::UnexpectedTeamIdentifier)
+        );
+    }
+
+    #[test]
+    fn official_science_identity_requires_unique_nonempty_fields() {
+        assert_eq!(
+            parse_official_science_identity(&format!(
+                "TeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
+            )),
+            Err(OfficialScienceIdentityError::MissingIdentifier)
+        );
+        assert_eq!(
+            parse_official_science_identity(&format!(
+                "Identifier=\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
+            )),
+            Err(OfficialScienceIdentityError::MissingIdentifier)
+        );
+        assert_eq!(
+            parse_official_science_identity(&format!(
+                "Identifier=com.anthropic.operon\nIdentifier=com.anthropic.operon.cli\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
+            )),
+            Err(OfficialScienceIdentityError::DuplicateIdentifier)
+        );
+        assert_eq!(
+            parse_official_science_identity("Identifier=com.anthropic.operon\n"),
+            Err(OfficialScienceIdentityError::MissingTeamIdentifier)
+        );
+        assert_eq!(
+            parse_official_science_identity("Identifier=com.anthropic.operon\nTeamIdentifier=\n"),
+            Err(OfficialScienceIdentityError::MissingTeamIdentifier)
+        );
+        assert_eq!(
+            parse_official_science_identity(&format!(
+                "Identifier=com.anthropic.operon\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\nTeamIdentifier=WRONGTEAM1\n"
+            )),
+            Err(OfficialScienceIdentityError::DuplicateTeamIdentifier)
+        );
+    }
+
+    #[test]
+    fn official_science_identity_reports_codesign_and_macho_failures(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            official_science_identity_from_codesign_output(&codesign_output(1, "")),
+            Err(OfficialScienceIdentityError::CodesignFailed)
+        );
+        assert_eq!(
+            official_science_identity_from_codesign_output(&Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: vec![b'x'; 64 * 1024 + 1],
+            }),
+            Err(OfficialScienceIdentityError::CodesignOutputTooLarge)
+        );
+
+        let root = unique_temp_dir("science-identity-not-macho")?;
+        let script = root.join("claude-science");
+        write_fake_bin(&script, 0o755)?;
+        assert_eq!(
+            validate_official_updated_local_identity(&script),
+            Err(OfficialScienceIdentityError::NotMachO)
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
@@ -2312,6 +2511,14 @@ mod tests {
             status: ExitStatus::from_raw(code << 8),
             stdout: stdout.as_bytes().to_vec(),
             stderr: Vec::new(),
+        }
+    }
+
+    fn codesign_output(code: i32, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
         }
     }
 
