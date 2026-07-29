@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import pwd
+import shutil
 import stat
 import sys
 import unicodedata
@@ -889,6 +890,29 @@ def _tool_record(path: str) -> dict[str, Any]:
             os.close(fd)
 
 
+def _node_tool_path(account_home: str) -> str:
+    selected = shutil.which("node")
+    if not selected:
+        raise SourceRuntimeError("source Node tool missing")
+    selected = os.path.realpath(selected)
+    allowed_roots = (
+        "/opt/homebrew",
+        "/usr/local",
+        os.path.join(account_home, ".nvm/versions/node"),
+        os.path.join(account_home, ".volta/tools/image/node"),
+    )
+    if (
+        not selected.startswith("/")
+        or os.path.basename(selected) != "node"
+        or not any(
+            selected.startswith(root + os.sep)
+            for root in allowed_roots
+        )
+    ):
+        raise SourceRuntimeError("source Node tool outside approved roots")
+    return selected
+
+
 def _proc_pidpath_raw(pid: int, capacity: int) -> tuple[int, bytes]:
     """Darwin libproc seam returning the kernel-reported Mach image bytes."""
     try:
@@ -1768,7 +1792,7 @@ def _production_dependencies(root_fd: int) -> SourceRuntimeDependencies:
         tool_paths = {
             "PYTHON": "/usr/bin/python3",
             "BASH": "/bin/bash",
-            "NODE": "/usr/local/bin/node",
+            "NODE": _node_tool_path(account_home),
             "CARGO": os.path.join(rust_bin, "cargo"),
             "RUSTC": os.path.join(rust_bin, "rustc"),
             "GIT": "/usr/bin/git",

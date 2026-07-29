@@ -273,6 +273,12 @@ and inventory, checks imported module origins, and repeats the full inventory
 before completion. A package payload add, removal, or modification therefore
 fails closed without binding the gate to one user's home path or pip metadata.
 
+Node selection is likewise portable but closed: the parent resolves `node`
+from its PATH, canonicalizes the result, and accepts it only below the standard
+Homebrew roots or the current account's NVM/Volta version roots. The selected
+regular executable is then held and SHA-256-bound like every other gate tool;
+an arbitrary temporary PATH entry is rejected.
+
 The public CLI must bind the executable that is actually running the parent
 process, not only `sys.executable`, argv text, or the isolated-mode flag. On the
 approved macOS source-gate host, Python authority is one closed composite tool

@@ -943,6 +943,11 @@ class ProductionInputAuthority(unittest.TestCase):
             ),
             mock.patch.object(
                 source_runtime,
+                "_node_tool_path",
+                return_value="/controlled/node",
+            ),
+            mock.patch.object(
+                source_runtime,
                 "_tool_record",
                 side_effect=tool_record,
             ),
@@ -985,6 +990,22 @@ class ProductionInputAuthority(unittest.TestCase):
         ))
 
     def test_production_input_digests_are_stable_for_same_identity(self):
+        with mock.patch.object(
+            source_runtime.shutil,
+            "which",
+            return_value="/controlled/.nvm/versions/node/v24/bin/node",
+        ):
+            self.assertEqual(
+                source_runtime._node_tool_path("/controlled"),
+                "/controlled/.nvm/versions/node/v24/bin/node",
+            )
+        with mock.patch.object(
+            source_runtime.shutil,
+            "which",
+            return_value="/private/tmp/node",
+        ):
+            with self.assertRaises(source_runtime.SourceRuntimeError):
+                source_runtime._node_tool_path("/controlled")
         records = (
             (1, 2, stat.S_IFDIR | 0o755, os.geteuid(), 2, 3, 4),
             (5, 6, stat.S_IFDIR | 0o755, os.geteuid(), 3, 7, 8),
