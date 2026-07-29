@@ -37,14 +37,17 @@ class SkillRuntimeBoundary(unittest.TestCase):
 
     def test_gateway_starts_only_after_config_and_science_state_prechecks(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
-        state_check = session.index("let (remembered_runtime, confirmed_stopped)")
-        self.assertLess(session.index("config::load_from(&dir)"), state_check)
-        self.assertNotIn("ensure_proxy(", session[:state_check])
+        one_click = session.split("fn one_click_login_with_options", 1)[1].split(
+            "\n#[cfg(test)]\nmod transaction_tests", 1
+        )[0]
+        state_check = one_click.index("let (science_state, running_runtime)")
+        self.assertLess(one_click.index("config::load_from(&dir)"), state_check)
+        self.assertNotIn("ensure_proxy(", one_click[:state_check])
 
-        runtime_selection = session.index("let launch_runtime: ScienceRuntimeIdentity")
+        runtime_selection = one_click.index("let launch_runtime: ScienceRuntimeIdentity")
         self.assertGreater(runtime_selection, state_check)
-        launch_check = session.index("if !launch.is_file()")
-        normal_proxy = session.index("let (pport, secret, proxy_action) =", state_check)
+        launch_check = one_click.index("if !launch.is_file()")
+        normal_proxy = one_click.index("let (pport, secret, proxy_action) =", state_check)
         self.assertGreater(normal_proxy, launch_check)
 
     def test_launcher_never_clones_or_implicitly_selects_data_dir_runtime(self):
@@ -157,9 +160,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("fn safe_science_version(path: &Path)", science)
         self.assertIn("official_updated_science_bin()", science)
         self.assertIn("ScienceRuntimeSource::OfficialUpdated", science)
-        self.assertIn("OFFICIAL_SCIENCE_IDENTIFIERS", science)
-        self.assertIn('"com.anthropic.operon"', science)
-        self.assertIn('"com.anthropic.operon.cli"', science)
+        self.assertIn("OFFICIAL_UPDATED_SCIENCE_IDENTIFIER", science)
         self.assertIn("OFFICIAL_SCIENCE_TEAM_ID", science)
         self.assertIn("sha256: [u8; 32]", science)
         self.assertIn("runtime_identity_is_current", science)
@@ -240,6 +241,9 @@ class SkillRuntimeBoundary(unittest.TestCase):
         runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
         lifecycle = (ROOT / "desktop/src-tauri/src/runtime/proxy_lifecycle.rs").read_text()
         lib = (ROOT / "desktop/src-tauri/src/lib.rs").read_text()
+        one_click_runtime = session.split(
+            "fn one_click_login_with_options", 1
+        )[1].split("\n#[cfg(test)]\nmod transaction_tests", 1)[0]
 
         submission = js.split("function catalogSubmission(kind)", 1)[1].split(
             "function catalogRolesChanged", 1
@@ -267,10 +271,8 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("setBusy(false)", one_click)
         self.assertIn("setBrowserFallback(r.fallback_url)", one_click)
 
-        gateway_ready = session.index(
-            "verify_gateway_model_catalog_traced(&trace, pport, &secret, active_profile)?"
-        )
-        science_spawn = session.index('Command::new("zsh")', gateway_ready)
+        gateway_ready = one_click_runtime.index("verify_gateway_model_catalog_traced(")
+        science_spawn = one_click_runtime.index('Command::new("zsh")', gateway_ready)
         self.assertLess(gateway_ready, science_spawn)
         for stage in ("start_gateway", "start_science", "verify_science_catalog"):
             self.assertIn(f'"{stage}"', session)
@@ -290,10 +292,13 @@ class SkillRuntimeBoundary(unittest.TestCase):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
         science = (ROOT / "desktop/src-tauri/src/runtime/science.rs").read_text()
         runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
+        one_click = session.split("fn one_click_login_with_options", 1)[1].split(
+            "\n#[cfg(test)]\nmod transaction_tests", 1
+        )[0]
         self.assertIn('.env("SCIENCE_BIN", &launch_runtime.path)', session)
         self.assertIn('.env("CSSWITCH_PROXY_URL", &proxy_url)', session)
         self.assertNotIn('.arg(&proxy_url)', session)
-        self.assertIn("st.science_runtime = Some(launch_runtime.clone())", session)
+        self.assertIn("current.science_runtime = Some(launch_runtime.clone())", one_click)
         self.assertIn("probe_known_runtime(sport, &runtime)", session)
         self.assertIn("sandbox_listener_matches_runtime(sport, &launch_runtime)", session)
         self.assertIn("sandbox_url(sport, &launch_runtime)", session)

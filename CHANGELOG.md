@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.8.4] — 2026-07-29
+
+### Fixed
+
+- Accepted both exact Claude Science 0.1.25 updater identifiers observed in official installations while retaining the fixed-path, owner, permission, Mach-O, Team ID, SHA-256 snapshot, and source-stability checks. This prevents a valid App-seeded updater from being rejected as invalid embedded metadata.
+
+## [0.8.3] — 2026-07-29
+
+### Fixed
+
+- Added Claude Science 0.1.25 compatibility for updater runtimes, new-session control, authority trees, health checks, managed reattach, and stop/recovery identity.
+- Replaced whole-tree Science authority backups with a selective snapshot of credentials, organizations, MCP state, and SSH bridge metadata. Conda, Runtime, seed assets, R libraries, and sandbox bind sources remain opaque and are never traversed or copied, removing the multi-gigabyte cold-start snapshot path.
+- Split profile selection from runtime application: **Set active** now saves the local choice only, while **Start** is the single guarded transaction that validates, applies, starts, and opens Science.
+- Preserved selected-versus-applied truth across profile edits, preset sync, key clearing, deletion, rollback, and interrupted runtime operations.
+- Hardened managed Science and Gateway adoption against stale receipts, PID reuse, unproven restart candidates, late SSH failures, and incomplete authority recovery.
+- Rejected malformed OpenAI Responses tool arguments locally instead of forwarding ambiguous tool calls.
+- Simplified provider cards and Science model display names while retaining strict internal selector and role mappings.
+
+### Compatibility and release notes
+
+- Version 0.8.3 remains macOS Apple Silicon only. The public package is ad-hoc signed and is not claimed as Developer ID signed, notarized, stapled, or Gatekeeper accepted.
+- DeepSeek Pro thinking multi-round compatibility remains an open provider-specific issue; this release does not claim every provider or real-account path is green.
+- Automated, mock, loopback, installed-app, live-provider, signing, and public-release evidence remain separate claims.
+
 ## [0.8.2] — 2026-07-23
 
 ### Fixed

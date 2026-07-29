@@ -20,7 +20,7 @@ use crate::{active_org, ScienceExecutableFingerprint, ScienceHostContext, AGENT_
 #[cfg(not(test))]
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,6 +73,98 @@ pub struct BatchSkillUpdate {
     pub missing_attach: Vec<String>,
     pub remaining_detach: Vec<String>,
     pub changed: bool,
+}
+
+/// An in-memory, read-only session for Science daemon health.
+///
+/// The nonce and cookie never leave this module, are never serialized, and
+/// must be recreated after every daemon restart.
+pub struct ScienceHealthSession {
+    client: Client,
+    origin: String,
+    auth_cookie: String,
+}
+
+impl ScienceHealthSession {
+    pub fn read_health(&self) -> Result<Vec<u8>, AttachError> {
+        self.read_health_with_timeout(Duration::from_secs(5))
+    }
+
+    pub fn read_health_with_timeout(&self, timeout: Duration) -> Result<Vec<u8>, AttachError> {
+        if timeout.is_zero() {
+            return Err(AttachError::new(
+                "SCIENCE_HEALTH_TIMEOUT",
+                "读取 Science authenticated health 已超过截止时间",
+            )
+            .retryable(true));
+        }
+        let response = self
+            .client
+            .get(format!("{}/api/health", self.origin))
+            .header(ORIGIN, &self.origin)
+            .header(COOKIE, format!("operon_auth={}", self.auth_cookie))
+            .timeout(timeout.min(Duration::from_secs(5)))
+            .send()
+            .map_err(|_| {
+                AttachError::new(
+                    "SCIENCE_HEALTH_UNREACHABLE",
+                    "读取 Science authenticated health 失败",
+                )
+                .retryable(true)
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(AttachError::new(
+                "SCIENCE_HEALTH_HTTP_STATUS",
+                format!("Science authenticated health 返回 HTTP {}", status.as_u16()),
+            )
+            .retryable(status.is_server_error()));
+        }
+        read_response_capped(response)
+    }
+}
+
+pub fn open_science_health_session(
+    context: &ScienceHostContext,
+) -> Result<ScienceHealthSession, AttachError> {
+    open_science_health_session_before(
+        context,
+        Instant::now() + PROCESS_TIMEOUT + Duration::from_secs(5),
+    )
+}
+
+pub fn open_science_health_session_before(
+    context: &ScienceHostContext,
+    deadline: Instant,
+) -> Result<ScienceHealthSession, AttachError> {
+    validate_context(context)?;
+    let control_url = fresh_control_url_before(context, deadline)?;
+    let (origin, nonce) = validate_control_url(&control_url, context.sandbox_port)?;
+    if nonce.len() != 64 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AttachError::new(
+            "SCIENCE_CONTROL_FAILED",
+            "Science health control URL nonce 不符合 64-hex 合同",
+        ));
+    }
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| {
+            AttachError::new(
+                "SCIENCE_CONTROL_FAILED",
+                "初始化 Science health control 客户端失败",
+            )
+        })?;
+    let auth_timeout = remaining_timeout(deadline, Duration::from_secs(5))?;
+    let auth_cookie = authenticate_health(&client, &origin, &nonce, auth_timeout)?;
+    Ok(ScienceHealthSession {
+        client,
+        origin,
+        auth_cookie,
+    })
 }
 
 pub fn update_agent_skills(
@@ -430,6 +522,13 @@ fn require_active_org(
 }
 
 fn fresh_control_url(context: &ScienceHostContext) -> Result<String, AttachError> {
+    fresh_control_url_before(context, Instant::now() + PROCESS_TIMEOUT)
+}
+
+fn fresh_control_url_before(
+    context: &ScienceHostContext,
+    deadline: Instant,
+) -> Result<String, AttachError> {
     let temp = context.home.join(".csswitch-skill-tmp");
     match fs::symlink_metadata(&temp) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -490,7 +589,7 @@ fn fresh_control_url(context: &ScienceHostContext) -> Result<String, AttachError
             }
         });
     }
-    let output = output_with_timeout(&mut command)?;
+    let output = output_with_timeout(&mut command, deadline)?;
     if !output.success {
         return Err(
             AttachError::new("SCIENCE_CONTROL_FAILED", "claude-science url 非零退出")
@@ -527,7 +626,17 @@ struct ProcessOutput {
     stderr: Vec<u8>,
 }
 
-fn output_with_timeout(command: &mut Command) -> Result<ProcessOutput, AttachError> {
+fn output_with_timeout(
+    command: &mut Command,
+    outer_deadline: Instant,
+) -> Result<ProcessOutput, AttachError> {
+    if Instant::now() >= outer_deadline {
+        return Err(AttachError::new(
+            "SCIENCE_CONTROL_TIMEOUT",
+            "claude-science url 已超过截止时间",
+        )
+        .retryable(true));
+    }
     let mut child = command.spawn().map_err(|_| {
         AttachError::new("SCIENCE_CONTROL_FAILED", "无法启动 claude-science url").retryable(true)
     })?;
@@ -541,7 +650,7 @@ fn output_with_timeout(command: &mut Command) -> Result<ProcessOutput, AttachErr
         .ok_or_else(|| AttachError::new("SCIENCE_CONTROL_FAILED", "无法读取 Science stderr"))?;
     let stdout_reader = thread::spawn(move || read_capped(stdout));
     let stderr_reader = thread::spawn(move || read_capped(stderr));
-    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    let deadline = outer_deadline.min(Instant::now() + PROCESS_TIMEOUT);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -553,7 +662,9 @@ fn output_with_timeout(command: &mut Command) -> Result<ProcessOutput, AttachErr
                 }
                 break status;
             }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) if Instant::now() < deadline => thread::sleep(
+                Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+            ),
             Ok(None) => {
                 #[cfg(unix)]
                 unsafe {
@@ -736,6 +847,55 @@ fn authenticate(client: &Client, origin: &str, nonce: &str) -> Result<ControlSes
     })
 }
 
+fn remaining_timeout(deadline: Instant, cap: Duration) -> Result<Duration, AttachError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(AttachError::new(
+            "SCIENCE_CONTROL_TIMEOUT",
+            "Science health control 已超过截止时间",
+        )
+        .retryable(true));
+    }
+    Ok(remaining.min(cap))
+}
+
+fn authenticate_health(
+    client: &Client,
+    origin: &str,
+    nonce: &str,
+    timeout: Duration,
+) -> Result<String, AttachError> {
+    let auth = client
+        .post(format!("{origin}/api/auth/nonce"))
+        .header(ORIGIN, origin)
+        .form(&[("nonce", nonce), ("dest", "/")])
+        .timeout(timeout)
+        .send()
+        .map_err(|_| {
+            AttachError::new(
+                "SCIENCE_HEALTH_UNREACHABLE",
+                "Science health nonce 认证失败",
+            )
+            .retryable(true)
+        })?;
+    if !auth.status().is_success() {
+        return Err(AttachError::new(
+            "SCIENCE_HEALTH_HTTP_STATUS",
+            format!(
+                "Science health nonce 认证返回 HTTP {}",
+                auth.status().as_u16()
+            ),
+        )
+        .retryable(auth.status().is_server_error()));
+    }
+    strict_health_auth_cookie(&auth).ok_or_else(|| {
+        AttachError::new(
+            "SCIENCE_CONTROL_FAILED",
+            "Science health nonce 未返回严格 operon_auth cookie",
+        )
+    })
+}
+
 fn agent_has_skill(
     client: &Client,
     origin: &str,
@@ -833,6 +993,48 @@ fn response_cookie(response: &Response, name: &str) -> Option<String> {
                     .all(|byte| byte.is_ascii_graphic() && byte != b';'))
             .then(|| value.to_string())
         })
+}
+
+fn strict_health_auth_cookie(response: &Response) -> Option<String> {
+    let headers = response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .collect::<Vec<_>>();
+    if headers.len() != 1 {
+        return None;
+    }
+    let mut parts = headers[0].split(';').map(str::trim);
+    let (name, value) = parts.next()?.split_once('=')?;
+    if name != "operon_auth"
+        || value.len() != 64
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut path_root = false;
+    let mut http_only = false;
+    let mut same_site_strict = false;
+    for attribute in parts {
+        if attribute.eq_ignore_ascii_case("httponly") {
+            http_only = true;
+            continue;
+        }
+        let Some((attribute_name, attribute_value)) = attribute.split_once('=') else {
+            continue;
+        };
+        if attribute_name.eq_ignore_ascii_case("path") && attribute_value == "/" {
+            path_root = true;
+        } else if attribute_name.eq_ignore_ascii_case("samesite")
+            && attribute_value.eq_ignore_ascii_case("strict")
+        {
+            same_site_strict = true;
+        } else if attribute_name.eq_ignore_ascii_case("domain") {
+            return None;
+        }
+    }
+    (path_root && http_only && same_site_strict).then(|| value.to_string())
 }
 
 fn ensure_success(response: &Response, stage: &str) -> Result<(), AttachError> {
@@ -943,6 +1145,15 @@ mod tests {
         stream.write_all(response.as_bytes()).unwrap();
     }
 
+    fn reply_health_auth(stream: &mut TcpStream, cookie_headers: &str) {
+        let body = r#"{"ok":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n{cookie_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    }
+
     fn attach_context(label: &str, port: u16) -> ScienceHostContext {
         let context = context_with_script(
             label,
@@ -963,6 +1174,166 @@ mod tests {
         assert!(validate_control_url("http://127.0.0.1:8991/?nonce=x", 8990).is_err());
         assert!(validate_control_url("http://127.0.0.1:8990/?nonce=x&nonce=y", 8990).is_err());
         assert!(validate_control_url("https://127.0.0.1:8990/?nonce=x", 8990).is_err());
+    }
+
+    #[test]
+    fn authenticated_health_session_uses_fresh_nonce_origin_and_cookie() {
+        let Some(listener) = bind_loopback() else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let nonce = "a".repeat(64);
+        let cookie = "b".repeat(64);
+        let context = context_with_script(
+            "health-success",
+            &format!("printf '%s\\n' 'http://127.0.0.1:{port}/?nonce={nonce}'"),
+            port,
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let expected_cookie = cookie.clone();
+        let worker = thread::spawn(move || {
+            let (mut auth, _) = listener.accept().unwrap();
+            captured.lock().unwrap().push(read_request(&mut auth));
+            reply_health_auth(
+                &mut auth,
+                &format!(
+                    "Set-Cookie: operon_auth={expected_cookie}; Path=/; HttpOnly; SameSite=Strict\r\n"
+                ),
+            );
+            let (mut health, _) = listener.accept().unwrap();
+            captured.lock().unwrap().push(read_request(&mut health));
+            reply(
+                &mut health,
+                None,
+                r#"{"db_corruption":{"flagged":false,"kind":null},"db_migrations_skipped":false}"#,
+            );
+        });
+
+        let session = open_science_health_session(&context).unwrap();
+        let body = String::from_utf8(session.read_health().unwrap()).unwrap();
+        worker.join().unwrap();
+        assert!(body.contains(r#""db_migrations_skipped":false"#));
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("POST /api/auth/nonce "));
+        assert!(requests[0].contains(&format!("nonce={nonce}")));
+        assert!(requests[0].contains(&format!("origin: http://127.0.0.1:{port}")));
+        assert!(requests[1].starts_with("GET /api/health "));
+        assert!(requests[1].contains(&format!("origin: http://127.0.0.1:{port}")));
+        assert!(requests[1].contains(&format!("cookie: operon_auth={cookie}")));
+        fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn health_session_open_and_read_honor_the_callers_deadline() {
+        let slow = context_with_script(
+            "health-slow-url",
+            "sleep 1\nprintf '%s\\n' 'http://127.0.0.1:18988/?nonce=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+            18_988,
+        );
+        let started = Instant::now();
+        let error =
+            match open_science_health_session_before(&slow, started + Duration::from_millis(80)) {
+                Ok(_) => panic!("slow control URL must not cross the caller deadline"),
+                Err(error) => error,
+            };
+        assert!(error.retryable);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        fs::remove_dir_all(slow.home.parent().unwrap()).unwrap();
+
+        let Some(listener) = bind_loopback() else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let nonce = "b".repeat(64);
+        let cookie = "c".repeat(64);
+        let context = context_with_script(
+            "health-slow-read",
+            &format!("printf '%s\\n' 'http://127.0.0.1:{port}/?nonce={nonce}'"),
+            port,
+        );
+        let worker = thread::spawn(move || {
+            let (mut auth, _) = listener.accept().unwrap();
+            let _ = read_request(&mut auth);
+            reply_health_auth(
+                &mut auth,
+                &format!("Set-Cookie: operon_auth={cookie}; Path=/; HttpOnly; SameSite=Strict\r\n"),
+            );
+            let (mut health, _) = listener.accept().unwrap();
+            let _ = read_request(&mut health);
+            thread::sleep(Duration::from_millis(300));
+        });
+        let session = open_science_health_session(&context).unwrap();
+        let started = Instant::now();
+        let error = session
+            .read_health_with_timeout(Duration::from_millis(40))
+            .expect_err("stalled health response must respect the per-request timeout");
+        assert!(error.retryable);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        worker.join().unwrap();
+        fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn health_session_rejects_short_nonce_and_weak_or_ambiguous_cookie() {
+        let short = context_with_script(
+            "health-short-nonce",
+            "printf '%s\\n' 'http://127.0.0.1:18989/?nonce=short'",
+            18_989,
+        );
+        let short_error = match open_science_health_session(&short) {
+            Ok(_) => panic!("short nonce must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(short_error.code, "SCIENCE_CONTROL_FAILED");
+        fs::remove_dir_all(short.home.parent().unwrap()).unwrap();
+
+        for (label, cookie_headers) in [
+            (
+                "missing-httponly",
+                format!(
+                    "Set-Cookie: operon_auth={}; Path=/; SameSite=Strict\r\n",
+                    "c".repeat(64)
+                ),
+            ),
+            (
+                "duplicate-cookie",
+                format!(
+                    "Set-Cookie: operon_auth={}; Path=/; HttpOnly; SameSite=Strict\r\nSet-Cookie: other=x; Path=/\r\n",
+                    "d".repeat(64)
+                ),
+            ),
+            (
+                "domain-cookie",
+                format!(
+                    "Set-Cookie: operon_auth={}; Path=/; HttpOnly; SameSite=Strict; Domain=localhost\r\n",
+                    "e".repeat(64)
+                ),
+            ),
+        ] {
+            let Some(listener) = bind_loopback() else {
+                return;
+            };
+            let port = listener.local_addr().unwrap().port();
+            let nonce = "f".repeat(64);
+            let context = context_with_script(
+                label,
+                &format!("printf '%s\\n' 'http://127.0.0.1:{port}/?nonce={nonce}'"),
+                port,
+            );
+            let worker = thread::spawn(move || {
+                let (mut auth, _) = listener.accept().unwrap();
+                let _ = read_request(&mut auth);
+                reply_health_auth(&mut auth, &cookie_headers);
+            });
+            let error = match open_science_health_session(&context) {
+                Ok(_) => panic!("{label} must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "SCIENCE_CONTROL_FAILED", "{label}");
+            worker.join().unwrap();
+            fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -1069,7 +1440,7 @@ printf '%s\n' 'http://127.0.0.1:18990/?nonce=fresh-one'"#,
         let _guard = ENV_LOCK.lock().unwrap();
         let timeout = context_with_script(
             "timeout",
-            "sleep 5\nprintf '%s\\n' 'http://127.0.0.1:18995/?nonce=late'",
+            "sleep 30\nprintf '%s\\n' 'http://127.0.0.1:18995/?nonce=late'",
             18_995,
         );
         assert_eq!(

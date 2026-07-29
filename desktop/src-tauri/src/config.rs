@@ -37,10 +37,477 @@ static CONFIG_ACCESS: std::sync::Mutex<ConfigAccessState> =
         downgrade_terminal: false,
     });
 
+#[cfg(test)]
+pub(crate) const PENDING_AUTHORITY_CLEANUP_MANIFEST_FILE: &str =
+    "pending-authority-cleanup.v1.json";
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct AtomicWritePreRenameObservation {
+    pub(crate) temp_path: PathBuf,
+    pub(crate) target_path: PathBuf,
+    pub(crate) temp_device: u64,
+    pub(crate) temp_inode: u64,
+    pub(crate) config_access_held: bool,
+}
+
+#[cfg(test)]
+struct AtomicWritePreRenameFailpoint {
+    id: u64,
+    directory_device: u64,
+    directory_inode: u64,
+    observation: std::sync::Arc<std::sync::Mutex<Option<AtomicWritePreRenameObservation>>>,
+}
+
+#[cfg(test)]
+static ATOMIC_WRITE_PRE_RENAME_FAILPOINT: std::sync::LazyLock<
+    std::sync::Mutex<Option<AtomicWritePreRenameFailpoint>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+static ATOMIC_WRITE_PRE_RENAME_FAILPOINT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+pub(crate) struct AtomicWritePreRenameFailpointGuard {
+    id: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingCleanupIdentity {
+    pub(crate) managed_id: String,
+    pub(crate) path: PathBuf,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) marker: String,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PendingCleanupLifecycleEvent {
+    Register(PendingCleanupIdentity),
+    Remove {
+        identity: PendingCleanupIdentity,
+        not_found: bool,
+    },
+    Clear,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingCleanupPublishFault {
+    Register,
+    Clear,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PendingCleanupInitialTicket {
+    Present(PendingCleanupIdentity),
+    Missing(PendingCleanupIdentity),
+}
+
+#[cfg(test)]
+impl PendingCleanupInitialTicket {
+    fn identity(&self) -> &PendingCleanupIdentity {
+        match self {
+            Self::Present(identity) | Self::Missing(identity) => identity,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingCleanupRemovalOutcome {
+    Removed,
+    AlreadyAbsent,
+    Error,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PendingCleanupFinalState {
+    NotFound,
+    Present(PendingCleanupIdentity),
+    Error,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PendingCleanupRaceAction {
+    Recreate { path: PathBuf, marker: String },
+    Delete { path: PathBuf },
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PendingCleanupLifecycleObservation {
+    pub(crate) events: Vec<PendingCleanupLifecycleEvent>,
+    pub(crate) attempted_register: Option<PendingCleanupIdentity>,
+    pub(crate) validated_loader_count: usize,
+    pub(crate) initial_ticket_count: usize,
+    pub(crate) race_hook_count: usize,
+    pub(crate) delete_attempt_count: usize,
+    pub(crate) completion_count: usize,
+    pub(crate) causal_mismatch_count: usize,
+    pub(crate) race_identity: Option<PendingCleanupIdentity>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+#[allow(dead_code)]
+struct PendingCleanupLifecycleSeam {
+    registered_identity: Option<PendingCleanupIdentity>,
+    initial_ticket: Option<PendingCleanupInitialTicket>,
+    race_action: Option<PendingCleanupRaceAction>,
+    observation: PendingCleanupLifecycleObservation,
+    publish_fault: Option<PendingCleanupPublishFault>,
+}
+
+#[cfg(test)]
+static PENDING_CLEANUP_LIFECYCLE_SEAM: std::sync::LazyLock<
+    std::sync::Mutex<Option<PendingCleanupLifecycleSeam>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+pub(crate) struct PendingCleanupLifecycleGuard;
+
+#[cfg(test)]
+impl Drop for PendingCleanupLifecycleGuard {
+    fn drop(&mut self) {
+        *PENDING_CLEANUP_LIFECYCLE_SEAM
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_arm_pending_cleanup_lifecycle(
+    publish_fault: Option<PendingCleanupPublishFault>,
+) -> PendingCleanupLifecycleGuard {
+    *PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(PendingCleanupLifecycleSeam {
+        publish_fault,
+        ..Default::default()
+    });
+    PendingCleanupLifecycleGuard
+}
+
+#[cfg(test)]
+pub(crate) fn test_pending_cleanup_lifecycle_observation() -> PendingCleanupLifecycleObservation {
+    let seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    seam.as_ref()
+        .map(|seam| seam.observation.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_pending_cleanup_register_publish_attempt(
+    identity: PendingCleanupIdentity,
+) -> io::Result<()> {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(seam) = seam.as_mut() else {
+        return Ok(());
+    };
+    seam.observation.attempted_register = Some(identity);
+    if seam.publish_fault == Some(PendingCleanupPublishFault::Register) {
+        return Err(io::Error::other(
+            "test-only pending cleanup REGISTER publish failure",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_pending_cleanup_clear_publish_attempt() -> io::Result<()> {
+    let seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if seam
+        .as_ref()
+        .is_some_and(|seam| seam.publish_fault == Some(PendingCleanupPublishFault::Clear))
+    {
+        return Err(io::Error::other(
+            "test-only pending cleanup CLEAR publish failure",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_observe_pending_cleanup_register_published(identity: PendingCleanupIdentity) {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(seam) = seam.as_mut() {
+        seam.registered_identity = Some(identity.clone());
+        seam.observation
+            .events
+            .push(PendingCleanupLifecycleEvent::Register(identity));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_observe_pending_cleanup_manifest_validated(identity: PendingCleanupIdentity) {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(seam) = seam.as_mut() {
+        seam.registered_identity = Some(identity.clone());
+        seam.observation.validated_loader_count += 1;
+        seam.observation
+            .events
+            .push(PendingCleanupLifecycleEvent::Register(identity));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_observe_pending_cleanup_initial_ticket(ticket: PendingCleanupInitialTicket) {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(seam) = seam.as_mut() else {
+        return;
+    };
+    seam.observation.initial_ticket_count += 1;
+    if seam.registered_identity.as_ref() != Some(ticket.identity()) {
+        seam.observation.causal_mismatch_count += 1;
+        return;
+    }
+    seam.initial_ticket = Some(ticket);
+}
+
+#[cfg(test)]
+pub(crate) fn test_configure_pending_cleanup_race(action: PendingCleanupRaceAction) {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(seam) = seam.as_mut() {
+        seam.race_action = Some(action);
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_pending_cleanup_race_hook() -> io::Result<()> {
+    let action = {
+        let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(seam) = seam.as_mut() else {
+            return Ok(());
+        };
+        seam.observation.race_hook_count += 1;
+        seam.race_action.clone()
+    };
+    let race_identity = match action {
+        Some(PendingCleanupRaceAction::Recreate { path, marker }) => {
+            fs::create_dir(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+            let marker_path = path.join(".csswitch-one-click-rollback.marker");
+            fs::write(&marker_path, format!("{marker}\n"))?;
+            fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))?;
+            let metadata = path.symlink_metadata()?;
+            Some(PendingCleanupIdentity {
+                managed_id: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                marker,
+            })
+        }
+        Some(PendingCleanupRaceAction::Delete { path }) => {
+            fs::remove_dir_all(path)?;
+            None
+        }
+        None => None,
+    };
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(seam) = seam.as_mut() {
+        seam.observation.race_identity = race_identity;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_observe_pending_cleanup_delete_attempt() {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(seam) = seam.as_mut() {
+        seam.observation.delete_attempt_count += 1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_observe_pending_cleanup_completion(
+    outcome: PendingCleanupRemovalOutcome,
+    final_state: PendingCleanupFinalState,
+) {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(seam) = seam.as_mut() else {
+        return;
+    };
+    seam.observation.completion_count += 1;
+    let Some(ticket) = seam.initial_ticket.take() else {
+        seam.observation.causal_mismatch_count += 1;
+        return;
+    };
+    let event = match (ticket, outcome, final_state) {
+        (
+            PendingCleanupInitialTicket::Present(identity),
+            PendingCleanupRemovalOutcome::Removed,
+            PendingCleanupFinalState::NotFound,
+        ) => Some(PendingCleanupLifecycleEvent::Remove {
+            identity,
+            not_found: false,
+        }),
+        (
+            PendingCleanupInitialTicket::Missing(identity),
+            PendingCleanupRemovalOutcome::AlreadyAbsent,
+            PendingCleanupFinalState::NotFound,
+        ) => Some(PendingCleanupLifecycleEvent::Remove {
+            identity,
+            not_found: true,
+        }),
+        _ => None,
+    };
+    if let Some(event) = event {
+        seam.observation.events.push(event);
+    } else {
+        seam.observation.causal_mismatch_count += 1;
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_observe_pending_cleanup_clear_published() {
+    let mut seam = PENDING_CLEANUP_LIFECYCLE_SEAM
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(seam) = seam.as_mut() {
+        seam.observation
+            .events
+            .push(PendingCleanupLifecycleEvent::Clear);
+    }
+}
+
+#[cfg(test)]
+impl Drop for AtomicWritePreRenameFailpointGuard {
+    fn drop(&mut self) {
+        let mut failpoint = ATOMIC_WRITE_PRE_RENAME_FAILPOINT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if failpoint.as_ref().is_some_and(|armed| armed.id == self.id) {
+            *failpoint = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_arm_pending_manifest_pre_rename_failure(
+    directory: &Path,
+) -> io::Result<(
+    AtomicWritePreRenameFailpointGuard,
+    std::sync::Arc<std::sync::Mutex<Option<AtomicWritePreRenameObservation>>>,
+)> {
+    let expected = default_dir().canonicalize()?;
+    let actual = directory.canonicalize()?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "test-only manifest failpoint requires the exact config directory",
+        ));
+    }
+    let metadata = actual.symlink_metadata()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "test-only manifest failpoint requires a regular config directory",
+        ));
+    }
+    let id = ATOMIC_WRITE_PRE_RENAME_FAILPOINT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let observation = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let armed = AtomicWritePreRenameFailpoint {
+        id,
+        directory_device: metadata.dev(),
+        directory_inode: metadata.ino(),
+        observation: observation.clone(),
+    };
+    *ATOMIC_WRITE_PRE_RENAME_FAILPOINT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(armed);
+    Ok((AtomicWritePreRenameFailpointGuard { id }, observation))
+}
+
 fn config_access() -> std::sync::MutexGuard<'static, ConfigAccessState> {
     CONFIG_ACCESS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(test)]
+fn atomic_write_pre_rename_failure(
+    secure: &SecureDir,
+    target: &str,
+    temp: &str,
+    _bytes: &[u8],
+) -> io::Result<()> {
+    let failpoint = ATOMIC_WRITE_PRE_RENAME_FAILPOINT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(armed) = failpoint.as_ref() else {
+        return Ok(());
+    };
+    if target != PENDING_AUTHORITY_CLEANUP_MANIFEST_FILE {
+        return Ok(());
+    }
+    let directory = secure.file.metadata()?;
+    if directory.dev() != armed.directory_device || directory.ino() != armed.directory_inode {
+        return Ok(());
+    }
+    let temp_path = secure.path.join(temp);
+    let target_path = secure.path.join(target);
+    let metadata = temp_path.symlink_metadata()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(io::Error::other(
+            "test-only pre-rename observation rejected an unsafe temp",
+        ));
+    }
+    *armed
+        .observation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(AtomicWritePreRenameObservation {
+        temp_path,
+        target_path,
+        temp_device: metadata.dev(),
+        temp_inode: metadata.ino(),
+        config_access_held: CONFIG_ACCESS.try_lock().is_err(),
+    });
+    Err(io::Error::other(
+        "test-only pending manifest failure after temp sync before rename",
+    ))
 }
 
 fn ensure_config_access_open(access: &ConfigAccessState) -> io::Result<()> {
@@ -235,8 +702,19 @@ pub(crate) fn require_template_enabled(cfg: &Config, template_id: &str) -> Resul
     Ok(())
 }
 
+pub(crate) fn require_no_runtime_transaction(cfg: &Config) -> Result<(), String> {
+    if cfg.runtime_transaction.is_some() {
+        Err(
+            "code=runtime_transaction_in_progress 运行时事务尚未结束；请先完成恢复或重试一键开始。"
+                .into(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
 impl Config {
-    /// 当前生效 profile（active_id 空或悬空 → None）。
+    /// 当前选择 profile（active_id 空或悬空 → None）。
     pub fn active_profile(&self) -> Option<&Profile> {
         if self.active_id.is_empty() {
             return None;
@@ -629,6 +1107,49 @@ pub fn default_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     default_dir_from_home(&home)
+}
+
+pub(crate) fn read_pending_authority_cleanup_manifest(dir: &Path) -> io::Result<Option<Vec<u8>>> {
+    let access = config_access();
+    ensure_config_access_open(&access)?;
+    let secure = match SecureDir::open(dir, false) {
+        Ok(secure) => secure,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    secure.read_regular("pending-authority-cleanup.v1.json")
+}
+
+pub(crate) fn write_pending_authority_cleanup_manifest(
+    dir: &Path,
+    bytes: &[u8],
+    expected_before: Option<&[u8]>,
+) -> io::Result<()> {
+    let access = config_access();
+    ensure_config_access_open(&access)?;
+    let secure = SecureDir::open(dir, true)?;
+    atomic_write_named_bytes_in(
+        &secure,
+        "pending-authority-cleanup.v1.json",
+        bytes,
+        expected_before,
+        |secure| secure.sync(),
+    )
+}
+
+pub(crate) fn write_pending_authority_cleanup_manifest_if_absent(
+    dir: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let access = config_access();
+    ensure_config_access_open(&access)?;
+    let secure = SecureDir::open(dir, true)?;
+    atomic_write_named_bytes_if_absent_in(
+        &secure,
+        "pending-authority-cleanup.v1.json",
+        bytes,
+        |secure| secure.sync(),
+    )
 }
 
 fn config_path(dir: &Path) -> PathBuf {
@@ -1439,6 +1960,12 @@ fn atomic_rollback_is_uncertain(error: &io::Error) -> bool {
 
 /// 先发布临时文件，再持久化目录项。若发布后的同步失败，恢复发布前字节并再次
 /// 同步，保证 `Err` 的可观察语义是目标文件未改变。测试可注入 commit sync 失败。
+enum AtomicWriteExpectedBefore<'a> {
+    Any,
+    Exact(&'a [u8]),
+    Absent,
+}
+
 fn atomic_write_named_bytes_in<F>(
     secure: &SecureDir,
     target: &str,
@@ -1449,9 +1976,52 @@ fn atomic_write_named_bytes_in<F>(
 where
     F: FnOnce(&SecureDir) -> io::Result<()>,
 {
+    atomic_write_named_bytes_with_expectation_in(
+        secure,
+        target,
+        bytes,
+        expected_before
+            .map(AtomicWriteExpectedBefore::Exact)
+            .unwrap_or(AtomicWriteExpectedBefore::Any),
+        commit_sync,
+    )
+}
+
+fn atomic_write_named_bytes_if_absent_in<F>(
+    secure: &SecureDir,
+    target: &str,
+    bytes: &[u8],
+    commit_sync: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&SecureDir) -> io::Result<()>,
+{
+    atomic_write_named_bytes_with_expectation_in(
+        secure,
+        target,
+        bytes,
+        AtomicWriteExpectedBefore::Absent,
+        commit_sync,
+    )
+}
+
+fn atomic_write_named_bytes_with_expectation_in<F>(
+    secure: &SecureDir,
+    target: &str,
+    bytes: &[u8],
+    expected_before: AtomicWriteExpectedBefore<'_>,
+    commit_sync: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&SecureDir) -> io::Result<()>,
+{
     let before = secure.read_regular_snapshot(target)?;
-    if let Some(expected) = expected_before {
-        if before.as_ref().map(|(bytes, _)| bytes.as_slice()) != Some(expected) {
+    match expected_before {
+        AtomicWriteExpectedBefore::Any => {}
+        AtomicWriteExpectedBefore::Exact(expected)
+            if before.as_ref().map(|(bytes, _)| bytes.as_slice()) == Some(expected) => {}
+        AtomicWriteExpectedBefore::Absent if before.is_none() => {}
+        _ => {
             return Err(io::Error::other("配置在迁移提交前被外部进程修改"));
         }
     }
@@ -1464,6 +2034,12 @@ where
         return Err(error);
     }
     drop(file);
+
+    #[cfg(test)]
+    if let Err(error) = atomic_write_pre_rename_failure(secure, target, &tmp, bytes) {
+        let _ = secure.unlink(&tmp);
+        return Err(error);
+    }
 
     match (before.as_ref(), secure.read_regular(target)) {
         (Some((expected, _)), Ok(Some(actual))) if expected == &actual => {}
@@ -1833,6 +2409,24 @@ where
     let mut cfg = load_from_unlocked(dir).map_err(|error| error.to_string())?;
     let (result, changed) = f(&mut cfg)?;
     if changed {
+        save_to_unlocked(dir, &cfg).map_err(|error| error.to_string())?;
+    }
+    Ok(result)
+}
+
+/// Fallible serialized update whose rolling backup is created only after the
+/// closure accepts the mutation. Backup remains best-effort, matching existing
+/// profile-save behavior, while a guard error leaves both files untouched.
+pub fn update_result_with_rolling_backup<T, F>(dir: &Path, f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut Config) -> Result<(T, bool), String>,
+{
+    let access = config_access();
+    ensure_config_access_open(&access).map_err(|error| error.to_string())?;
+    let mut cfg = load_from_unlocked(dir).map_err(|error| error.to_string())?;
+    let (result, changed) = f(&mut cfg)?;
+    if changed {
+        let _ = write_rolling_backup_unlocked(dir);
         save_to_unlocked(dir, &cfg).map_err(|error| error.to_string())?;
     }
     Ok(result)

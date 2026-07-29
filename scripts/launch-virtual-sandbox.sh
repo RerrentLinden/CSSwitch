@@ -30,13 +30,12 @@ SANDBOX_SSH_DIR="$SANDBOX_HOME/.ssh"
 SANDBOX_SSH_CONFIG="$SANDBOX_SSH_DIR/config"
 SSH_STUB_MARKER_V1="# CSSwitch managed system SSH config bridge v1"
 SSH_STUB_MARKER="# CSSwitch managed system SSH config bridge v2"
-LEGACY_SSH_STUB_MAX_ALIASES=512
-LEGACY_SSH_STUB_MAX_BYTES=65536
 PORT=8990
 PROXY_URL="${CSSWITCH_PROXY_URL:-http://127.0.0.1:18991}"
 EMAIL="virtual@localhost.invalid"
 DRY_RUN=0
 SKIP_FORGE=0
+SCIENCE_OPAQUE_BINDINGS="${CSSWITCH_SCIENCE_OPAQUE_BINDINGS:-}"
 
 is_safe_science_bin() {
   local probe="$1"
@@ -58,56 +57,48 @@ path_contains_symlink() {
   return 1
 }
 
-is_legacy_managed_ssh_stub_v2() {
-  # Fork 242c4b2 used the same v2 marker as upstream but wrote Include first
-  # and one Host alias per line. Recognize only that bounded, data-only shape
-  # so prepare_sandbox_ssh_config can atomically replace it with upstream v2.
-  local target="$1" escaped size last_byte
-  size="$(/usr/bin/stat -f '%z' "$target" 2>/dev/null)" || return 1
-  [[ "$size" =~ ^[0-9]+$ ]] || return 1
-  (( 10#${size} <= LEGACY_SSH_STUB_MAX_BYTES )) || return 1
-  last_byte="$(/usr/bin/tail -c 1 "$target" 2>/dev/null | /usr/bin/od -An -tuC | /usr/bin/tr -d '[:space:]')"
-  [[ "$last_byte" == "10" ]] || return 1
-  escaped="$(printf '%s' "$SYSTEM_SSH_CONFIG" | /usr/bin/sed 's/\\/\\\\/g; s/"/\\"/g')"
-  LC_ALL=C /usr/bin/awk \
-    -v marker="$SSH_STUB_MARKER" \
-    -v include="Include \"$escaped\"" \
-    -v max_aliases="$LEGACY_SSH_STUB_MAX_ALIASES" '
-      NR == 1 {
-        if ($0 != marker) {
-          valid = 0
-          exit
-        }
-        next
-      }
-      NR == 2 {
-        if ($0 != include) {
-          valid = 0
-          exit
-        }
-        next
-      }
-      {
-        if ($0 !~ /^Host [A-Za-z0-9._:@%+-]+$/) {
-          valid = 0
-          exit
-        }
-        alias = substr($0, 6)
-        if (length(alias) > 255 || substr(alias, 1, 1) == "-" || seen[alias]++) {
-          valid = 0
-          exit
-        }
-        count++
-        if (count > max_aliases) {
-          valid = 0
-          exit
-        }
-      }
-      BEGIN { valid = 1 }
-      END {
-        if (!valid || NR < 2) exit 1
-      }
-    ' "$target" >/dev/null 2>&1
+validate_science_opaque_bindings() {
+  local binding name expected target actual owner mode
+  if [[ -z "$SCIENCE_OPAQUE_BINDINGS" ]]; then
+    [[ "${CSSWITCH_RUNTIME_VERSION_PRECHECKED:-0}" != "1" ]] && return 0
+    echo "拒绝：缺少 Science opaque-root 启动绑定" >&2
+    return 1
+  fi
+  for binding in ${(s:;:)SCIENCE_OPAQUE_BINDINGS}; do
+    name="${binding%%=*}"
+    expected="${binding#*=}"
+    case "$name" in
+      conda|runtime|seed-assets|r-libs|sbx-bind-src) ;;
+      *)
+        echo "拒绝：Science opaque-root 启动绑定名称非法" >&2
+        return 1
+        ;;
+    esac
+    target="$DATA_DIR/$name"
+    if [[ "$expected" == "absent" ]]; then
+      if [[ -e "$target" || -L "$target" ]]; then
+        echo "拒绝：Science opaque root 在启动前出现" >&2
+        return 1
+      fi
+      continue
+    fi
+    [[ "$expected" =~ ^[0-9]+:[0-9]+$ ]] || {
+      echo "拒绝：Science opaque-root 启动绑定格式非法" >&2
+      return 1
+    }
+    if [[ ! -d "$target" || -L "$target" ]]; then
+      echo "拒绝：Science opaque root 在启动前被替换" >&2
+      return 1
+    fi
+    actual="$(/usr/bin/stat -f '%d:%i' "$target" 2>/dev/null || true)"
+    owner="$(/usr/bin/stat -f '%u' "$target" 2>/dev/null || true)"
+    mode="$(/usr/bin/stat -f '%Lp' "$target" 2>/dev/null || true)"
+    if [[ "$actual" != "$expected" || "$owner" != "$(/usr/bin/id -u)" || ! "$mode" =~ ^[0-7]{3,4}$ ]] \
+        || (( (8#$mode & 8#22) != 0 )); then
+      echo "拒绝：Science opaque root 启动绑定已变化" >&2
+      return 1
+    fi
+  done
 }
 
 is_managed_ssh_stub() {
@@ -124,13 +115,10 @@ is_managed_ssh_stub() {
   if [[ "$first" == "$SSH_STUB_MARKER_V1" && "$second" == "Include \"$escaped\"" && -z "$third" && -z "$fourth" ]]; then
     return 0
   fi
-  if [[ "$first" == "$SSH_STUB_MARKER" && "$second" == "Host "* && "$third" == "Include \"$escaped\"" && -z "$fourth" ]]; then
-    for host in ${(z)second#Host }; do
-      [[ "$host" =~ '^[A-Za-z0-9._:@%+-]{1,255}$' && "$host" != -* ]] || return 1
-    done
-    return 0
-  fi
-  is_legacy_managed_ssh_stub_v2 "$target"
+  [[ "$first" == "$SSH_STUB_MARKER" && "$second" == "Host "* && "$third" == "Include \"$escaped\"" && -z "$fourth" ]] || return 1
+  for host in ${(z)second#Host }; do
+    [[ "$host" =~ '^[A-Za-z0-9._:@%+-]{1,255}$' && "$host" != -* ]] || return 1
+  done
 }
 
 prepare_sandbox_ssh_config() {
@@ -344,6 +332,7 @@ if path_contains_symlink "$DATA_DIR"; then
   echo "拒绝：Science data-dir 路径在启动前发生符号链接变化"
   exit 1
 fi
+validate_science_opaque_bindings
 typeset -a _SCIENCE_ENV
 _SCIENCE_ENV=(
   "HOME=$SANDBOX_HOME"
@@ -367,7 +356,9 @@ if ! /usr/bin/env "${_SCIENCE_ENV[@]}" "$BIN" serve \
     --no-browser --no-auto-update --detached \
     >/dev/null 2>&1; then
   echo "Science 启动命令失败（原始输出可能含临时链接或路径，未写入 CSSwitch 日志）" >&2
-  exit 1
+  # Contract with the desktop transaction: this distinct code proves that
+  # Science was invoked and may have mutated its opaque environment roots.
+  exit 70
 fi
 
 echo

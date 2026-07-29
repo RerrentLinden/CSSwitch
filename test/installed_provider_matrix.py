@@ -356,7 +356,9 @@ def build_case_scenario(case: CaseDefinition) -> Scenario:
         if case.case_id == "kimi" and template.phase in {"scratch", "formal"}:
             equals = item["checks"].setdefault("body", {}).setdefault("equals", {})
             equals["/thinking/type"] = "enabled"
-            equals["/thinking/budget_tokens"] = 1 if "scratch" in template.step_id else 1024
+            equals["/thinking/budget_tokens"] = 1024
+            if "scratch" in template.step_id:
+                equals["/max_tokens"] = 1025
         if case.case_id == "kimi" and template.phase == "formal":
             body = item["checks"].setdefault("body", {})
             body.setdefault("required", []).extend(
@@ -1072,17 +1074,72 @@ from pathlib import Path
 import socketserver
 import subprocess
 import sys
+import urllib.parse
 
 port = int(sys.argv[1])
 state = Path(sys.argv[2])
 state.mkdir(parents=True, exist_ok=True)
 os.chmod(state, 0o700)
+origin = f"http://127.0.0.1:{port}"
+auth_cookie = f"{os.getpid():064x}"
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+    def reject_auth(self):
+        body = b'{"detail":"invalid bearer token"}'
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_POST(self):
+        if self.path != "/api/auth/nonce" or self.headers.get("Origin") != origin:
+            self.reject_auth()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.reject_auth()
+            return
+        if length <= 0 or length > 4096:
+            self.reject_auth()
+            return
+        form = urllib.parse.parse_qs(
+            self.rfile.read(length).decode("ascii"),
+            keep_blank_values=True,
+        )
+        try:
+            expected_nonce = (state / "url-nonce").read_text(encoding="ascii").strip()
+        except OSError:
+            self.reject_auth()
+            return
+        if form.get("nonce") != [expected_nonce] or form.get("dest") != ["/"]:
+            self.reject_auth()
+            return
+        body = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header(
+            "Set-Cookie",
+            f"operon_auth={auth_cookie}; Path=/; HttpOnly; SameSite=Strict",
+        )
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
     def do_GET(self):
-        body = b'{"status":"ok","fake_science":true}'
+        if self.path.startswith("/api/health"):
+            cookies = {}
+            for item in self.headers.get("Cookie", "").split(";"):
+                if "=" in item:
+                    name, value = item.split("=", 1)
+                    cookies[name.strip()] = value.strip()
+            if self.headers.get("Origin") != origin or cookies.get("operon_auth") != auth_cookie:
+                self.reject_auth()
+                return
+            body = b'{"db_corruption":{"flagged":false,"kind":null},"db_migrations_skipped":false}'
+        else:
+            body = b'{"status":"ok","fake_science":true}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1166,7 +1223,9 @@ case "$cmd" in
     count="$(cat "$state/url-count" 2>/dev/null || echo 0)"
     count=$((count + 1))
     printf '%s' "$count" > "$state/url-count"
-    printf 'http://127.0.0.1:%s/?nonce=%s\\n' "$recorded_port" "$count"
+    nonce="$(printf '%064x' "$count")"
+    printf '%s' "$nonce" > "$state/url-nonce"
+    printf 'http://127.0.0.1:%s/?nonce=%s\\n' "$recorded_port" "$nonce"
     ;;
   stop)
     if test ! -e "$state/pid" && test ! -e "$state/port" && test ! -e "$state/executable"; then

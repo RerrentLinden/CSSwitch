@@ -29,7 +29,9 @@ static NEXT_OP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 pub(crate) enum OperationKind {
+    #[allow(dead_code)]
     ActivateProfile,
+    #[allow(dead_code)]
     UpdateActiveConnection,
     ValidateConnection,
     FetchModels,
@@ -59,8 +61,11 @@ pub(crate) enum OperationStage {
     ProxySpawn,
     ProxyHealth,
     CatalogVerify,
+    #[allow(dead_code)]
     Commit,
+    #[allow(dead_code)]
     Rollback,
+    AuthoritySnapshot,
     SandboxLogin,
     SandboxLaunch,
     SandboxHealth,
@@ -80,6 +85,7 @@ impl OperationStage {
             OperationStage::CatalogVerify => "catalog_verify",
             OperationStage::Commit => "commit",
             OperationStage::Rollback => "rollback",
+            OperationStage::AuthoritySnapshot => "authority_snapshot",
             OperationStage::SandboxLogin => "sandbox_login",
             OperationStage::SandboxLaunch => "sandbox_launch",
             OperationStage::SandboxHealth => "sandbox_health",

@@ -23,6 +23,13 @@
     },
     "tools": [
       {
+        "input_schema": {
+          "properties": {},
+          "type": "object"
+        },
+        "name": "web_search"
+      },
+      {
         "description": "lookup",
         "input_schema": {
           "properties": {
@@ -79,8 +86,7 @@
   "kimi_rule_ids": [
     "provider.relay.force-model-shell",
     "provider.kimi.relay-thinking-enabled",
-    "tool.relay.input-schema-normalize",
-    "tool.kimi.web_search.server-tool-filter"
+    "tool.relay.input-schema-normalize"
   ],
   "kimi_target_model": "kimi-k2.7-code",
   "plain_mapped": {

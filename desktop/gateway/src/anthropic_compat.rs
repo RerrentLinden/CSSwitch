@@ -628,6 +628,18 @@ fn degrade_missing_tool_choice(body: &mut Value) {
     }
 }
 
+fn is_anthropic_server_tool(tool: &Value) -> bool {
+    let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    matches!(tool_type, "mcp_toolset")
+        || tool_type.starts_with("web_search_")
+        || tool_type.starts_with("web_fetch_")
+        || tool_type.starts_with("code_execution_")
+        || tool_type.starts_with("tool_search_tool_")
+        || tool_type.starts_with("advisor_")
+}
+
 fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
     let Some(tools) = body.get("tools") else {
         return;
@@ -641,7 +653,16 @@ fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
     };
 
     let mut normalized = Vec::new();
+    let mut normalized_client_tool = false;
     for tool in tool_items {
+        if tool
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|tool_type| !tool_type.is_empty())
+        {
+            normalized.push(tool.clone());
+            continue;
+        }
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
         };
@@ -656,9 +677,12 @@ fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
             "input_schema".to_string(),
             normalize_relay_input_schema(tool.get("input_schema")),
         );
+        normalized_client_tool = true;
         normalized.push(Value::Object(clean));
     }
-    append_rule_id(rule_ids, RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE);
+    if normalized_client_tool {
+        append_rule_id(rule_ids, RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE);
+    }
     if normalized.is_empty() {
         if let Some(obj) = body.as_object_mut() {
             obj.remove("tools");
@@ -679,7 +703,7 @@ fn filter_kimi_server_tools(body: &mut Value, target_model: &str, rule_ids: &mut
     };
     let filtered: Vec<Value> = tools
         .iter()
-        .filter(|tool| tool.get("name").and_then(Value::as_str) != Some("web_search"))
+        .filter(|tool| !is_anthropic_server_tool(tool))
         .cloned()
         .collect();
     if filtered.len() == tools.len() {
@@ -1114,7 +1138,6 @@ mod tests {
             vec![
                 "provider.kimi.relay-thinking-enabled".to_string(),
                 "tool.relay.input-schema-normalize".to_string(),
-                "tool.kimi.web_search.server-tool-filter".to_string(),
             ]
         );
     }
@@ -1126,7 +1149,7 @@ mod tests {
                 "model": "claude-opus-4-8",
                 "messages": [],
                 "tool_choice": {"type": "tool", "name": "web_search"},
-                "tools": [{"name": "web_search", "input_schema": {"type": "object"}}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             }),
             "kimi-k2.7-code",
             None,
@@ -1135,6 +1158,92 @@ mod tests {
         .unwrap();
         assert!(mapped.get("tools").is_none());
         assert_eq!(mapped["tool_choice"], json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn relay_server_tools_are_not_client_schema_normalized() {
+        let (mapped, metadata) = transform_relay_request(
+            json!({
+                "model": "claude-sonnet-5",
+                "messages": [],
+                "tools": [
+                    {"type": "web_search_20250305", "name": "web_search"},
+                    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 2},
+                    {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
+                    {"type": "vendor_server_tool_20990101", "vendor_option": true},
+                    {"name": "lookup", "input_schema": {"properties": {"q": {"type": "string"}}}}
+                ]
+            }),
+            "relay-model",
+            None,
+            "",
+        )
+        .unwrap();
+        let tools = mapped["tools"].as_array().unwrap();
+        assert_eq!(
+            tools[0],
+            json!({"type": "web_search_20250305", "name": "web_search"})
+        );
+        assert_eq!(
+            tools[1],
+            json!({"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 2})
+        );
+        assert!(tools[0].get("input_schema").is_none());
+        assert!(tools[1].get("input_schema").is_none());
+        assert_eq!(
+            tools[2],
+            json!({"type": "mcp_toolset", "mcp_server_name": "pubmed"})
+        );
+        assert!(tools[2].get("input_schema").is_none());
+        assert_eq!(
+            tools[3],
+            json!({"type": "vendor_server_tool_20990101", "vendor_option": true})
+        );
+        assert!(tools[3].get("input_schema").is_none());
+        assert_eq!(
+            tools[4]["input_schema"],
+            json!({"type": "object", "properties": {"q": {"type": "string"}}})
+        );
+        assert_eq!(
+            metadata.rule_ids,
+            vec!["tool.relay.input-schema-normalize".to_string()]
+        );
+    }
+
+    #[test]
+    fn kimi_filters_server_tools_by_type_without_deleting_same_named_client_tool() {
+        let (mapped, metadata) = transform_relay_request(
+            json!({
+                "model": "claude-sonnet-5",
+                "messages": [],
+                "tool_choice": {"type": "tool", "name": "web_search"},
+                "tools": [
+                    {"type": "web_search_20250305", "name": "web_search"},
+                    {"type": "web_fetch_20260209", "name": "web_fetch"},
+                    {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
+                    {"name": "web_search", "input_schema": {"type": "object"}}
+                ]
+            }),
+            "kimi-k3",
+            None,
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            mapped["tools"],
+            json!([{"name": "web_search", "input_schema": {"type": "object", "properties": {}}}])
+        );
+        assert_eq!(
+            mapped["tool_choice"],
+            json!({"type": "tool", "name": "web_search"})
+        );
+        assert_eq!(
+            metadata.rule_ids,
+            vec![
+                "tool.relay.input-schema-normalize".to_string(),
+                "tool.kimi.web_search.server-tool-filter".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -9,7 +9,6 @@ import {
   buildSimpleModelSubmission,
   mergeCatalogCandidates,
   projectSimpleModelFields,
-  summarizeProfileRoleModels,
 } from "./model-catalog-state.js";
 
 // CSSwitch 桌面面板前端。只调用后端 Tauri command，绝不碰任何密钥落盘逻辑。
@@ -18,7 +17,7 @@ import {
 // ── Tauri 参数键约定（务必遵守）──────────────────────────────────────────────
 // 本项目所有命令都是裸 `#[tauri::command]`（无 rename_all）。tauri-macros 默认
 // `ArgumentCase::Camel`，会把 Rust 蛇形【顶层参数名】转成 lowerCamelCase 交给 JS：
-//   template_id→templateId、base_url→baseUrl、api_format→apiFormat、skip_verify→skipVerify。
+//   template_id→templateId、base_url→baseUrl、api_format→apiFormat。
 // 所以 invoke 顶层 args 用【小驼峰】。而 serde 结构体入参（`req`=FetchModelsReq、
 // `cfg`=UiSettings）内部字段按结构体字段名（蛇形）：proxy_port/sandbox_port、
 // template_id/base_url/key/profile_id。核对表见任务报告。
@@ -88,6 +87,8 @@ for (const template of MOCK_TEMPLATES) {
 const mockStore = {
   schema_version: 3,
   active_id: PREVIEW_CODEX ? "p-codex" : "p-demo1",
+  applied_profile_id: PREVIEW_CODEX ? "p-codex" : "p-demo1",
+  selection_pending: false,
   proxy_port: 18991,
   sandbox_port: 8990,
   reuse_system_ssh: false,
@@ -164,6 +165,8 @@ function mockInvoke(cmd, args) {
       }
       return Promise.resolve({
         schema_version: mockStore.schema_version, active_id: mockStore.active_id,
+        applied_profile_id: mockStore.applied_profile_id,
+        selection_pending: mockStore.selection_pending,
         proxy_port: mockStore.proxy_port, sandbox_port: mockStore.sandbox_port,
         reuse_system_ssh: mockStore.reuse_system_ssh,
         experimental_codex_enabled: mockStore.experimental_codex_enabled,
@@ -218,23 +221,42 @@ function mockInvoke(cmd, args) {
         p.model = selected?.upstream_model || p.model_catalog[0]?.upstream_model || "";
       }
       if (args.key) p.key = mockMask(args.key);
+      if (mockStore.active_id === args.id) mockStore.selection_pending = true;
       return Promise.resolve({ validated: true });
     }
     case "clear_profile_key": {
       const p = mockStore.profiles.find((x) => x.id === args.id);
       if (p) p.key = "";
+      if (mockStore.applied_profile_id === args.id) {
+        mockStore.applied_profile_id = null;
+        mockStore.selection_pending = !!mockStore.active_id;
+      } else if (mockStore.active_id === args.id) {
+        mockStore.selection_pending = true;
+      }
       return Promise.resolve(null);
     }
     case "delete_profile":
       mockStore.profiles = mockStore.profiles.filter((x) => x.id !== args.id);
       if (mockStore.active_id === args.id) mockStore.active_id = "";
+      if (mockStore.applied_profile_id === args.id) mockStore.applied_profile_id = null;
+      mockStore.selection_pending = !!mockStore.active_id &&
+        mockStore.active_id !== mockStore.applied_profile_id;
       return Promise.resolve(null);
     case "set_active_profile": {
       const p = mockStore.profiles.find((x) => x.id === args.id);
       if (!p) return Promise.reject("找不到 profile：" + args.id);
       const commit = () => {
         mockStore.active_id = args.id;
-        return { committed: true, active_id: args.id, hint: "（预览：已设为当前）" };
+        mockStore.selection_pending = true;
+        return {
+          committed: true,
+          status: "ok",
+          selected_profile_id: args.id,
+          applied_profile_id: mockStore.applied_profile_id,
+          apply_state: "pending",
+          science_running: false,
+          hint: "（预览：已设为当前选择，待一键开始应用）",
+        };
       };
       return PREVIEW_SLOW_ACTIVATION
         ? new Promise((resolve) => setTimeout(() => resolve(commit()), 1200))
@@ -276,6 +298,7 @@ function mockInvoke(cmd, args) {
       });
     }
     case "apply_profile_preset_sync":
+      if (mockStore.active_id === args.id) mockStore.selection_pending = true;
       return Promise.resolve({ committed: true, status: "ok", message: "已同步最新推荐。" });
     case "validate_profile_catalog_model":
       return Promise.resolve({ validated: true, status: "ok", message: "该模型已通过隔离 scratch 请求验证。" });
@@ -333,6 +356,8 @@ function mockInvoke(cmd, args) {
       mockStore.mode = args.mode;
       return Promise.resolve(null);
     case "one_click_login":
+      mockStore.applied_profile_id = mockStore.active_id || null;
+      mockStore.selection_pending = false;
       return Promise.resolve(PREVIEW_BROWSER_FAIL
         ? {
             msg: "（预览模式：服务已就绪；自动打开失败。）",
@@ -385,13 +410,12 @@ let skillPage = null;
 let runtimeChoiceActiveId = null;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
-let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false, experimental_codex_enabled: false, codex_network: { mode: "auto", proxy_url: "" }, codex_network_resolved: { source: "direct", proxy_scheme: null } };
+let configState = { profiles: [], templates: [], active_id: "", applied_profile_id: null, selection_pending: false, proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false, experimental_codex_enabled: false, codex_network: { mode: "auto", proxy_url: "" }, codex_network_resolved: { source: "direct", proxy_scheme: null } };
 let codexAuthState = null;          // 仅保存后端脱敏状态；绝不包含 token / email
 let codexAuthOperation = null;      // 仅驻内存；operation ID 不展示、不写日志
 let codexLoginStarting = false;
 let codexProfileRepairNeeded = false;
 let codexNetworkSaving = false;
-let pendingSkipActivateId = null;   // set_active 校验含糊时，允许「跳过验证」再切
 let pendingConfirm = null;          // 危险操作（清 key / 删除）的「再点一次确认」态
 let wizardCatalog = [];
 let connectionCatalog = [];
@@ -539,10 +563,14 @@ function renderCurrentSummary() {
   updateModelIcon(els.currentProfileIcon, profile);
   els.currentProfileName.textContent = profile.name || "未命名配置";
   const codexDisabled = isCodexSource(profile) && !configState.experimental_codex_enabled;
-  els.currentProfileState.textContent = codexDisabled ? "入口已关闭" : "当前配置";
+  const pending = configState.selection_pending || configState.active_id !== configState.applied_profile_id;
+  els.currentProfileState.textContent = codexDisabled
+    ? "入口已关闭"
+    : pending
+    ? "当前选择 · 待一键开始应用"
+    : "当前选择 · 上次应用";
   els.currentProfileState.className = "state-pill neutral";
-  const roleSummary = isCodexSource(profile) ? null : summarizeProfileRoleModels(profile);
-  els.currentProfileModel.textContent = roleSummary?.inline || profile.model || modelSummary(profile);
+  els.currentProfileModel.textContent = modelSummary(profile);
   els.currentProfileMeta.textContent = isCodexSource(profile)
     ? "CSSwitch OAuth · 账号动态模型目录"
     : (profile.base_url || (hasKey ? "Key 已保存" : "未填写端点"));
@@ -781,21 +809,17 @@ function startFetchModelsFeedback(id, codex = false) {
   scheduleBusyMsg(120000, { kind: "fetchModels", id }, "模型目录接近等待上限。若官方暂时不可达，可能返回带年龄标记的安全缓存。");
 }
 
-function startActivateFeedback(id, skipVerify) {
+function startActivateFeedback(id) {
   const name = profileName(id);
-  if (skipVerify) {
-    setMsg("已提交「" + name + "」：跳过上游校验，后台启动正式代理并探活。完成后会提示结果。");
-    return;
-  }
-  setMsg("已提交「" + name + "」：后台校验上游并准备正式代理。完成后会提示结果。");
+  setMsg("正在把「" + name + "」设为当前选择；不会启动或切换正在运行的服务。");
 }
 
-function startSaveConnectionFeedback(id, active) {
+function startSaveConnectionFeedback(id, selected) {
   clearBusyMsgTimers();
-  if (active) {
-    setMsg("正在保存当前生效配置：先校验新连接，再重启正式代理并探活…");
-    scheduleBusyMsg(4500, { kind: "saveConnection", id }, "仍在等待新连接上游校验。失败会保留原连接和原代理。");
-    scheduleBusyMsg(18000, { kind: "saveConnection", id }, "上游校验接近等待上限。完成后才会写盘并应用，失败会据实回滚。");
+  if (selected) {
+    setMsg("正在保存当前选择的连接；当前运行链保持不变，下次一键开始时应用…");
+    scheduleBusyMsg(4500, { kind: "saveConnection", id }, "仍在等待候选连接上游校验。当前运行链保持不变。");
+    scheduleBusyMsg(18000, { kind: "saveConnection", id }, "上游校验接近等待上限。验证后只保存候选连接。");
     return;
   }
   setMsg("保存连接中：正在做候选上游校验；无法确认时会保存但标记为未校验…");
@@ -804,9 +828,9 @@ function startSaveConnectionFeedback(id, active) {
 
 function startOneClickFeedback() {
   clearBusyMsgTimers();
-  setMsg("一键开始：检查代理 → 准备虚拟登录 → 启动/复用沙箱 → 探活…");
-  scheduleBusyMsg(3500, { kind: "oneClick" }, "仍在准备代理或沙箱。若代理配置已变更，可能需要重启本地代理。");
-  scheduleBusyMsg(9000, { kind: "oneClick" }, "仍在等待沙箱就绪。完成后会自动打开 Science；失败会显示日志摘要。");
+  setMsg("一键开始：检查代理 → 保护凭据与历史 → 准备虚拟登录 → 启动/复用沙箱 → 探活…");
+  scheduleBusyMsg(3500, { kind: "oneClick" }, "正在建立启动事务并保护凭据、组织历史和插件配置；不会复制 Science 的 Conda 或 Runtime 环境。");
+  scheduleBusyMsg(9000, { kind: "oneClick" }, "仍在准备受保护状态或启动沙箱。完成后会自动打开 Science；失败会显示日志摘要。");
 }
 
 function startSwitchModeFeedback(targetMode) {
@@ -854,7 +878,7 @@ function setBusy(on, op) {
     els.connRoleQuality, els.connRoleQualityDisplayName,
     els.connRoleFast, els.connRoleFastDisplayName,
     els.connRoleFable, els.connRoleFableDisplayName,
-    els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
+    els.metaSaveBtn, els.metaCancelBtn,
     els.codexEnabled, els.codexStatusBtn, els.codexLoginBtn, els.codexRepairProfileBtn,
     els.codexCancelBtn, els.codexLogoutBtn, els.codexNetworkMode, els.codexProxyUrl,
     els.codexNetworkSaveBtn, els.codexDowngradeBtn,
@@ -887,7 +911,6 @@ function syncActivationControls() {
     els.connClearBtn, els.metaSaveBtn,
   ].forEach((b) => b && (b.disabled = writeLocked));
   if (els.modeSeg) els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => (b.disabled = writeLocked));
-  if (els.skipActivateBtn) els.skipActivateBtn.disabled = busy;
   if (els.oneClickBtn) els.oneClickBtn.disabled = busy || activationInFlight;
   if (els.runtimeUseCacheBtn) els.runtimeUseCacheBtn.disabled = busy || activationInFlight;
   if (els.reuseSystemSsh) els.reuseSystemSsh.disabled = busy || activationInFlight;
@@ -926,12 +949,8 @@ function showView(v) {
   els.metaSec.hidden = v !== "meta";
   els.panel.classList.toggle("view-form", v !== "list");
   if (v !== "list") setPage("switch");
-  if (v === "list") hideSkip();
 }
 function cancelForm() { showView("list"); setPage("switch"); setMsg("就绪。"); }
-
-function showSkip() { els.skipActivateBtn.hidden = false; }
-function hideSkip() { els.skipActivateBtn.hidden = true; pendingSkipActivateId = null; }
 
 // 危险操作「再点一次确认」（避免依赖 window.confirm，Tauri webview 里不可靠）。
 function confirmAction(token, promptText, fn) {
@@ -1508,6 +1527,8 @@ async function loadConfig(options) {
     configState.profiles = cfg.profiles || [];
     configState.templates = cfg.templates || [];
     configState.active_id = cfg.active_id || "";
+    configState.applied_profile_id = cfg.applied_profile_id || null;
+    configState.selection_pending = !!cfg.selection_pending;
     configState.proxy_port = cfg.proxy_port ?? 18991;
     configState.sandbox_port = cfg.sandbox_port ?? 8990;
     configState.reuse_system_ssh = !!cfg.reuse_system_ssh;
@@ -1562,16 +1583,9 @@ function profileModelControl(p) {
   const model = p.model || "";
   if (!PROFILE_INTERACTIVE_PREVIEW) {
     const count = Number.isFinite(p.model_count) ? p.model_count : (p.model_catalog || []).length;
-    const roleSummary = isCodexSource(p) ? null : summarizeProfileRoleModels(p);
-    const route = (p.model_catalog || []).find((item) =>
-      item.selector_id === p.default_model_route_id || item.upstream_model === p.model
-    );
-    const upstream = route?.upstream_model || p.model || "";
-    const primary = roleSummary?.primary || modelSummary(p);
-    const details = roleSummary?.secondary
-      ? `${roleSummary.secondary} · ${count} 个模型`
-      : `${count ? `${count} 个模型` : "动态目录"}${upstream ? ` · ${upstream}` : ""}`;
-    return `<strong class="profile-model-text" title="${escapeHtml(roleSummary?.inline || primary)}">${escapeHtml(primary)}</strong><span class="profile-model-meta">${escapeHtml(details)}</span>`;
+    const primary = modelSummary(p);
+    const details = count ? `${count} 个可用模型` : "动态目录";
+    return `<strong class="profile-model-text" title="${escapeHtml(primary)}">${escapeHtml(primary)}</strong><span class="profile-model-meta">${escapeHtml(details)}</span>`;
   }
   const options = profileModelOptions(p);
   return `<select class="profile-model-select" data-profile-model="${escapeHtml(p.id)}" aria-label="${escapeHtml(p.name)} 的模型">
@@ -1587,7 +1601,7 @@ function renderList() {
     list.innerHTML = '<div class="empty">还没有配置。使用“新建配置”添加一条第三方来源。</div>';
     return;
   }
-  const header = `<div class="profile-list-head" aria-hidden="true"><span>配置</span><span>模型分工 / 目录</span><span>凭据</span><span>操作</span></div>`;
+  const header = `<div class="profile-list-head" aria-hidden="true"><span>配置</span><span>模型 / 目录</span><span>凭据</span><span>操作</span></div>`;
   list.innerHTML = header + ps.map((p) => {
     const active = p.id === configState.active_id;
     const codex = isCodexSource(p);
@@ -1603,7 +1617,8 @@ function renderList() {
           '<div class="prow-top">' +
             modelIconMarkup(p) +
             '<span class="pname">' + escapeHtml(p.name) + "</span>" +
-            (active ? '<span class="badge on">当前</span>' : "") +
+            (active ? '<span class="badge on">当前选择</span>' : "") +
+            (p.id === configState.applied_profile_id ? '<span class="badge">上次应用</span>' : "") +
             (codex && !codexEnabled ? '<span class="badge warn">入口已关闭</span>' : "") +
           "</div>" +
         "</div>" +
@@ -1921,7 +1936,6 @@ function renderCodexCatalog(meta, list, r) {
 
 // ── C2：新建向导 ──
 function openWizard() {
-  hideSkip();
   renderTemplateChips();
   const first = (configState.templates || [])[0];
   selectWizTemplate(first ? first.id : "");
@@ -1959,7 +1973,7 @@ function onWizTemplate() {
   const codex = isCodexSource(t);
   els.wizName.value = t.name;
   // 把「新建不自动生效」放进顶部常驻提示（默认窗口下反馈区首屏可能在折叠线下，见 #6）。
-  els.wizTplHint.textContent = sourceHint(t) + " 新建后需在列表点「设为当前」才生效。";
+  els.wizTplHint.textContent = sourceHint(t) + " 新建后先设为当前选择，再点「一键开始」应用。";
   els.wizBaseGroup.hidden = codex;
   els.wizKeyGroup.hidden = codex;
   els.wizCodexCatalog.hidden = !codex;
@@ -2073,7 +2087,7 @@ async function wizSave() {
     await loadConfig();
     setMsg(codex
       ? "已创建「" + name + "」。先设为当前；一键开始后请在 Science 的 More models 选择 Codex / …。"
-      : "已创建「" + name + "」。可在列表点「设为当前」启用。", "ok");
+      : "已创建「" + name + "」。请设为当前选择，再点「一键开始」应用。", "ok");
   } catch (e) {
     setMsg("创建失败：" + e, "err");
   } finally {
@@ -2098,9 +2112,9 @@ function openConn(id) {
     return;
   }
   const editable = t ? t.base_url_editable : true;
-  const active = id === configState.active_id;
+  const selected = id === configState.active_id;
   els.connSec.dataset.id = id;
-  els.connTitle.textContent = (codex ? "Codex 账号模型 · " : "编辑连接 · ") + p.name + (active ? "（当前生效）" : "");
+  els.connTitle.textContent = (codex ? "Codex 账号模型 · " : "编辑连接 · ") + p.name + (selected ? "（当前选择）" : "");
   els.connBaseGroup.hidden = codex;
   els.connKeyGroup.hidden = codex;
   els.connCodexCatalog.hidden = !codex;
@@ -2146,8 +2160,8 @@ function openConn(id) {
   refreshConnGate();
   setMsg(codex
     ? "这里只读取 CSSwitch OAuth 账号模型；不会在配置中固定模型。启动后请在 Science 的 More models 选择。"
-    : (active
-      ? "编辑当前生效配置：保存会先校验→切换，失败自动回退到原配置（不谎报生效）。"
+    : (selected
+      ? "编辑当前选择：保存只更新候选连接；当前运行链保持不变，下次一键开始时核验并应用。"
       : "编辑连接后点「保存连接」。"));
 }
 
@@ -2207,7 +2221,7 @@ async function connSave() {
   if (baseUrlRequired(capSrc) && !base) { setMsg("中转 / 自定义端点必须填写连接地址（base_url）。", "err"); return; }
   const baseErr = openaiCustomAnthropicBaseMessage(t, base);
   if (baseErr) { setMsg(baseErr, "err"); return; }
-  const active = p.id === configState.active_id;
+  const selected = p.id === configState.active_id;
   // key 留空＝不改；目录三件套必须一起提交，避免漏字段被解释为重置默认/roles。
   const args = {
     id: p.id,
@@ -2218,20 +2232,20 @@ async function connSave() {
     roleBindings: catalogPayload.role_bindings,
   };
   setBusy(true, { kind: "saveConnection", id: p.id });
-  startSaveConnectionFeedback(p.id, active);
+  startSaveConnectionFeedback(p.id, selected);
   try {
     const r = await call("update_profile_connection", args);
     els.connKey.value = "";
     await loadConfig();
-    if (r && (r.status === "error" || (active && r.committed === false))) {
+    if (r && (r.status === "error" || r.committed === false)) {
       const recovery = r.recovery_status === "degraded" ? "；恢复也未完全成功，请先全部停止后检查" : r.recovery_status === "restored" ? "；旧配置已恢复" : "";
       setMsg((r.message || "连接未应用") + recovery + "（阶段：" + (r.stage || "unknown") + "）", "err");
-    } else if (active) {
-      setMsg((r && (r.message || r.hint)) || "已保存并应用新连接。", "ok");
+    } else if (selected) {
+      setMsg((r && (r.message || r.hint)) || "已保存连接；当前运行链保持不变，下次一键开始时应用。", "ok");
     } else if (r && r.validated) {
       setMsg("已保存连接（已通过上游校验）。", "ok");
     } else {
-      setMsg("已保存连接（未能连通上游校验，激活时会再验）。", "ok");
+      setMsg("已保存连接（未能连通上游校验；下次一键开始时会再验并应用）。", "ok");
     }
   } catch (e) {
     // 后端错误文案已如实说明回滚/代理状态（可能是「已回滚到原配置」或「回滚未成功：代理当前已停」），
@@ -2251,15 +2265,18 @@ function clearKey(id) {
   confirmAction("clearkey:" + id, "将清除「" + nm + "」的 API key（需重填才能用）", () => doClearKey(id));
 }
 async function doClearKey(id) {
-  const wasActive = id === configState.active_id;
+  const wasSelected = id === configState.active_id;
+  const wasApplied = id === configState.applied_profile_id;
   setBusy(true);
   setMsg("清除 key 中…");
   try {
     await call("clear_profile_key", { id });
     await loadConfig();
     setMsg(
-      wasActive
-        ? "已清除 key（该配置是当前生效，链路已断，请重新填 key 再「设为当前」）。"
+      wasApplied
+        ? "已清除 key（该配置属于上次提交的运行绑定，代理已停止；请重新填写并一键开始）。"
+        : wasSelected
+        ? "已清除当前选择的 key；当前运行链保持不变，重新填写后再一键开始。"
         : "已清除 key。",
       "ok"
     );
@@ -2305,15 +2322,18 @@ function del(id) {
   confirmAction("delete:" + id, "将删除配置「" + nm + "」", () => doDelete(id));
 }
 async function doDelete(id) {
-  const wasActive = id === configState.active_id;
+  const wasSelected = id === configState.active_id;
+  const wasApplied = id === configState.applied_profile_id;
   setBusy(true);
   setMsg("删除中…");
   try {
     await call("delete_profile", { id });
     await loadConfig();
     setMsg(
-      wasActive
-        ? "已删除。删掉的是当前生效配置，请重新选择一条并「设为当前」。"
+      wasApplied
+        ? "已删除上次提交的运行绑定配置，相关代理已停止。"
+        : wasSelected
+        ? "已删除当前选择，请重新选择一条并「设为当前」。"
         : "已删除。",
       "ok"
     );
@@ -2325,11 +2345,10 @@ async function doDelete(id) {
   }
 }
 
-// 设为当前：走后端切换事务（校验→起正式→健康才提交）。
-// 返回体 committed:true=已生效；committed:false=未生效（可能可 skip）；抛错=回滚/中止。
-async function activate(id, skipVerify) {
+// 设为当前只保存选择；真正 apply/start 的唯一边界是一键开始。
+async function activate(id) {
   if (activationInFlight) {
-    setMsg("已有配置应用在后台完成。可以查看日志、反馈或自检；请稍后再提交另一条配置。");
+    setMsg("当前选择仍在保存。请稍后再提交另一条配置。");
     return;
   }
   const target = (configState.profiles || []).find((p) => p.id === id);
@@ -2338,24 +2357,23 @@ async function activate(id, skipVerify) {
     setMsg("Codex 实验入口已关闭。请先在“设置 > Codex 账号与连接”重新启用。", "err");
     return;
   }
-  hideSkip();
-  setBrowserFallback("");
   setActivationInFlight(true, { kind: "activate", id });
-  startActivateFeedback(id, !!skipVerify);
+  startActivateFeedback(id);
   try {
-    const r = await call("set_active_profile", { id, skipVerify: !!skipVerify });
+    const r = await call("set_active_profile", { id });
     if (r && r.committed) {
       hideHistoryRecovery();
       await loadConfig();
-      setMsg((r.hint || "已设为当前生效。") + (codex
+      if (r.apply_state === "pending") {
+        configState.selection_pending = true;
+        renderList();
+      }
+      setMsg((r.hint || "已设为当前选择，待一键开始应用。") + (codex
         ? " 一键开始后，请在 Science 的 More models 中选择 Codex / …；默认 Claude 壳不会被静默映射。"
         : ""), "ok");
     } else {
-      await loadConfig(); // 反映未变（仍是原 active）
-      const recovery = r && r.recovery_status === "degraded" ? "；恢复未完全成功" : r && r.recovery_status === "restored" ? "；旧链路已恢复" : "";
-      setMsg((r && (r.message || r.hint) || "校验未通过，未切换。") + recovery + (r && r.stage ? "（阶段：" + r.stage + "）" : ""), "err");
-      setBrowserFallback(r && r.fallback_url);
-      if (r && r.can_skip) { pendingSkipActivateId = id; showSkip(); }
+      await loadConfig();
+      setMsg((r && (r.message || r.hint)) || "当前选择未更改。", "err");
     }
   } catch (e) {
     await loadConfig();
@@ -2428,11 +2446,11 @@ async function restoreHistoryChoice(reference) {
 
 async function checkOneClickBoundary() {
   if (activationInFlight) {
-    setMsg("配置仍在后台应用。请等待它完成后再一键开始，避免按旧的当前配置启动。", "err");
+    setMsg("当前选择仍在保存。请等待完成后再一键开始。", "err");
     return false;
   }
   if (!configState.active_id) {
-    setMsg("还没有「当前生效」的配置。请先点「新建配置」或在列表点「设为当前」选一条，再一键开始。", "err");
+    setMsg("还没有「当前选择」的配置。请先点「新建配置」或在列表点「设为当前」选一条，再一键开始。", "err");
     return false;
   }
   const active = (configState.profiles || []).find((p) => p.id === configState.active_id);
@@ -2449,7 +2467,7 @@ async function runOneClick(runtimeChoice) {
   if (runtimeChoice) {
     if (!runtimeChoiceActiveId || runtimeChoiceActiveId !== configState.active_id) {
       hideRuntimeChoice();
-      setMsg("当前生效配置已变化，本次缓存运行选择已作废。请重新点击「一键开始」。", "err");
+      setMsg("当前选择已变化，本次缓存运行选择已作废。请重新点击「一键开始」。", "err");
       return;
     }
   }
@@ -2487,6 +2505,9 @@ async function runOneClick(runtimeChoice) {
       ? " 请在 Science 的 More models 中选择 Codex / … 后再发第一条消息；默认 Claude 壳会被明确拒绝。"
       : ""), "ok");
     setBrowserFallback(r.fallback_url);
+    configState.selection_pending = false;
+    configState.applied_profile_id = configState.active_id || null;
+    renderList();
     await refreshStatus();
   } catch (e) {
     setMsg("一键开始失败：" + runtimeCommandErrorText(e), "err");
@@ -2687,7 +2708,7 @@ function wire() {
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
     "codexEnabled", "codexAuthStatus", "codexStatusBtn", "codexLoginBtn", "codexCancelBtn", "codexLogoutBtn", "codexProfileRepairBox", "codexRepairProfileBtn",
     "codexNetworkMode", "codexProxyUrl", "codexNetworkResolved", "codexNetworkSaveBtn", "codexDowngradeBox", "codexDowngradeBtn",
-    "connectionOverview", "listSec", "profileList", "newBtn", "skipActivateBtn",
+    "connectionOverview", "listSec", "profileList", "newBtn",
     "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBaseGroup", "wizBase", "wizBaseHint",
     "wizModelGroup", "wizModelLabel", "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelDisplayName", "wizModelHint", "wizCodexCatalog", "wizCodexCatalogMeta", "wizCodexCatalogList", "wizStaticCatalog", "wizRoleQuality", "wizRoleQualityDisplayName", "wizRoleFast", "wizRoleFastDisplayName", "wizRoleFable", "wizRoleFableDisplayName", "wizCatalogWarning", "wizKeyGroup", "wizKey", "wizSaveBtn", "wizCancelBtn",
     "connSec", "connTitle", "connBaseGroup", "connBase", "connBaseHint", "connFetchBtn",
@@ -2733,7 +2754,7 @@ function wire() {
     if (!btn || !row || btn.disabled || btn.dataset.permanentlyDisabled === "true") return;
     const id = row.getAttribute("data-id");
     const act = btn.getAttribute("data-act");
-    if (act === "activate") activate(id, false);
+    if (act === "activate") activate(id);
     else if (act === "editconn") openConn(id);
     else if (act === "editmeta") openMeta(id);
     else if (act === "clearkey") clearKey(id);
@@ -2756,11 +2777,6 @@ function wire() {
   });
 
   els.newBtn.addEventListener("click", openWizard);
-  els.skipActivateBtn.addEventListener("click", () => {
-    const id = pendingSkipActivateId;
-    if (id) activate(id, true);
-  });
-
   els.wizTemplateChips.addEventListener("click", (e) => {
     if (busy) return;
     const chip = e.target.closest(".chip");

@@ -34,7 +34,7 @@
 ---
 
 <p align="center">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.2/CSSwitch_0.8.2_aarch64.dmg">下载 v0.8.2</a> ·
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.3/CSSwitch_0.8.3_aarch64.dmg">下载 v0.8.3</a> ·
   <a href="#功能介绍">功能介绍</a> ·
   <a href="#安装与启动">安装与启动</a> ·
   <a href="#provider-与模型">Provider 与模型</a> ·
@@ -50,7 +50,7 @@
 | Provider 与模型 | 已支持 | 连接内置 Provider、中转站和自定义兼容端点，自由填写并严格映射 Science 使用的模型。 |
 | Codex | 实验功能 | 使用 CSSwitch 独立浏览器登录和账号动态模型目录；默认关闭，不读取或修改原生 `~/.codex` 登录。 |
 | Skill | 已支持 | 查看当前 Science 组织中的 Skill，从本地包导入，或让 Agent 从准确的公开 GitHub URL 安装。 |
-| MCP | 即将支持 | v0.8.2 尚未提供面向用户的通用 MCP 添加、配置和运行管理；后续版本会继续完善。 |
+| MCP | 即将支持 | v0.8.3 尚未提供面向用户的通用 MCP 添加、配置和运行管理；后续版本会继续完善。 |
 
 ## 社区
 
@@ -64,7 +64,7 @@
 
 ### 第一次安装
 
-1. 下载 [`CSSwitch_0.8.2_aarch64.dmg`](https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.2/CSSwitch_0.8.2_aarch64.dmg)，打开后将 CSSwitch 拖入「应用程序」。
+1. 下载 [`CSSwitch_0.8.3_aarch64.dmg`](https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.3/CSSwitch_0.8.3_aarch64.dmg)，打开后将 CSSwitch 拖入「应用程序」。
 2. 确认电脑上已经安装 [Claude Science](https://claude.com/download)，然后打开 CSSwitch。
 3. 首次打开如被 macOS 阻止，请在 Finder 中右键 CSSwitch，选择「打开」。
 
@@ -118,7 +118,7 @@ CSSwitch 当前聚焦于安全地把外部 Skill 接入隔离 Science，而不�
 
 ## MCP
 
-通用 MCP 支持正在开发中。当前 v0.8.2 还不能让用户在 CSSwitch 中添加、编辑或管理自己的 MCP server，也不应把 Skill 安装所用的内部 connector 当成完整 MCP 功能。后续支持范围以对应版本的 README 和更新日志为准。
+通用 MCP 支持正在开发中。当前 v0.8.3 还不能让用户在 CSSwitch 中添加、编辑或管理自己的 MCP server，也不应把 Skill 安装所用的内部 connector 当成完整 MCP 功能。后续支持范围以对应版本的 README 和更新日志为准。
 
 ## 安全与隔离
 

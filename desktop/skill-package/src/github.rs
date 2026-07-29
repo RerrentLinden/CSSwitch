@@ -1702,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "explicit full-size Nature archive through mock GitHub transport"]
+    #[ignore = "explicit Acceptance-boundary full-size Nature archive through mock GitHub transport"]
     fn full_nature_archive_uses_github_flow_and_retry_skips_archive() {
         let archive_path = std::env::var_os("CSSWITCH_LOCAL_NATURE_BUNDLE_ARCHIVE")
             .map(PathBuf::from)

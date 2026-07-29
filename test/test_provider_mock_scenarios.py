@@ -261,12 +261,14 @@ class ProviderMockScenarioTests(unittest.TestCase):
         first = conn.getresponse()
         self.assertEqual(first.status, 200)
         first.read()
+        self.assertTrue(wait_for_request_count(mock, 1))
         mock.enter_phase("formal")
         body = b"{}"
         conn.request("POST", "/formal", body=body, headers={"Content-Type": "application/json"})
         second = conn.getresponse()
         self.assertEqual(second.status, 200)
         self.assertEqual(json.loads(second.read())["type"], "message")
+        self.assertTrue(wait_for_request_count(mock, 2))
         conn.close()
         before_stop = mock.result()
         self.assertTrue(before_stop["protocol_complete"])
@@ -414,7 +416,17 @@ class ProviderMockScenarioTests(unittest.TestCase):
             mock.write_ready_evidence()
             mock.enter_phase("formal")
             self.assertEqual(request(mock, "GET", "/hit", headers={"X-Api-Key": fake_key})[0], 200)
-            hits_before_stop = (evidence.path / "hits.jsonl").read_text(encoding="utf-8")
+            hits_path = evidence.path / "hits.jsonl"
+            deadline = time.monotonic() + 2
+            hits_before_stop = ""
+            while time.monotonic() < deadline:
+                # append_hit holds this lock through write+fsync. Reading under
+                # the same lock proves the handler's durable append completed.
+                with evidence._lock:
+                    hits_before_stop = hits_path.read_text(encoding="utf-8")
+                if hits_before_stop:
+                    break
+                time.sleep(0.01)
             self.assertIn('"header_matches":{"x-api-key":true}', hits_before_stop)
             self.assertNotIn(fake_key, hits_before_stop)
             final = mock.stop()
@@ -744,6 +756,7 @@ class ProviderMockScenarioTests(unittest.TestCase):
                 self.assertEqual(
                     request(instance.mock, "POST", "/status/503", {})[0], 503
                 )
+                self.assertTrue(instance.mock.wait_complete(timeout=2))
                 self.assertTrue(instance.mock.result()["protocol_complete"])
                 instance._stop_requested.set()
                 return value

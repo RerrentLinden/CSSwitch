@@ -58,6 +58,7 @@ pub(crate) struct FormalGatewayPlan {
     pub(crate) model: String,
     pub(crate) static_model_catalog: Option<String>,
     pub(crate) credential: FormalCredential,
+    #[allow(dead_code)]
     pub(crate) model_policy: ModelPolicy,
     pub(crate) transport: Transport,
     pub(crate) endpoint_policy: EndpointPolicy,

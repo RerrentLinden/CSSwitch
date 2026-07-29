@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.8.2"
+version = "0.8.4"
 description = "CSSwitch 菜单栏 app（进程管家 + 配置面板）"
 authors = ["CSSwitch"]
 edition = "2021"
@@ -45,3 +45,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"

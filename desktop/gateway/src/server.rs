@@ -286,6 +286,16 @@ fn api_error_json(stream: &mut TcpStream, status: u16, detail: &str) {
     typed_error_json(stream, status, status_reason(status), "api_error", detail);
 }
 
+fn upstream_protocol_error_json(stream: &mut TcpStream, detail: &str) {
+    typed_error_json(
+        stream,
+        502,
+        "Bad Gateway",
+        "upstream_protocol_error",
+        detail,
+    );
+}
+
 fn status_reason(status: u16) -> &'static str {
     reqwest::StatusCode::from_u16(status)
         .ok()
@@ -1419,10 +1429,11 @@ fn handle_messages(
                     }
                 };
                 let anthropic_resp = if cfg.provider == "openai-responses" {
-                    Ok(openai_responses::openai_to_anthropic(
+                    openai_responses::openai_to_anthropic_validated(
                         &openai_resp,
                         &model_id,
-                    ))
+                        &known_tools,
+                    )
                 } else {
                     openai_chat::openai_to_anthropic(
                         &openai_resp,
@@ -1434,7 +1445,11 @@ fn handle_messages(
                 let anthropic_resp = match anthropic_resp {
                     Ok(response) => response,
                     Err(error) => {
-                        api_error_json(stream, 502, &error);
+                        if cfg.provider == "openai-responses" {
+                            upstream_protocol_error_json(stream, &error);
+                        } else {
+                            api_error_json(stream, 502, &error);
+                        }
                         return;
                     }
                 };
@@ -2997,13 +3012,29 @@ mod tests {
         assert!(head.contains("x-csswitch-model-source: live"));
         assert!(head.contains("x-csswitch-model-age-seconds: 0"));
         let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
-        assert_eq!(body["data"].as_array().unwrap().len(), 3);
+        assert_eq!(body["data"].as_array().unwrap().len(), 8);
         assert_eq!(body["data"][0]["id"], "claude-csswitch-codex-gpt-5.6-sol");
         assert_eq!(body["data"][0]["display_name"], "Codex / GPT-5.6-Sol");
         assert_eq!(body["data"][1]["id"], "claude-csswitch-codex-gpt-5.6-terra");
         assert_eq!(body["data"][1]["display_name"], "Codex / GPT-5.6-Terra");
         assert_eq!(body["data"][2]["id"], "claude-csswitch-codex-gpt-5.6-luna");
         assert_eq!(body["data"][2]["display_name"], "Codex / GPT-5.6-Luna");
+        for canonical in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(
+                body["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|model| model["id"] == canonical),
+                "routable Science canonical role {canonical} must be published"
+            );
+        }
         assert_eq!(body["diagnostics"]["source"], "live");
         assert_eq!(body["diagnostics"]["stale"], false);
         assert!(!serde_json::to_string(&body)

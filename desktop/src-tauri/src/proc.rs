@@ -57,6 +57,171 @@ pub fn http_health(port: u16, secret: Option<&str>, timeout_ms: u64) -> bool {
     http_health_response(port, secret, timeout_ms).is_some()
 }
 
+#[cfg(test)]
+const SCIENCE_HEALTH_HEADER_LIMIT: usize = 16 * 1024;
+#[cfg(test)]
+const SCIENCE_HEALTH_BODY_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScienceDbHealth {
+    Ready,
+    ReverifyPending,
+    RestartRequired,
+}
+
+#[cfg(test)]
+pub(crate) fn science_db_health(port: u16, timeout_ms: u64) -> Result<ScienceDbHealth, String> {
+    let (status, body) =
+        http_get_body_bounded(port, "/api/health", timeout_ms, SCIENCE_HEALTH_BODY_LIMIT)?;
+    if status != 200 {
+        return Err(format!("science_api_health_status_{status}"));
+    }
+    science_db_health_from_body(&body)
+}
+
+pub(crate) fn science_db_health_from_body(body: &str) -> Result<ScienceDbHealth, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "science_api_health_malformed")?;
+    let corruption = value
+        .get("db_corruption")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("science_api_health_missing_db_corruption")?;
+    let flagged = corruption
+        .get("flagged")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("science_api_health_missing_db_corruption")?;
+    let kind = corruption
+        .get("kind")
+        .ok_or("science_api_health_missing_db_corruption_kind")?;
+    let migrations_skipped = value
+        .get("db_migrations_skipped")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("science_api_health_missing_db_migrations_skipped")?;
+    match (flagged, kind.as_str(), kind.is_null()) {
+        (true, Some("damage"), false) if migrations_skipped => {
+            return Ok(ScienceDbHealth::ReverifyPending)
+        }
+        (true, Some("damage"), false) => return Ok(ScienceDbHealth::RestartRequired),
+        (true, Some("io_errors"), false) => return Ok(ScienceDbHealth::RestartRequired),
+        (false, None, true) => {}
+        _ => return Err("science_api_health_invalid_db_corruption_kind".into()),
+    }
+    if migrations_skipped {
+        return Ok(ScienceDbHealth::RestartRequired);
+    }
+    Ok(ScienceDbHealth::Ready)
+}
+
+#[cfg(test)]
+fn http_get_body_bounded(
+    port: u16,
+    path: &str,
+    timeout_ms: u64,
+    body_limit: usize,
+) -> Result<(u16, String), String> {
+    let addr = ("127.0.0.1", port)
+        .to_socket_addrs()
+        .map_err(|_| "science_api_health_unreachable")?
+        .next()
+        .ok_or("science_api_health_unreachable")?;
+    let dur = Duration::from_millis(timeout_ms);
+    let mut stream =
+        TcpStream::connect_timeout(&addr, dur).map_err(|_| "science_api_health_unreachable")?;
+    let poll = Duration::from_millis(250).min(dur);
+    stream
+        .set_read_timeout(Some(poll))
+        .map_err(|_| "science_api_health_unreachable")?;
+    stream
+        .set_write_timeout(Some(poll))
+        .map_err(|_| "science_api_health_unreachable")?;
+    let request = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| "science_api_health_unreachable")?;
+    let deadline = Instant::now() + dur;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut header_end = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("science_api_health_incomplete".into());
+        }
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(250).min(remaining)));
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    header_end = raw.windows(4).position(|window| window == b"\r\n\r\n");
+                    if header_end.is_none() && raw.len() > SCIENCE_HEALTH_HEADER_LIMIT {
+                        return Err("science_api_health_headers_too_large".into());
+                    }
+                }
+                if let Some(end) = header_end {
+                    if end > SCIENCE_HEALTH_HEADER_LIMIT {
+                        return Err("science_api_health_headers_too_large".into());
+                    }
+                    if raw.len().saturating_sub(end + 4) > body_limit {
+                        return Err("science_api_health_body_too_large".into());
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return Err("science_api_health_unreachable".into()),
+        }
+    }
+    let header_end = header_end.ok_or("science_api_health_incomplete")?;
+    let headers = std::str::from_utf8(&raw[..header_end])
+        .map_err(|_| "science_api_health_malformed_headers")?;
+    if headers.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && !value.trim().eq_ignore_ascii_case("identity")
+        })
+    }) {
+        return Err("science_api_health_unsupported_transfer_encoding".into());
+    }
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or("science_api_health_malformed_status")?;
+    let body = &raw[header_end + 4..];
+    let mut content_length = None;
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err("science_api_health_malformed_headers".into());
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err("science_api_health_malformed_headers".into());
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| "science_api_health_malformed_headers")?,
+            );
+        }
+    }
+    if let Some(length) = content_length {
+        if length > body_limit {
+            return Err("science_api_health_body_too_large".into());
+        }
+        if length != body.len() {
+            return Err("science_api_health_incomplete".into());
+        }
+    }
+    let body = std::str::from_utf8(body).map_err(|_| "science_api_health_malformed_utf8")?;
+    Ok((status, body.to_string()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayHealth {
     pub gateway: String,
@@ -458,6 +623,93 @@ mod tests {
     fn health_false_when_nothing_listening() {
         // 一个几乎肯定没人监听的高端口。
         assert!(!http_health(59999, None, 300));
+    }
+
+    #[test]
+    fn science_db_health_requires_both_semantic_flags_to_be_clear() {
+        assert_eq!(
+            science_db_health_from_body(
+                r#"{"db_corruption":{"flagged":false,"kind":null},"db_migrations_skipped":false}"#
+            ),
+            Ok(ScienceDbHealth::Ready)
+        );
+        assert_eq!(
+            science_db_health_from_body(
+                r#"{"db_corruption":{"flagged":true,"kind":"damage"},"db_migrations_skipped":true}"#
+            ),
+            Ok(ScienceDbHealth::ReverifyPending)
+        );
+        assert_eq!(
+            science_db_health_from_body(
+                r#"{"db_corruption":{"flagged":true,"kind":"damage"},"db_migrations_skipped":false}"#
+            ),
+            Ok(ScienceDbHealth::RestartRequired)
+        );
+        assert_eq!(
+            science_db_health_from_body(
+                r#"{"db_corruption":{"flagged":true,"kind":"io_errors"},"db_migrations_skipped":false}"#
+            ),
+            Ok(ScienceDbHealth::RestartRequired)
+        );
+        assert_eq!(
+            science_db_health_from_body(
+                r#"{"db_corruption":{"flagged":false,"kind":null},"db_migrations_skipped":true}"#
+            ),
+            Ok(ScienceDbHealth::RestartRequired)
+        );
+        for body in [
+            r#"{"db_corruption":{"flagged":true},"db_migrations_skipped":false}"#,
+            r#"{"db_corruption":{"flagged":true,"kind":null},"db_migrations_skipped":false}"#,
+            r#"{"db_corruption":{"flagged":true,"kind":"unknown"},"db_migrations_skipped":false}"#,
+            r#"{"db_corruption":{"flagged":false,"kind":"damage"},"db_migrations_skipped":false}"#,
+        ] {
+            assert!(science_db_health_from_body(body).is_err());
+        }
+        assert!(science_db_health_from_body(r#"{"status":"ok"}"#).is_err());
+        assert!(science_db_health_from_body("not-json").is_err());
+    }
+
+    #[test]
+    fn science_db_health_rejects_declared_body_over_64_kib() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.0 200 OK\r\nContent-Length: 65537\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            science_db_health(port, 1_000),
+            Err("science_api_health_body_too_large".into())
+        );
+    }
+
+    #[test]
+    fn science_db_health_never_accepts_a_valid_json_prefix_of_an_oversize_body() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request);
+            let prefix =
+                br#"{"db_corruption":{"flagged":false,"kind":null},"db_migrations_skipped":false}"#;
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.write_all(prefix).unwrap();
+            stream.write_all(&vec![b' '; 65_537]).unwrap();
+            stream.write_all(b"not-json").unwrap();
+        });
+        assert_eq!(
+            science_db_health(port, 1_000),
+            Err("science_api_health_body_too_large".into())
+        );
     }
 
     #[test]

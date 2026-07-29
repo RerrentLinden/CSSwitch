@@ -14,6 +14,7 @@
 - [真机验收](operations/real-machine-acceptance.md)
 - [发布](operations/release.md)
 - [升级与回滚](operations/upgrade-and-rollback.md)
+- [Quality kernel](operations/quality-kernel.md)：机器事实源、变化登记、source-green 与证据层边界。
 
 ## 功能合同
 

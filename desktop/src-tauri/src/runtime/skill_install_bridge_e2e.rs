@@ -375,6 +375,20 @@ struct ModelAliasProvider {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+fn with_science_canonical_roles(mut models: Vec<(String, String)>) -> Vec<(String, String)> {
+    models.extend([
+        ("claude-opus-5".into(), "Claude Opus 5".into()),
+        ("claude-sonnet-5".into(), "Claude Sonnet 5".into()),
+        ("claude-opus-4-8".into(), "Claude Opus 4.8".into()),
+        ("claude-sonnet-4-6".into(), "Claude Sonnet 4.6".into()),
+        (
+            "claude-haiku-4-5-20251001".into(),
+            "Claude Haiku 4.5".into(),
+        ),
+    ]);
+    models
+}
+
 impl ModelAliasProvider {
     fn start(models: Vec<(String, String)>) -> Self {
         use std::sync::atomic::Ordering;
@@ -1508,6 +1522,85 @@ fn snapshot_line_ref(line: &str) -> Option<String> {
     Some(line[start..end].to_string())
 }
 
+fn snapshot_button_ref_by_child_text(snapshot: &str, text: &str) -> Option<String> {
+    let plain_text = format!("- text: {text}");
+    let quoted_text = format!("- text: \"{text}\"");
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let mut matches = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("- button [ref=") {
+            continue;
+        }
+        let Some(button_ref) = snapshot_line_ref(line) else {
+            continue;
+        };
+        let button_indent = line.len() - trimmed.len();
+        let mut contains_nested_button = false;
+        let mut contains_target_text = false;
+        for child in &lines[index + 1..] {
+            let child_trimmed = child.trim_start();
+            let child_indent = child.len() - child_trimmed.len();
+            if !child_trimmed.is_empty() && child_indent <= button_indent {
+                break;
+            }
+            if child_trimmed.starts_with("- button") {
+                contains_nested_button = true;
+            }
+            if child_trimmed == plain_text || child_trimmed == quoted_text {
+                contains_target_text = true;
+            }
+        }
+        if contains_target_text && !contains_nested_button {
+            matches.push(button_ref);
+        }
+    }
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
+#[test]
+fn snapshot_button_ref_accepts_unlabelled_button_with_child_text() {
+    let snapshot = r#"
+- navigation "Sessions" [ref=e1]:
+  - button:
+    - text: Ignored
+  - button "Not New" [ref=e5]:
+    - text: New
+  - button [ref=e2] [cursor=pointer]:
+    - generic [ref=e3]:
+      - text: New
+  - button "Search" [ref=e4]
+"#;
+    assert_eq!(
+        snapshot_button_ref_by_child_text(snapshot, "New").as_deref(),
+        Some("e2")
+    );
+    assert_eq!(snapshot_button_ref_by_child_text(snapshot, "Search"), None);
+
+    let duplicate = r#"
+- button [ref=e1]:
+  - text: New
+- button [ref=e2]:
+  - text: "New"
+"#;
+    assert_eq!(snapshot_button_ref_by_child_text(duplicate, "New"), None);
+
+    let nested = r#"
+- button [ref=outer]:
+  - generic:
+    - button [ref=inner]:
+      - text: New
+"#;
+    assert_eq!(
+        snapshot_button_ref_by_child_text(nested, "New").as_deref(),
+        Some("inner")
+    );
+}
+
 fn wait_control(guard: &ScienceGuard, needle: &str, attempts: usize) -> Result<String, String> {
     for _ in 0..attempts {
         let current = snapshot(guard)?;
@@ -1621,8 +1714,19 @@ fn open_chat(guard: &mut ScienceGuard) -> Result<String, String> {
     }
     let home = wait_control(guard, "button \"Open project Example project\"", 30)?;
     click(guard, &home, "button \"Open project Example project\"")?;
-    let project = wait_control(guard, "button \"New\"", 30)?;
-    click(guard, &project, "button \"New\"")?;
+    let mut new_button = None;
+    for _ in 0..30 {
+        let project = snapshot(guard)?;
+        if let Some(reference) = snapshot_ref(&project, "button \"New\"")
+            .or_else(|| snapshot_button_ref_by_child_text(&project, "New"))
+        {
+            new_button = Some(reference);
+            break;
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    let new_button = new_button.ok_or("New 控件未出现")?;
+    playwright_output(guard, &["click", &new_button])?;
     wait_chat_idle(guard, 80)
 }
 
@@ -1634,6 +1738,39 @@ fn open_model_catalog(guard: &ScienceGuard, current: &str) -> Result<String, Str
         catalog = snapshot(guard)?;
     }
     Ok(catalog)
+}
+
+fn assert_science_role_settings_are_available(
+    guard: &ScienceGuard,
+    current: &str,
+) -> Result<String, String> {
+    let customize = snapshot_button_ref_by_child_text(current, "Customize")
+        .ok_or("missing Customize button")?;
+    playwright_output(guard, &["click", &customize])?;
+    let customize_page = snapshot(guard)?;
+    let general =
+        snapshot_ref(&customize_page, "button \"General\"").ok_or("missing General button")?;
+    playwright_output(guard, &["click", &general])?;
+    let general_page = snapshot(guard)?;
+    if general_page.contains("(unavailable)") {
+        return Err(format!(
+            "Science canonical role setting is unavailable:\n{general_page}"
+        ));
+    }
+    if !general_page.contains("textbox [")
+        || !general_page.contains("claude-sonnet-5")
+        || !general_page.contains("Default model")
+        || !general_page.contains("Subagent model")
+        || !general_page.contains("Reviewer model")
+    {
+        return Err(format!(
+            "Science canonical reviewer setting is missing:\n{general_page}"
+        ));
+    }
+    let close = snapshot_ref(&general_page, "button \"Close settings\"")
+        .ok_or("missing Close settings button")?;
+    playwright_output(guard, &["click", &close])?;
+    wait_chat_idle(guard, 40)
 }
 
 fn send_prompt(guard: &ScienceGuard, current: &str, prompt: &str) -> Result<(), String> {
@@ -2202,8 +2339,14 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
         .expect("read installed Science version");
     assert!(version_output.status.success());
     let science_version = String::from_utf8(version_output.stdout).unwrap();
+    assert!(
+        science_version
+            .split_whitespace()
+            .eq(["claude-science", "0.1.25", "(release,", "public)",]),
+        "model settings oracle requires exact public Claude Science 0.1.25: {science_version}"
+    );
 
-    let provider = ModelAliasProvider::start(vec![
+    let provider = ModelAliasProvider::start(with_science_canonical_roles(vec![
         (
             "claude-csswitch-opencode-go-kimi-k2-6-old".into(),
             "Stage0 Kimi K2.6".into(),
@@ -2212,7 +2355,7 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
             "claude-csswitch-codex-stage0-old-b".into(),
             "Stage0 Codex Old B".into(),
         ),
-    ]);
+    ]));
     let port = free_port();
     let sandbox_port = free_port();
     assert_ne!(port, sandbox_port);
@@ -2247,6 +2390,7 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
     assert_installed_runtime_identity(&guard, &science_version);
 
     let old_chat = open_chat(&mut guard).unwrap();
+    let old_chat = assert_science_role_settings_are_available(&guard, &old_chat).unwrap();
     let old_catalog = open_model_catalog(&guard, &old_chat).unwrap();
     assert!(old_catalog.contains("Stage0 Kimi K2.6"), "{old_catalog}");
     assert!(old_catalog.contains("Stage0 Codex Old B"), "{old_catalog}");
@@ -2271,7 +2415,7 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
     let k3_alias = static_models[0].0.clone();
     let selected_alias = static_models[4].0.clone();
     let gets_before_hot_replace = provider.snapshot().model_gets;
-    provider.replace_models(static_models.clone());
+    provider.replace_models(with_science_canonical_roles(static_models.clone()));
     let hot_chat = open_chat(&mut guard).unwrap();
     let hot_catalog = open_model_catalog(&guard, &hot_chat).unwrap();
     assert!(hot_catalog.contains("Stage0 Kimi K2.6"), "{hot_catalog}");

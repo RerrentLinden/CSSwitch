@@ -10,6 +10,13 @@ const MAX_ROUTES: usize = 64;
 const MAX_SELECTOR_BYTES: usize = 160;
 const MAX_DISPLAY_BYTES: usize = 256;
 const MAX_UPSTREAM_BYTES: usize = 512;
+pub(crate) const SCIENCE_CANONICAL_ROLE_MODELS: [(&str, &str); 5] = [
+    ("claude-opus-5", "Claude Opus 5"),
+    ("claude-sonnet-5", "Claude Sonnet 5"),
+    ("claude-opus-4-8", "Claude Opus 4.8"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+];
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -310,17 +317,19 @@ impl StaticProfileResolver {
             indexes.retain(|index| *index != default_index);
             indexes.insert(0, default_index);
         }
-        let data: Vec<Value> = indexes
+        let mut data: Vec<Value> = indexes
             .into_iter()
             .map(|index| {
                 let route = &self.routes[index];
                 // 旧配置可能把内部占位词 `default` 写进展示名。Science
                 // 应展示用户实际配置的 upstream 模型，而不是伪模型名称。
-                let display_name = if route.display_name.trim().eq_ignore_ascii_case("default") {
+                let raw_display = if route.display_name.trim().eq_ignore_ascii_case("default") {
                     &route.upstream_model
                 } else {
                     &route.display_name
                 };
+                let display_name =
+                    crate::models::science_safe_display_name(&route.upstream_model, raw_display);
                 json!({
                     "type": "model",
                     "id": route.selector_id,
@@ -340,6 +349,36 @@ impl StaticProfileResolver {
                 })
             })
             .collect();
+        for (id, _) in SCIENCE_CANONICAL_ROLE_MODELS {
+            if self.by_selector.contains_key(id) {
+                continue;
+            }
+            let Some(resolved) = self.resolve(id) else {
+                continue;
+            };
+            let route = resolved.route;
+            let route_display = crate::models::science_safe_display_name(
+                &route.upstream_model,
+                &route.display_name,
+            );
+            data.push(json!({
+                "type": "model",
+                "id": id,
+                "display_name": route_display,
+                "supports_tools": route.supports_tools,
+                "capabilities": {
+                    "reasoning_round_trip": match route.capabilities.reasoning_round_trip {
+                        ReasoningRoundTrip::None => "none",
+                        ReasoningRoundTrip::Native => "native",
+                        ReasoningRoundTrip::CsswitchOpaque => "csswitch_opaque",
+                    },
+                    "forced_tool_choice": route.capabilities.forced_tool_choice,
+                    "structured_output": route.capabilities.structured_output,
+                    "vision": route.capabilities.vision,
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+            }));
+        }
         json!({
             "data": data,
             "has_more": false,
@@ -497,7 +536,30 @@ mod tests {
             response["data"][0]["id"],
             "claude-csswitch-qwen-plus-111111111111"
         );
-        assert_eq!(response["data"].as_array().unwrap().len(), 3);
+        assert_eq!(response["data"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn models_response_publishes_science_canonical_role_ids_that_inference_accepts() {
+        let resolver = resolver();
+        let response = resolver.models_response();
+        let models = response["data"].as_array().unwrap();
+        for (id, upstream, display_name) in [
+            ("claude-opus-5", "qwen-max", "Max"),
+            ("claude-sonnet-5", "qwen-plus", "Plus"),
+            ("claude-opus-4-8", "qwen-max", "Max"),
+            ("claude-sonnet-4-6", "qwen-plus", "Plus"),
+            ("claude-haiku-4-5-20251001", "qwen-fast", "Fast"),
+        ] {
+            let model = models
+                .iter()
+                .find(|model| model["id"] == id)
+                .unwrap_or_else(|| {
+                    panic!("Science canonical model {id} must be listed when it is routable")
+                });
+            assert_eq!(model["display_name"], display_name);
+            assert_eq!(resolver.resolve(id).unwrap().upstream_model(), upstream);
+        }
     }
 
     #[test]
@@ -510,6 +572,23 @@ mod tests {
         resolver.routes[default_index].display_name = "default".into();
         let response = resolver.models_response();
         assert_eq!(response["data"][0]["display_name"], "qwen-plus");
+    }
+
+    #[test]
+    fn machine_shaped_claude_display_name_is_humanized_without_changing_id() {
+        let mut resolver = resolver();
+        let default_index = *resolver
+            .by_selector
+            .get(&resolver.default_selector_id)
+            .unwrap();
+        resolver.routes[default_index].upstream_model = "claude-sonnet-5".into();
+        resolver.routes[default_index].display_name = "claude-sonnet-5".into();
+        let response = resolver.models_response();
+        assert_eq!(
+            response["data"][0]["id"],
+            "claude-csswitch-qwen-plus-111111111111"
+        );
+        assert_eq!(response["data"][0]["display_name"], "Claude Sonnet 5");
     }
 
     #[test]

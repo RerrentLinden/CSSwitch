@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::Runtime;
@@ -23,7 +24,8 @@ pub(crate) const SCIENCE_BIN: &str =
 pub(crate) const SCIENCE_DOWNLOAD_URL: &str = "https://claude.com/download";
 pub(crate) const CACHED_ONCE_CHOICE: &str = "cached_once";
 const OFFICIAL_UPDATED_RUNTIME_RELATIVE: &str = ".claude-science/bin/claude-science";
-const OFFICIAL_SCIENCE_IDENTIFIERS: &[&str] = &["com.anthropic.operon", "com.anthropic.operon.cli"];
+const OFFICIAL_UPDATED_SCIENCE_IDENTIFIERS: [&str; 2] =
+    ["com.anthropic.operon", "com.anthropic.operon.cli"];
 const OFFICIAL_SCIENCE_TEAM_ID: &str = "Q6L2SF6YDW";
 const MIN_SCIENCE_BINARY_SIZE: u64 = 1024 * 1024;
 const MAX_SCIENCE_BINARY_SIZE: u64 = 512 * 1024 * 1024;
@@ -31,7 +33,11 @@ const OFFICIAL_UPDATED_SNAPSHOT_DIR: &str = "runtime-snapshots/science";
 const OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE: &str = "claude-science";
 const OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX: &str = "sha256-";
 const SCIENCE_VERSION_TIMEOUT: Duration = Duration::from_secs(15);
+const MANAGED_LAUNCH_FILE: &str = "science-managed-launch.v1.json";
+const MAX_MANAGED_LAUNCH_BYTES: u64 = 16 * 1024;
 static SCIENCE_VERSION_OUTPUT_NONCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static MANAGED_LAUNCH_LAST_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScienceRuntimeSource {
@@ -61,6 +67,10 @@ pub(crate) struct ScienceRuntimeIdentity {
 }
 
 impl ScienceRuntimeIdentity {
+    pub(crate) fn environment_transaction_id(&self) -> String {
+        fingerprint_sha256_hex(&self.fingerprint)
+    }
+
     pub(crate) fn skill_install_host_context(
         &self,
         sandbox_port: u16,
@@ -114,6 +124,69 @@ pub(crate) struct ScienceExecutableFingerprint {
     modified_nanoseconds: i64,
     mode: u32,
     sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScienceManagedLaunchRecord {
+    schema_version: u32,
+    launch_id: String,
+    port: u16,
+    listener_pid: u32,
+    process_start: String,
+    runtime_path: PathBuf,
+    runtime_device: u64,
+    runtime_inode: u64,
+    runtime_size: u64,
+    runtime_modified_seconds: i64,
+    runtime_modified_nanoseconds: i64,
+    runtime_mode: u32,
+    runtime_sha256: String,
+    data_dir: PathBuf,
+    data_dir_device: u64,
+    data_dir_inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedLaunchFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    mode: u32,
+    uid: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScienceManagedLaunchToken {
+    record: ScienceManagedLaunchRecord,
+    receipt_file: Option<ManagedLaunchFileIdentity>,
+}
+
+#[cfg(test)]
+static MANAGED_LAUNCH_COMMIT_FAILURE_ONCE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn test_reset_managed_launch_commit_failure_once() {
+    MANAGED_LAUNCH_COMMIT_FAILURE_ONCE_FIRED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[derive(Debug)]
+pub(crate) struct ScienceManagedLaunchCommitError {
+    message: String,
+    token: Option<ScienceManagedLaunchToken>,
+}
+
+impl ScienceManagedLaunchCommitError {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn token(&self) -> Option<&ScienceManagedLaunchToken> {
+        self.token.as_ref()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -245,119 +318,44 @@ fn is_explicit_executable_file(path: &Path) -> bool {
     is_executable_file(path)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OfficialScienceEmbeddedIdentity {
-    identifier: String,
-    team_identifier: String,
+fn embedded_identity_metadata_matches(details: &str, identifier: &str, team_id: &str) -> bool {
+    details
+        .lines()
+        .any(|line| line == format!("Identifier={identifier}"))
+        && details
+            .lines()
+            .any(|line| line == format!("TeamIdentifier={team_id}"))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OfficialScienceIdentityError {
-    NotMachO,
-    CodesignUnavailable,
-    CodesignFailed,
-    CodesignOutputTooLarge,
-    MissingIdentifier,
-    DuplicateIdentifier,
-    MissingTeamIdentifier,
-    DuplicateTeamIdentifier,
-    UnsupportedIdentifier,
-    UnexpectedTeamIdentifier,
+fn official_updated_embedded_identity_metadata_matches(details: &str) -> bool {
+    OFFICIAL_UPDATED_SCIENCE_IDENTIFIERS
+        .iter()
+        .any(|identifier| {
+            embedded_identity_metadata_matches(details, identifier, OFFICIAL_SCIENCE_TEAM_ID)
+        })
 }
 
-impl OfficialScienceIdentityError {
-    fn diagnostic(self) -> &'static str {
-        match self {
-            Self::NotMachO => "不是受支持的 Mach-O",
-            Self::CodesignUnavailable => "embedded metadata 检查命令不可用",
-            Self::CodesignFailed => "embedded metadata 检查失败",
-            Self::CodesignOutputTooLarge => "embedded metadata 输出超出安全上限",
-            Self::MissingIdentifier => "embedded identifier 缺失",
-            Self::DuplicateIdentifier => "embedded identifier 重复",
-            Self::MissingTeamIdentifier => "Team ID 缺失",
-            Self::DuplicateTeamIdentifier => "Team ID 重复",
-            Self::UnsupportedIdentifier => "embedded identifier 不受支持",
-            Self::UnexpectedTeamIdentifier => "Team ID 不匹配",
-        }
-    }
-}
-
-fn parse_unique_codesign_field(
-    details: &str,
-    prefix: &str,
-    missing: OfficialScienceIdentityError,
-    duplicate: OfficialScienceIdentityError,
-) -> Result<String, OfficialScienceIdentityError> {
-    let mut values = details.lines().filter_map(|line| line.strip_prefix(prefix));
-    let value = values.next().ok_or(missing)?;
-    if values.next().is_some() {
-        return Err(duplicate);
-    }
-    if value.is_empty() {
-        return Err(missing);
-    }
-    Ok(value.to_string())
-}
-
-fn parse_official_science_identity(
-    details: &str,
-) -> Result<OfficialScienceEmbeddedIdentity, OfficialScienceIdentityError> {
-    Ok(OfficialScienceEmbeddedIdentity {
-        identifier: parse_unique_codesign_field(
-            details,
-            "Identifier=",
-            OfficialScienceIdentityError::MissingIdentifier,
-            OfficialScienceIdentityError::DuplicateIdentifier,
-        )?,
-        team_identifier: parse_unique_codesign_field(
-            details,
-            "TeamIdentifier=",
-            OfficialScienceIdentityError::MissingTeamIdentifier,
-            OfficialScienceIdentityError::DuplicateTeamIdentifier,
-        )?,
-    })
-}
-
-fn official_science_identity_from_codesign_output(
-    output: &Output,
-) -> Result<OfficialScienceEmbeddedIdentity, OfficialScienceIdentityError> {
-    if output.stderr.len() > 64 * 1024 {
-        return Err(OfficialScienceIdentityError::CodesignOutputTooLarge);
-    }
-    if !output.status.success() {
-        return Err(OfficialScienceIdentityError::CodesignFailed);
-    }
-    parse_official_science_identity(&String::from_utf8_lossy(&output.stderr))
-}
-
-fn validate_official_science_identity(
-    identity: &OfficialScienceEmbeddedIdentity,
-) -> Result<(), OfficialScienceIdentityError> {
-    if !OFFICIAL_SCIENCE_IDENTIFIERS.contains(&identity.identifier.as_str()) {
-        return Err(OfficialScienceIdentityError::UnsupportedIdentifier);
-    }
-    if identity.team_identifier != OFFICIAL_SCIENCE_TEAM_ID {
-        return Err(OfficialScienceIdentityError::UnexpectedTeamIdentifier);
-    }
-    Ok(())
-}
-
-fn inspect_official_science_identity(
-    path: &Path,
-) -> Result<OfficialScienceEmbeddedIdentity, OfficialScienceIdentityError> {
-    // Current upstream Science updater binaries expose the same embedded
-    // Team ID as the App seed, but the updater and App CLI use different known
-    // identifiers and may fail strict cryptographic `codesign --verify`. Treat
-    // these fields only as format/identity guards; the local trust boundary is
-    // the fixed user-owned path plus SHA-256-bound runtime identity below, not
-    // a claim of verified official provenance.
+fn official_updated_identity_metadata_matches(path: &Path) -> bool {
+    // Official updater executables observed in 0.1.25 use either
+    // `com.anthropic.operon` or `com.anthropic.operon.cli`, including an updater
+    // seeded byte-for-byte from the installed App.
+    // Both currently fail strict cryptographic `codesign --verify`. Treat the
+    // exact allowlisted fields only as format/identity guards; the local trust
+    // boundary remains the fixed user-owned path plus SHA-256-bound runtime
+    // identity below, not a claim of verified official provenance.
     let output = Command::new("/usr/bin/codesign")
         .args(["-d", "--verbose=4"])
         .arg(path)
         .stdout(Stdio::null())
-        .output()
-        .map_err(|_| OfficialScienceIdentityError::CodesignUnavailable)?;
-    official_science_identity_from_codesign_output(&output)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() || output.stderr.len() > 64 * 1024 {
+        return false;
+    }
+    let details = String::from_utf8_lossy(&output.stderr);
+    official_updated_embedded_identity_metadata_matches(&details)
 }
 
 fn file_is_macho(path: &Path) -> bool {
@@ -383,16 +381,6 @@ fn file_is_macho(path: &Path) -> bool {
             | [0xca, 0xfe, 0xba, 0xbf]
             | [0xbf, 0xba, 0xfe, 0xca]
     )
-}
-
-fn validate_official_updated_local_identity(
-    path: &Path,
-) -> Result<(), OfficialScienceIdentityError> {
-    if !file_is_macho(path) {
-        return Err(OfficialScienceIdentityError::NotMachO);
-    }
-    let identity = inspect_official_science_identity(path)?;
-    validate_official_science_identity(&identity)
 }
 
 fn official_updated_science_bin_for_home(
@@ -429,7 +417,8 @@ fn official_updated_science_bin_for_home(
     }
     if verify_local_identity
         && (!(MIN_SCIENCE_BINARY_SIZE..=MAX_SCIENCE_BINARY_SIZE).contains(&metadata.len())
-            || validate_official_updated_local_identity(&candidate).is_err())
+            || !file_is_macho(&candidate)
+            || !official_updated_identity_metadata_matches(&candidate))
     {
         return None;
     }
@@ -639,13 +628,10 @@ fn official_updated_snapshot_from_process_paths(
     if fingerprint_sha256_hex(&fingerprint) != expected_sha {
         return Err("Science runtime snapshot 文件名与内容 SHA-256 不一致".into());
     }
-    if verify_local_identity {
-        validate_official_updated_local_identity(path).map_err(|error| {
-            format!(
-                "Science runtime snapshot {}；已拒绝恢复",
-                error.diagnostic()
-            )
-        })?;
+    if verify_local_identity
+        && (!file_is_macho(path) || !official_updated_identity_metadata_matches(path))
+    {
+        return Err("Science runtime snapshot 未通过 Mach-O/embedded metadata 复核".into());
     }
     Ok(Some(path.clone()))
 }
@@ -751,13 +737,14 @@ fn official_updated_snapshot_for_home(
         }
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o500))
             .map_err(|error| format!("收紧 Science runtime snapshot 权限失败：{error}"))?;
-        if verify_local_identity {
-            validate_official_updated_local_identity(&temporary).map_err(|error| {
-                format!(
-                    "updater Science executable {}；已拒绝静默回退旧 App",
-                    error.diagnostic()
-                )
-            })?;
+        if verify_local_identity
+            && (!file_is_macho(&temporary)
+                || !official_updated_identity_metadata_matches(&temporary))
+        {
+            return Err(
+                "updater Science executable 未通过 Mach-O/embedded metadata 校验；已拒绝静默回退旧 App"
+                    .into(),
+            );
         }
 
         let sha256: [u8; 32] = digest.finalize().into();
@@ -1390,6 +1377,71 @@ fn classify_known_runtime_state(
 }
 
 fn loopback_port_accepts_tcp(port: u16) -> bool {
+    #[cfg(test)]
+    if std::env::var_os("CSSWITCH_TEST_PORT_OBSERVATION_TARGET")
+        .and_then(|value| value.to_string_lossy().parse::<u16>().ok())
+        == Some(port)
+    {
+        if let Some(sequence_dir) = std::env::var_os("CSSWITCH_TEST_PORT_OBSERVATION_SEQUENCE_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.join("armed").is_file())
+        {
+            let false_marker = sequence_dir.join("observed-false");
+            if OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&false_marker)
+                .is_ok()
+            {
+                return false;
+            }
+            let replaced_marker = sequence_dir.join("receipt-replaced");
+            if !replaced_marker.is_file() {
+                let replacement =
+                    std::env::var_os("CSSWITCH_TEST_PORT_OBSERVATION_REPLACEMENT_RECEIPT")
+                        .map(PathBuf::from);
+                let target =
+                    std::env::var_os("CSSWITCH_TEST_PORT_OBSERVATION_RECEIPT").map(PathBuf::from);
+                let replacement_result = (|| -> std::io::Result<()> {
+                    let replacement = replacement.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "replacement receipt path is missing",
+                        )
+                    })?;
+                    let target = target.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "managed receipt path is missing",
+                        )
+                    })?;
+                    let bytes = fs::read(replacement)?;
+                    let temp = sequence_dir.join("concurrent-receipt.tmp");
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(&temp)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                    fs::rename(&temp, &target)?;
+                    File::open(
+                        target
+                            .parent()
+                            .ok_or_else(|| std::io::Error::other("receipt parent is missing"))?,
+                    )?
+                    .sync_all()?;
+                    fs::write(&replaced_marker, b"replaced")
+                })();
+                if replacement_result.is_err() {
+                    let _ = fs::write(sequence_dir.join("receipt-replacement-failed"), b"failed");
+                }
+            }
+            let _ = fs::write(sequence_dir.join("observed-true"), b"true");
+            return true;
+        }
+    }
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
 }
@@ -1416,6 +1468,528 @@ fn unique_listener_pid(port: u16) -> Option<u32> {
         return None;
     }
     parse_unique_listener_pid(&String::from_utf8(listener.stdout).ok()?)
+}
+
+fn managed_launch_path() -> PathBuf {
+    config::default_dir().join(MANAGED_LAUNCH_FILE)
+}
+
+fn process_start_identity(pid: u32) -> Option<String> {
+    if pid <= 1 {
+        return None;
+    }
+    #[cfg(test)]
+    if std::env::var_os("CSSWITCH_TEST_PROCESS_START_DRIFT_PID")
+        .and_then(|value| value.to_string_lossy().parse::<u32>().ok())
+        == Some(pid)
+        && std::env::var_os("CSSWITCH_TEST_PROCESS_START_DRIFT_MARKER")
+            .is_some_and(|path| PathBuf::from(path).is_file())
+    {
+        return Some("Mon Jan  1 00:00:00 2001".into());
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .env_clear()
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > 256 || !output.stderr.is_empty() {
+        return None;
+    }
+    let identity = String::from_utf8(output.stdout).ok()?;
+    let identity = identity.trim();
+    if identity.is_empty()
+        || identity.len() > 128
+        || !identity.is_ascii()
+        || identity.lines().count() != 1
+    {
+        return None;
+    }
+    Some(identity.to_string())
+}
+
+fn data_dir_identity() -> Option<(PathBuf, u64, u64)> {
+    let data_dir = sandbox_data_dir().canonicalize().ok()?;
+    let metadata = data_dir.symlink_metadata().ok()?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return None;
+    }
+    Some((data_dir, metadata.dev(), metadata.ino()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_process_start_identity_for_pid(pid: u32) -> Option<String> {
+    process_start_identity(pid)
+}
+
+#[cfg(test)]
+pub(crate) fn test_unique_listener_pid(port: u16) -> Option<u32> {
+    unique_listener_pid(port)
+}
+
+fn managed_launch_record_for(
+    port: u16,
+    listener_pid: u32,
+    runtime: &ScienceRuntimeIdentity,
+) -> Option<ScienceManagedLaunchRecord> {
+    if !runtime.is_current() {
+        return None;
+    }
+    let runtime_path = runtime.path.canonicalize().ok()?;
+    if runtime_path != runtime.path {
+        return None;
+    }
+    let process_start = process_start_identity(listener_pid)?;
+    let (data_dir, data_dir_device, data_dir_inode) = data_dir_identity()?;
+    let fingerprint = &runtime.fingerprint;
+    Some(ScienceManagedLaunchRecord {
+        schema_version: 1,
+        launch_id: config::new_id(),
+        port,
+        listener_pid,
+        process_start,
+        runtime_path,
+        runtime_device: fingerprint.device,
+        runtime_inode: fingerprint.inode,
+        runtime_size: fingerprint.size,
+        runtime_modified_seconds: fingerprint.modified_seconds,
+        runtime_modified_nanoseconds: fingerprint.modified_nanoseconds,
+        runtime_mode: fingerprint.mode,
+        runtime_sha256: fingerprint_sha256_hex(fingerprint),
+        data_dir,
+        data_dir_device,
+        data_dir_inode,
+    })
+}
+
+fn record_matches_runtime(
+    record: &ScienceManagedLaunchRecord,
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+) -> bool {
+    let Some((data_dir, data_dir_device, data_dir_inode)) = data_dir_identity() else {
+        return false;
+    };
+    let fingerprint = &runtime.fingerprint;
+    record.schema_version == 1
+        && record.launch_id.len() >= 16
+        && record.launch_id.len() <= 128
+        && record
+            .launch_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && record.port == port
+        && record.listener_pid > 1
+        && record.runtime_path == runtime.path
+        && record.runtime_device == fingerprint.device
+        && record.runtime_inode == fingerprint.inode
+        && record.runtime_size == fingerprint.size
+        && record.runtime_modified_seconds == fingerprint.modified_seconds
+        && record.runtime_modified_nanoseconds == fingerprint.modified_nanoseconds
+        && record.runtime_mode == fingerprint.mode
+        && record.runtime_sha256 == fingerprint_sha256_hex(fingerprint)
+        && record.data_dir == data_dir
+        && record.data_dir_device == data_dir_device
+        && record.data_dir_inode == data_dir_inode
+}
+
+fn managed_launch_file_identity(metadata: &fs::Metadata) -> ManagedLaunchFileIdentity {
+    ManagedLaunchFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        mode: metadata.permissions().mode(),
+        uid: metadata.uid(),
+    }
+}
+
+fn private_managed_launch_file(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o077 == 0
+        && metadata.len() > 0
+        && metadata.len() <= MAX_MANAGED_LAUNCH_BYTES
+}
+
+fn read_managed_launch_snapshot_at(
+    path: &Path,
+) -> Option<(ScienceManagedLaunchRecord, ManagedLaunchFileIdentity)> {
+    let parent = path.parent()?;
+    let parent_metadata = parent.symlink_metadata().ok()?;
+    if !parent_metadata.file_type().is_dir()
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return None;
+    }
+    let metadata = path.symlink_metadata().ok()?;
+    if !private_managed_launch_file(&metadata) {
+        return None;
+    }
+    let expected_file = managed_launch_file_identity(&metadata);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !private_managed_launch_file(&after) || managed_launch_file_identity(&after) != expected_file
+    {
+        return None;
+    }
+    #[cfg(test)]
+    if let Some(barrier_dir) = std::env::var_os("CSSWITCH_TEST_MANAGED_LAUNCH_READ_BARRIER") {
+        let barrier_dir = PathBuf::from(barrier_dir);
+        fs::write(barrier_dir.join("ready"), b"ready").ok()?;
+        let mut released = false;
+        for _ in 0..500 {
+            if barrier_dir.join("continue").is_file() {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !released {
+            return None;
+        }
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(expected_file.size.min(MAX_MANAGED_LAUNCH_BYTES + 1)).ok()?,
+    );
+    (&mut file)
+        .take(MAX_MANAGED_LAUNCH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    #[cfg(test)]
+    MANAGED_LAUNCH_LAST_READ_BYTES.store(bytes.len() as u64, Ordering::SeqCst);
+    let final_metadata = file.metadata().ok()?;
+    if !private_managed_launch_file(&final_metadata)
+        || managed_launch_file_identity(&final_metadata) != expected_file
+        || bytes.len() as u64 != expected_file.size
+        || bytes.len() as u64 > MAX_MANAGED_LAUNCH_BYTES
+    {
+        return None;
+    }
+    let record = serde_json::from_slice(&bytes).ok()?;
+    Some((record, expected_file))
+}
+
+fn read_managed_launch_snapshot() -> Option<(ScienceManagedLaunchRecord, ManagedLaunchFileIdentity)>
+{
+    read_managed_launch_snapshot_at(&managed_launch_path())
+}
+
+#[cfg(test)]
+fn read_managed_launch_record() -> Option<ScienceManagedLaunchRecord> {
+    read_managed_launch_snapshot().map(|(record, _)| record)
+}
+
+fn write_managed_launch_record(record: &ScienceManagedLaunchRecord) -> Result<(), String> {
+    let path = managed_launch_path();
+    let parent = path
+        .parent()
+        .ok_or("Science managed launch 记录路径无父目录")?;
+    let parent_metadata = parent
+        .symlink_metadata()
+        .map_err(|_| "Science managed launch 记录目录不可用")?;
+    if !parent_metadata.file_type().is_dir()
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err("Science managed launch 记录目录不安全".into());
+    }
+    if let Ok(metadata) = path.symlink_metadata() {
+        if !metadata.file_type().is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err("Science managed launch 记录不是安全私有普通文件".into());
+        }
+    }
+    let bytes = serde_json::to_vec(record).map_err(|_| "Science managed launch 记录无法序列化")?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_MANAGED_LAUNCH_BYTES {
+        return Err("Science managed launch 记录大小非法".into());
+    }
+    let temp = parent.join(format!(".{MANAGED_LAUNCH_FILE}.{}.tmp", record.launch_id));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temp)
+            .map_err(|_| "无法创建 Science managed launch 临时记录")?;
+        file.write_all(&bytes)
+            .map_err(|_| "无法写入 Science managed launch 临时记录")?;
+        file.sync_all()
+            .map_err(|_| "无法持久化 Science managed launch 临时记录")?;
+        fs::rename(&temp, &path).map_err(|_| "无法提交 Science managed launch 记录")?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "无法持久化 Science managed launch 记录目录")?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    write_result
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn record_managed_science_launch(
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+) -> Result<ScienceManagedLaunchToken, ScienceManagedLaunchCommitError> {
+    let listener_pid =
+        listener_runtime_pid(port, runtime).ok_or_else(|| ScienceManagedLaunchCommitError {
+            message: "Science listener 身份在 managed launch 提交前无法确认".into(),
+            token: None,
+        })?;
+    let record = managed_launch_record_for(port, listener_pid, runtime).ok_or_else(|| {
+        ScienceManagedLaunchCommitError {
+            message: "Science managed launch 身份无法建立".into(),
+            token: None,
+        }
+    })?;
+    let uncommitted_token = ScienceManagedLaunchToken {
+        record: record.clone(),
+        receipt_file: None,
+    };
+    #[cfg(test)]
+    {
+        let persistent = std::env::var_os("CSSWITCH_TEST_MANAGED_LAUNCH_COMMIT_FAILURE").is_some();
+        let once = std::env::var_os("CSSWITCH_TEST_MANAGED_LAUNCH_COMMIT_FAILURE_ONCE").is_some()
+            && !MANAGED_LAUNCH_COMMIT_FAILURE_ONCE_FIRED
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if persistent || once {
+            if let Some(observation) =
+                std::env::var_os("CSSWITCH_TEST_MANAGED_LAUNCH_FAILURE_PID_LOG")
+            {
+                let _ = std::fs::write(observation, format!("{listener_pid}\n"));
+            }
+            return Err(ScienceManagedLaunchCommitError {
+                message: "test-only managed launch commit failure after listener identity".into(),
+                token: Some(uncommitted_token),
+            });
+        }
+    }
+    if unique_listener_pid(port) != Some(listener_pid)
+        || process_start_identity(listener_pid).as_deref() != Some(record.process_start.as_str())
+    {
+        return Err(ScienceManagedLaunchCommitError {
+            message: "Science listener 在 managed launch 提交前发生变化".into(),
+            token: Some(uncommitted_token),
+        });
+    }
+    if let Err(message) = write_managed_launch_record(&record) {
+        return Err(ScienceManagedLaunchCommitError {
+            message,
+            token: Some(uncommitted_token),
+        });
+    }
+    managed_launch_token(port, runtime).ok_or_else(|| ScienceManagedLaunchCommitError {
+        message: "Science managed launch 记录提交后回读不一致".into(),
+        token: Some(uncommitted_token),
+    })
+}
+
+/// Capture an exact, receipt-free stop token for a newly spawned Science
+/// listener. This is only valid for the narrow post-spawn/pre-receipt window:
+/// callers must either commit the managed receipt or use this token to stop
+/// the same PID/process-start/runtime identity before returning.
+pub(crate) fn uncommitted_managed_science_launch_token(
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+) -> Option<ScienceManagedLaunchToken> {
+    let listener_pid = listener_runtime_pid(port, runtime)?;
+    let record = managed_launch_record_for(port, listener_pid, runtime)?;
+    let token = ScienceManagedLaunchToken {
+        record,
+        receipt_file: None,
+    };
+    managed_launch_token_is_current(&token, runtime).then_some(token)
+}
+
+fn managed_launch_token(
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+) -> Option<ScienceManagedLaunchToken> {
+    if !runtime.is_current() {
+        return None;
+    }
+    let (record, receipt_file) = read_managed_launch_snapshot()?;
+    if !record_matches_runtime(&record, port, runtime) {
+        return None;
+    }
+    let pid_before = unique_listener_pid(port);
+    if pid_before != Some(record.listener_pid)
+        || process_start_identity(record.listener_pid).as_deref()
+            != Some(record.process_start.as_str())
+        || listener_runtime_pid(port, runtime) != Some(record.listener_pid)
+    {
+        return None;
+    }
+    if unique_listener_pid(port) != Some(record.listener_pid)
+        || process_start_identity(record.listener_pid).as_deref()
+            != Some(record.process_start.as_str())
+    {
+        return None;
+    }
+    Some(ScienceManagedLaunchToken {
+        record,
+        receipt_file: Some(receipt_file),
+    })
+}
+
+pub(crate) fn managed_launch_token_for_runtime(
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+) -> Option<ScienceManagedLaunchToken> {
+    managed_launch_token(port, runtime)
+}
+
+pub(crate) fn managed_launch_token_process_is_alive(token: &ScienceManagedLaunchToken) -> bool {
+    process_start_identity(token.record.listener_pid).as_deref()
+        == Some(token.record.process_start.as_str())
+}
+
+fn managed_launch_identity_matches(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
+    managed_launch_token(port, runtime).is_some()
+}
+
+fn managed_launch_token_is_current(
+    token: &ScienceManagedLaunchToken,
+    runtime: &ScienceRuntimeIdentity,
+) -> bool {
+    let record = &token.record;
+    if !runtime.is_current()
+        || !record_matches_runtime(record, record.port, runtime)
+        || unique_listener_pid(record.port) != Some(record.listener_pid)
+        || process_start_identity(record.listener_pid).as_deref()
+            != Some(record.process_start.as_str())
+        || listener_runtime_pid(record.port, runtime) != Some(record.listener_pid)
+    {
+        return false;
+    }
+    if let Some(expected_file) = token.receipt_file.as_ref() {
+        let Some((current_record, current_file)) = read_managed_launch_snapshot() else {
+            return false;
+        };
+        if current_record != *record || current_file != *expected_file {
+            return false;
+        }
+    }
+    unique_listener_pid(record.port) == Some(record.listener_pid)
+        && process_start_identity(record.listener_pid).as_deref()
+            == Some(record.process_start.as_str())
+}
+
+pub(crate) fn managed_launch_token_is_current_for_runtime(
+    token: &ScienceManagedLaunchToken,
+    runtime: &ScienceRuntimeIdentity,
+) -> bool {
+    managed_launch_token_is_current(token, runtime)
+}
+
+fn restore_unmatched_managed_launch_tombstone(tombstone: &Path, path: &Path) -> Result<(), String> {
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(test)]
+            if let Some(barrier_dir) =
+                std::env::var_os("CSSWITCH_TEST_TOMBSTONE_RESTORE_BARRIER").map(PathBuf::from)
+            {
+                fs::write(barrier_dir.join("ready"), b"ready")
+                    .map_err(|_| "Science managed launch 测试恢复屏障不可用".to_string())?;
+                let mut released = false;
+                for _ in 0..500 {
+                    if barrier_dir.join("continue").is_file() {
+                        released = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !released {
+                    return Err("Science managed launch 测试恢复屏障超时".into());
+                }
+            }
+            match fs::hard_link(tombstone, path) {
+                Ok(()) => {
+                    fs::remove_file(tombstone)
+                        .map_err(|_| "Science managed launch 记录已恢复但 tombstone 无法清理")?;
+                    let parent = path.parent().ok_or("Science managed launch 恢复路径无父目录")?;
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|_| "Science managed launch 恢复目录无法持久化")?;
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+                    "Science managed launch 原子 no-clobber 恢复冲突；新记录与旧 tombstone 均已保留"
+                        .into(),
+                ),
+                Err(_) => Err("Science managed launch 记录变化且无法原位恢复".into()),
+            }
+        }
+        Ok(_) => {
+            Err("Science managed launch 记录变化且新记录已出现；旧记录保留在 tombstone".into())
+        }
+        Err(_) => Err("Science managed launch 记录变化且无法确认恢复目标".into()),
+    }
+}
+
+fn clear_managed_launch_identity(
+    token: &ScienceManagedLaunchToken,
+    runtime: &ScienceRuntimeIdentity,
+) -> Result<(), String> {
+    let path = managed_launch_path();
+    let Some((record, receipt_file)) = read_managed_launch_snapshot() else {
+        return match path.symlink_metadata() {
+            Ok(_) => Err("Science managed launch 记录无效，未删除".into()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && token.receipt_file.is_none() =>
+            {
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err("Science managed launch 已提交记录在停止清理前消失".into())
+            }
+            Err(_) => Err("无法确认 Science managed launch 记录".into()),
+        };
+    };
+    if record != token.record
+        || token
+            .receipt_file
+            .as_ref()
+            .is_some_and(|expected| expected != &receipt_file)
+        || !record_matches_runtime(&record, token.record.port, runtime)
+    {
+        return Err("Science managed launch 记录与停止目标不匹配，未删除".into());
+    }
+    let parent = path.parent().ok_or("Science managed launch 路径无父目录")?;
+    let tombstone = parent.join(format!(
+        ".{MANAGED_LAUNCH_FILE}.{}.stopped",
+        token.record.launch_id
+    ));
+    if tombstone.symlink_metadata().is_ok() {
+        return Err("Science managed launch 清理 tombstone 已存在".into());
+    }
+    fs::rename(&path, &tombstone).map_err(|_| "无法冻结待清理 Science managed launch 记录")?;
+    let moved = read_managed_launch_snapshot_at(&tombstone);
+    if moved.as_ref() != Some(&(record, receipt_file)) {
+        let restore = restore_unmatched_managed_launch_tombstone(&tombstone, &path);
+        return Err(match restore {
+            Ok(()) => "Science managed launch 记录在清理前变化；已恢复且拒绝删除".into(),
+            Err(error) => error,
+        });
+    }
+    fs::remove_file(&tombstone).map_err(|_| "无法清理 Science managed launch 记录")?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "无法持久化 Science managed launch 清理")?;
+    Ok(())
 }
 
 fn process_text_paths(pid: u32) -> Option<Vec<PathBuf>> {
@@ -1544,8 +2118,10 @@ pub(crate) fn probe_known_runtime(
     let status = runtime_status(runtime);
     let health_ready = proc::http_health(port, None, 400);
     let port_accepts_tcp = health_ready || loopback_port_accepts_tcp(port);
-    let listener_matches_runtime =
-        status == Some(true) && health_ready && listener_uses_runtime(port, runtime);
+    let listener_matches_runtime = status == Some(true)
+        && health_ready
+        && listener_uses_runtime(port, runtime)
+        && managed_launch_identity_matches(port, runtime);
     classify_known_runtime_state(
         status,
         health_ready,
@@ -1572,7 +2148,11 @@ pub(crate) fn probe_sandbox_runtime_cached(
     let mut saw_running_unconfirmed = false;
     for runtime in candidates {
         match runtime_status(&runtime) {
-            Some(true) if health_ready && listener_uses_runtime(port, &runtime) => {
+            Some(true)
+                if health_ready
+                    && listener_uses_runtime(port, &runtime)
+                    && managed_launch_identity_matches(port, &runtime) =>
+            {
                 return Ok((SandboxScienceState::RunningHealthy, Some(runtime)))
             }
             Some(true) => saw_running_unconfirmed = true,
@@ -1634,7 +2214,32 @@ pub(crate) fn stop_sandbox<R: Runtime>(
     sandbox_url: &mut Option<String>,
     runtime: Option<&ScienceRuntimeIdentity>,
 ) -> Result<(), String> {
+    stop_sandbox_with_launch_token(app, sandbox, sandbox_url, runtime, None)
+}
+
+pub(crate) fn stop_sandbox_with_launch_token<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    sandbox: &mut Option<Child>,
+    sandbox_url: &mut Option<String>,
+    runtime: Option<&ScienceRuntimeIdentity>,
+    launch_token: Option<&ScienceManagedLaunchToken>,
+) -> Result<(), String> {
     if !sandbox_data_dir().exists() {
+        let sandbox_port = config::load_from(&config::default_dir())
+            .map_err(|error| format!("读取 Science 端口配置失败：{error}"))?
+            .sandbox_port;
+        let first_port_observation = loopback_port_accepts_tcp(sandbox_port);
+        let second_port_observation = if first_port_observation {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+            loopback_port_accepts_tcp(sandbox_port)
+        };
+        if second_port_observation {
+            return Err(
+                "Science data-dir 已消失，但配置端口仍有监听；未发送信号且未确认停止。".into(),
+            );
+        }
         kill_child(sandbox);
         *sandbox_url = None;
         return Ok(());
@@ -1662,7 +2267,16 @@ pub(crate) fn stop_sandbox<R: Runtime>(
     let sandbox_port = config::load_from(&config::default_dir())
         .map_err(|error| format!("读取 Science 端口配置失败：{error}"))?
         .sandbox_port;
-    let listener_before_stop = listener_runtime_pid(sandbox_port, runtime);
+    let stop_token = match launch_token {
+        Some(token) => token.clone(),
+        None => managed_launch_token(sandbox_port, runtime)
+            .ok_or("Science managed launch 身份无法确认；已拒绝调用 stop 或发送信号")?,
+    };
+    if stop_token.record.port != sandbox_port
+        || !managed_launch_token_is_current(&stop_token, runtime)
+    {
+        return Err("Science managed launch 身份在停止前发生变化；未调用 stop 或发送信号".into());
+    }
     let mut err = None;
     match asset_root(app) {
         Some(root) => {
@@ -1693,85 +2307,85 @@ pub(crate) fn stop_sandbox<R: Runtime>(
             );
         }
     }
-    if loopback_port_accepts_tcp(sandbox_port) {
-        match exact_stop_fallback_pid(
-            listener_before_stop,
-            listener_runtime_pid(sandbox_port, runtime),
-        ) {
-            Some(pid) => {
-                // Some upstream Science builds either return success without
-                // terminating or reject a CSSwitch legacy flat snapshot name.
-                // The user requested stop, so signal only the exact PID whose
-                // listener and canonical executable were proved before and
-                // after the CLI attempt.
-                // SAFETY: kill does not dereference pointers. PID > 1 and exact
-                // listener identity were checked immediately above.
-                if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
-                    err = Some("Science stop 后精确 daemon 无法接收 TERM。".into());
-                } else {
-                    for _ in 0..50 {
+    if err.is_none() && loopback_port_accepts_tcp(sandbox_port) {
+        let pid = stop_token.record.listener_pid;
+        if managed_launch_token_is_current(&stop_token, runtime) {
+            // Some upstream Science builds return success and remove their
+            // lockfile without terminating the daemon. The user requested
+            // stop, so signal only the exact launch token whose listener,
+            // process start, receipt, and canonical executable were proved
+            // both before and after CLI.
+            // SAFETY: kill does not dereference pointers. PID > 1 and exact
+            // listener identity were checked immediately above.
+            if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+                err = Some("Science stop 返回成功但精确 daemon 无法接收 TERM。".into());
+            } else {
+                for _ in 0..50 {
+                    if !loopback_port_accepts_tcp(sandbox_port) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if managed_launch_token_is_current(&stop_token, runtime) {
+                    // SAFETY: the same launch token, including process-start
+                    // identity, is revalidated after the TERM wait.
+                    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    for _ in 0..20 {
                         if !loopback_port_accepts_tcp(sandbox_port) {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(100));
                     }
-                    if listener_runtime_pid(sandbox_port, runtime) == Some(pid) {
-                        // SAFETY: the same exact listener/runtime identity is
-                        // revalidated after the TERM wait.
-                        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                        for _ in 0..20 {
-                            if !loopback_port_accepts_tcp(sandbox_port) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-                    }
-                    if loopback_port_accepts_tcp(sandbox_port) {
-                        err = Some(
-                            "Science stop 后端口仍被占用；已拒绝把未知监听者当作停止成功。".into(),
-                        );
-                    } else {
-                        err = None;
-                    }
+                }
+                if loopback_port_accepts_tcp(sandbox_port) {
+                    err = Some(
+                        "Science stop 返回成功，但端口仍被占用；已拒绝把未知监听者当作停止成功。"
+                            .into(),
+                    );
                 }
             }
-            _ => {
-                if err.is_none() {
-                    err = Some("Science stop 后监听身份与启动记录不一致；未发送信号。".into());
-                }
-            }
+        } else {
+            err = Some(
+                "Science stop 返回成功，但停止后的监听身份与启动记录不一致；未发送信号。".into(),
+            );
         }
     }
     kill_child(sandbox);
     *sandbox_url = None;
+    if err.is_none() {
+        if loopback_port_accepts_tcp(sandbox_port) {
+            err = Some(
+                "Science stop 后配置端口重新出现监听；未确认停止且未清理 managed launch 记录。"
+                    .into(),
+            );
+        } else if let Err(error) = clear_managed_launch_identity(&stop_token, runtime) {
+            err = Some(error);
+        }
+    }
     match err {
         Some(e) => Err(e),
         None => Ok(()),
     }
 }
 
-fn exact_stop_fallback_pid(before: Option<u32>, after: Option<u32>) -> Option<u32> {
-    match (before, after) {
-        (Some(before), Some(after)) if before > 1 && before == after => Some(before),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::Write;
-    use std::os::unix::fs::symlink;
-    use std::os::unix::fs::PermissionsExt;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::ExitStatusExt;
-    use std::process::{ExitStatus, Output};
+    use std::process::{Command, ExitStatus, Output};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use super::{
-        classify_known_runtime_state, classify_sandbox_state, exact_stop_fallback_pid,
-        fingerprint_sha256_hex, first_http_url, isolate_sandbox_browser_origin,
-        official_science_identity_from_codesign_output, official_updated_science_bin_for_home,
+        classify_known_runtime_state, classify_sandbox_state, fingerprint_sha256_hex,
+        first_http_url, isolate_sandbox_browser_origin, managed_launch_path,
+        official_updated_embedded_identity_metadata_matches, official_updated_science_bin_for_home,
         official_updated_snapshot_for_home, official_updated_snapshot_from_process_paths,
-        parse_official_science_identity, parse_unique_listener_pid, runtime_identity_is_current,
+        parse_unique_listener_pid, probe_sandbox_runtime_cached, read_managed_launch_record,
+        restore_unmatched_managed_launch_tombstone, runtime_identity_is_current,
         runtime_status_value, safe_science_version_with_timeout, sandbox_home,
         sandbox_running_ours, sandbox_url, science_executable_fingerprint,
         science_runtime_preflight_for_paths, science_runtime_preflight_for_paths_cached,
@@ -1779,12 +2393,335 @@ mod tests {
         secure_runtime_snapshot_root, select_science_runtime_for_paths,
         select_science_runtime_for_paths_cached, select_science_runtime_for_paths_with_updated,
         settings_change_needs_teardown, stop_runtime_from_probe, trusted_science_status,
-        validate_official_science_identity, validate_official_updated_local_identity,
-        OfficialScienceIdentityError, SandboxScienceState, ScienceRuntimeIdentity,
-        ScienceRuntimeSource, ScienceVersionCache, CACHED_ONCE_CHOICE,
-        OFFICIAL_SCIENCE_IDENTIFIERS, OFFICIAL_SCIENCE_TEAM_ID,
+        SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource, ScienceVersionCache,
+        CACHED_ONCE_CHOICE, MANAGED_LAUNCH_LAST_READ_BYTES, MAX_MANAGED_LAUNCH_BYTES,
         OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE, OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX,
     };
+
+    #[test]
+    fn official_updater_identity_parser_accepts_only_known_exact_variants() {
+        let standalone = "Identifier=com.anthropic.operon\nTeamIdentifier=Q6L2SF6YDW\n";
+        assert!(official_updated_embedded_identity_metadata_matches(
+            standalone
+        ));
+
+        let dmg_seed = "Identifier=com.anthropic.operon.cli\nTeamIdentifier=Q6L2SF6YDW\n";
+        assert!(official_updated_embedded_identity_metadata_matches(
+            dmg_seed
+        ));
+        assert!(!official_updated_embedded_identity_metadata_matches(
+            "Identifier=com.anthropic.operon.other\nTeamIdentifier=Q6L2SF6YDW\n",
+        ));
+        assert!(!official_updated_embedded_identity_metadata_matches(
+            "Identifier=com.anthropic.operon\nTeamIdentifier=WRONG\n",
+        ));
+        assert!(!official_updated_embedded_identity_metadata_matches(
+            "prefix-Identifier=com.anthropic.operon\nTeamIdentifier=Q6L2SF6YDW\n",
+        ));
+        assert!(!official_updated_embedded_identity_metadata_matches(
+            "Identifier=com.anthropic.operon\nTeamIdentifier=Q6L2SF6YDW-suffix\n",
+        ));
+    }
+
+    #[test]
+    fn managed_launch_tombstone_restore_uses_no_clobber_primitive() {
+        let source = include_str!("science.rs");
+        let start = source
+            .find("fn restore_unmatched_managed_launch_tombstone")
+            .expect("managed launch tombstone restore implementation must exist");
+        let remainder = &source[start..];
+        let end = remainder
+            .find("\nfn clear_managed_launch_identity")
+            .expect("managed launch tombstone restore implementation must remain bounded");
+        let implementation = &remainder[..end];
+
+        assert!(
+            implementation.contains("fs::hard_link(tombstone, path)"),
+            "managed launch tombstone restore must use hard_link as its final atomic no-clobber destination commit"
+        );
+        assert!(
+            !implementation.contains("rename("),
+            "managed launch tombstone restore must not retain a check-then-overwriting-rename path"
+        );
+    }
+
+    #[test]
+    fn managed_launch_tombstone_restore_is_atomic_no_clobber(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_temp_dir("science-managed-launch-restore-race")?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        let tombstone = root.join("science-managed-launch.old.stopped");
+        let receipt = root.join("science-managed-launch.v1.json");
+        let old_receipt = b"old-private-managed-launch".to_vec();
+        let new_receipt = b"new-concurrent-managed-launch".to_vec();
+        fs::write(&tombstone, &old_receipt)?;
+        fs::set_permissions(&tombstone, fs::Permissions::from_mode(0o600))?;
+        let barrier = root.join("restore-barrier");
+        fs::create_dir(&barrier)?;
+        std::env::set_var("CSSWITCH_TEST_TOMBSTONE_RESTORE_BARRIER", &barrier);
+
+        let receipt_for_writer = receipt.clone();
+        let barrier_for_writer = barrier.clone();
+        let new_receipt_for_writer = new_receipt.clone();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            for _ in 0..500 {
+                if barrier_for_writer.join("ready").is_file() {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&receipt_for_writer)?;
+                    file.write_all(&new_receipt_for_writer)?;
+                    file.sync_all()?;
+                    fs::write(barrier_for_writer.join("continue"), b"continue")?;
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tombstone restore never reached the deterministic race barrier",
+            ))
+        });
+
+        let restore = restore_unmatched_managed_launch_tombstone(&tombstone, &receipt);
+        writer
+            .join()
+            .map_err(|_| "managed launch race writer panicked")??;
+        std::env::remove_var("CSSWITCH_TEST_TOMBSTONE_RESTORE_BARRIER");
+        let receipt_after = fs::read(&receipt)?;
+        let tombstone_after = fs::read(&tombstone).ok();
+        fs::remove_dir_all(&root)?;
+
+        assert_eq!(
+            restore.as_ref().map_err(String::as_str),
+            Err(
+                "Science managed launch 原子 no-clobber 恢复冲突；新记录与旧 tombstone 均已保留"
+            ),
+            "atomic no-clobber restore must report the conflict from its final no-replace commit primitive, not from another check before an overwriting rename"
+        );
+        assert_eq!(
+            receipt_after, new_receipt,
+            "atomic no-clobber restore must preserve the concurrently committed receipt byte-for-byte"
+        );
+        assert_eq!(
+            tombstone_after.as_deref(),
+            Some(old_receipt.as_slice()),
+            "atomic no-clobber restore must retain the old tombstone on conflict"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_launch_receipt_growth_read_is_hard_bounded() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const CHILD_ENV: &str = "CSSWITCH_TEST_MANAGED_LAUNCH_GROWTH_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let root = unique_temp_dir("science-managed-launch-growth")?;
+            let home = root.join("home");
+            fs::create_dir_all(&home)?;
+            let output = Command::new(std::env::current_exe()?)
+                .arg("--exact")
+                .arg("runtime::science::tests::managed_launch_receipt_growth_read_is_hard_bounded")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("HOME", &home)
+                .output()?;
+            let _ = fs::remove_dir_all(&root);
+            assert!(
+                output.status.success(),
+                "isolated bounded receipt oracle failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        let config_dir = crate::config::default_dir();
+        fs::create_dir_all(&config_dir)?;
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))?;
+        let receipt = managed_launch_path();
+        fs::write(&receipt, b"{}")?;
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600))?;
+        let barrier = config_dir.join("managed-launch-read-barrier");
+        fs::create_dir_all(&barrier)?;
+        std::env::set_var("CSSWITCH_TEST_MANAGED_LAUNCH_READ_BARRIER", &barrier);
+        MANAGED_LAUNCH_LAST_READ_BYTES.store(0, Ordering::SeqCst);
+
+        let receipt_for_writer = receipt.clone();
+        let barrier_for_writer = barrier.clone();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            for _ in 0..500 {
+                if barrier_for_writer.join("ready").is_file() {
+                    let mut file = OpenOptions::new().append(true).open(&receipt_for_writer)?;
+                    file.write_all(&vec![b' '; 1024 * 1024])?;
+                    file.sync_all()?;
+                    fs::write(barrier_for_writer.join("continue"), b"continue")?;
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "managed launch reader never reached the deterministic barrier",
+            ))
+        });
+        let _ = read_managed_launch_record();
+        writer
+            .join()
+            .map_err(|_| "managed launch writer panicked")??;
+        std::env::remove_var("CSSWITCH_TEST_MANAGED_LAUNCH_READ_BARRIER");
+        let observed = MANAGED_LAUNCH_LAST_READ_BYTES.load(Ordering::SeqCst);
+        assert!(
+            observed <= MAX_MANAGED_LAUNCH_BYTES + 1,
+            "managed launch reader consumed {observed} bytes after concurrent growth; hard cap is {}",
+            MAX_MANAGED_LAUNCH_BYTES + 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_restart_rejects_listener_without_managed_launch_identity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_ENV: &str = "CSSWITCH_TEST_SCIENCE_REATTACH_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let root = unique_temp_dir("science-unmanaged-reattach")?;
+            let home = root.join("home");
+            fs::create_dir_all(&home)?;
+            let output = Command::new(std::env::current_exe()?)
+                .arg("--exact")
+                .arg("runtime::science::tests::fresh_restart_rejects_listener_without_managed_launch_identity")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("HOME", &home)
+                .output()?;
+            let _ = fs::remove_dir_all(&root);
+            assert!(
+                output.status.success(),
+                "isolated reattach oracle failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or("isolated HOME is required")?;
+        let bin = home.join("bin").join("claude-science");
+        let data_dir = sandbox_home().join(".claude-science");
+        let state_dir = data_dir.join("fake-science");
+        fs::create_dir_all(bin.parent().ok_or("fake bin parent is required")?)?;
+        fs::create_dir_all(&state_dir)?;
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-}"
+if [ "$#" -gt 0 ]; then shift; fi
+if [ "$cmd" = "--version" ]; then
+  echo "claude-science unmanaged-reattach-test"
+  exit 0
+fi
+data_dir=""
+port=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --data-dir) data_dir="$2"; shift 2 ;;
+    --port) port="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+state="$data_dir/fake-science"
+mkdir -p "$state"
+case "$cmd" in
+  serve)
+    python3 - "$port" "$state/pid" >/dev/null 2>&1 <<'PY' &
+import http.server
+import os
+import socketserver
+import sys
+port = int(sys.argv[1])
+pidfile = sys.argv[2]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        if self.path.startswith("/health"):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+socketserver.TCPServer.allow_reuse_address = True
+with open(pidfile, "w", encoding="utf-8") as f:
+    f.write(str(os.getpid()))
+with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+    httpd.serve_forever()
+PY
+    ;;
+  status)
+    pid="$(cat "$state/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo '{"running":true}'
+    else
+      echo '{"running":false}'
+      exit 1
+    fi
+    ;;
+  stop)
+    pid="$(cat "$state/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+    rm -f "$state/pid"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        )?;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+        let bin = bin.canonicalize()?;
+        std::env::set_var("SCIENCE_BIN", &bin);
+        std::env::set_var("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let launch = Command::new(&bin)
+            .arg("serve")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--port")
+            .arg(port.to_string())
+            .status()?;
+        assert!(launch.success());
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let observed = probe_sandbox_runtime_cached(port, &ScienceVersionCache::default())?;
+        let listener_still_alive = TcpStream::connect(("127.0.0.1", port)).is_ok();
+        let stopped = Command::new(&bin)
+            .arg("stop")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .status()?;
+        assert!(stopped.success());
+
+        assert_eq!(
+            observed,
+            (SandboxScienceState::Unknown, None),
+            "a fresh Desktop state must not adopt a listener that has no persisted managed-launch identity"
+        );
+        assert!(
+            listener_still_alive,
+            "rejected adoption must not signal the unproven listener"
+        );
+        Ok(())
+    }
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
     #[test]
@@ -1805,102 +2742,6 @@ mod tests {
             settings_change_needs_teardown(18991, 19000, 8990, 9000),
             "都变 → 拆"
         );
-    }
-
-    #[test]
-    fn official_science_identity_accepts_known_app_and_updater_identifiers() {
-        for identifier in OFFICIAL_SCIENCE_IDENTIFIERS {
-            let details =
-                format!("Identifier={identifier}\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n");
-            let identity = parse_official_science_identity(&details).unwrap();
-            assert_eq!(identity.identifier, *identifier);
-            assert_eq!(identity.team_identifier, OFFICIAL_SCIENCE_TEAM_ID);
-            assert_eq!(validate_official_science_identity(&identity), Ok(()));
-        }
-    }
-
-    #[test]
-    fn official_science_identity_rejects_unknown_identifier_and_team() {
-        let unknown_identifier = parse_official_science_identity(&format!(
-            "Identifier=com.anthropic.operon.unknown\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
-        ))
-        .unwrap();
-        assert_eq!(
-            validate_official_science_identity(&unknown_identifier),
-            Err(OfficialScienceIdentityError::UnsupportedIdentifier)
-        );
-
-        let wrong_team = parse_official_science_identity(
-            "Identifier=com.anthropic.operon\nTeamIdentifier=WRONGTEAM1\n",
-        )
-        .unwrap();
-        assert_eq!(
-            validate_official_science_identity(&wrong_team),
-            Err(OfficialScienceIdentityError::UnexpectedTeamIdentifier)
-        );
-    }
-
-    #[test]
-    fn official_science_identity_requires_unique_nonempty_fields() {
-        assert_eq!(
-            parse_official_science_identity(&format!(
-                "TeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
-            )),
-            Err(OfficialScienceIdentityError::MissingIdentifier)
-        );
-        assert_eq!(
-            parse_official_science_identity(&format!(
-                "Identifier=\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
-            )),
-            Err(OfficialScienceIdentityError::MissingIdentifier)
-        );
-        assert_eq!(
-            parse_official_science_identity(&format!(
-                "Identifier=com.anthropic.operon\nIdentifier=com.anthropic.operon.cli\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\n"
-            )),
-            Err(OfficialScienceIdentityError::DuplicateIdentifier)
-        );
-        assert_eq!(
-            parse_official_science_identity("Identifier=com.anthropic.operon\n"),
-            Err(OfficialScienceIdentityError::MissingTeamIdentifier)
-        );
-        assert_eq!(
-            parse_official_science_identity("Identifier=com.anthropic.operon\nTeamIdentifier=\n"),
-            Err(OfficialScienceIdentityError::MissingTeamIdentifier)
-        );
-        assert_eq!(
-            parse_official_science_identity(&format!(
-                "Identifier=com.anthropic.operon\nTeamIdentifier={OFFICIAL_SCIENCE_TEAM_ID}\nTeamIdentifier=WRONGTEAM1\n"
-            )),
-            Err(OfficialScienceIdentityError::DuplicateTeamIdentifier)
-        );
-    }
-
-    #[test]
-    fn official_science_identity_reports_codesign_and_macho_failures(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(
-            official_science_identity_from_codesign_output(&codesign_output(1, "")),
-            Err(OfficialScienceIdentityError::CodesignFailed)
-        );
-        assert_eq!(
-            official_science_identity_from_codesign_output(&Output {
-                status: ExitStatus::from_raw(0),
-                stdout: Vec::new(),
-                stderr: vec![b'x'; 64 * 1024 + 1],
-            }),
-            Err(OfficialScienceIdentityError::CodesignOutputTooLarge)
-        );
-
-        let root = unique_temp_dir("science-identity-not-macho")?;
-        let script = root.join("claude-science");
-        write_fake_bin(&script, 0o755)?;
-        assert_eq!(
-            validate_official_updated_local_identity(&script),
-            Err(OfficialScienceIdentityError::NotMachO)
-        );
-        fs::remove_dir_all(root)?;
-        Ok(())
     }
 
     #[test]
@@ -2118,15 +2959,6 @@ mod tests {
         );
         assert!(stop_runtime_from_probe(SandboxScienceState::Unknown, None).is_err());
         assert!(stop_runtime_from_probe(SandboxScienceState::RunningHealthy, None).is_err());
-    }
-
-    #[test]
-    fn stop_fallback_requires_the_same_exact_listener_pid() {
-        assert_eq!(exact_stop_fallback_pid(Some(42), Some(42)), Some(42));
-        assert_eq!(exact_stop_fallback_pid(Some(42), Some(43)), None);
-        assert_eq!(exact_stop_fallback_pid(None, Some(42)), None);
-        assert_eq!(exact_stop_fallback_pid(Some(42), None), None);
-        assert_eq!(exact_stop_fallback_pid(Some(1), Some(1)), None);
     }
 
     #[test]
@@ -2488,12 +3320,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CSSWITCH_REAL_SCIENCE_BIN pointing to an installed updater executable"]
+    #[ignore = "requires CSSWITCH_REAL_SCIENCE_BIN plus expected version and SHA-256"]
     fn real_updated_runtime_candidate_is_eligible_without_reading_real_science_data(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let source = std::env::var_os("CSSWITCH_REAL_SCIENCE_BIN")
             .map(std::path::PathBuf::from)
             .ok_or("CSSWITCH_REAL_SCIENCE_BIN is required")?;
+        let expected_version = std::env::var("CSSWITCH_EXPECTED_SCIENCE_VERSION")?;
+        let expected_sha256 = std::env::var("CSSWITCH_EXPECTED_SCIENCE_SHA256")?;
         let root = unique_temp_dir("science-real-updated")?;
         let home = root.join("home");
         let candidate = home.join(".claude-science/bin/claude-science");
@@ -2514,6 +3348,17 @@ mod tests {
         .expect("real updater snapshot");
         assert_ne!(snapshot, candidate);
         assert_eq!(fs::read(&snapshot)?, fs::read(&candidate)?);
+        assert_eq!(
+            snapshot.file_name().and_then(|name| name.to_str()),
+            Some(OFFICIAL_UPDATED_SNAPSHOT_EXECUTABLE)
+        );
+        assert_eq!(
+            snapshot
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str()),
+            Some(format!("{OFFICIAL_UPDATED_SNAPSHOT_VERSION_PREFIX}{expected_sha256}").as_str())
+        );
         let isolated_home = root.join("isolated-home");
         fs::create_dir_all(&isolated_home)?;
         let output = std::process::Command::new(&snapshot)
@@ -2521,7 +3366,45 @@ mod tests {
             .env("HOME", &isolated_home)
             .output()?;
         assert!(output.status.success());
-        assert!(String::from_utf8(output.stdout)?.starts_with("claude-science "));
+        assert_eq!(
+            String::from_utf8(output.stdout)?.trim(),
+            format!("claude-science {expected_version} (release, public)")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CSSWITCH_REAL_SCIENCE_APP_BIN plus expected version and SHA-256"]
+    fn real_installed_app_seed_is_selected_without_mutating_data_dir(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let app_bin = std::env::var_os("CSSWITCH_REAL_SCIENCE_APP_BIN")
+            .map(std::path::PathBuf::from)
+            .ok_or("CSSWITCH_REAL_SCIENCE_APP_BIN is required")?;
+        let expected_version = std::env::var("CSSWITCH_EXPECTED_SCIENCE_VERSION")?;
+        let expected_sha256 = std::env::var("CSSWITCH_EXPECTED_SCIENCE_SHA256")?;
+        let root = unique_temp_dir("science-real-installed-app")?;
+        let data_dir = root.join("home/.claude-science");
+        fs::create_dir_all(&data_dir)?;
+        let marker = data_dir.join("state-marker");
+        fs::write(&marker, "keep-me")?;
+
+        let selected = select_science_runtime_for_paths(&data_dir, None, &app_bin, None)?;
+        assert_eq!(selected.source, ScienceRuntimeSource::InstalledApp);
+        assert_eq!(selected.path, app_bin);
+        let expected_version_output =
+            format!("claude-science {expected_version} (release, public)");
+        assert_eq!(
+            selected.version.as_deref(),
+            Some(expected_version_output.as_str())
+        );
+        assert_eq!(
+            fingerprint_sha256_hex(&selected.fingerprint),
+            expected_sha256
+        );
+        assert_eq!(fs::read_to_string(&marker)?, "keep-me");
+        assert_eq!(data_dir.read_dir()?.count(), 1);
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -2673,14 +3556,6 @@ mod tests {
             status: ExitStatus::from_raw(code << 8),
             stdout: stdout.as_bytes().to_vec(),
             stderr: Vec::new(),
-        }
-    }
-
-    fn codesign_output(code: i32, stderr: &str) -> Output {
-        Output {
-            status: ExitStatus::from_raw(code << 8),
-            stdout: Vec::new(),
-            stderr: stderr.as_bytes().to_vec(),
         }
     }
 

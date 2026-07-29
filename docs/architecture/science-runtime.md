@@ -34,6 +34,20 @@ data-dir 持久化组织、项目、Skills 和 Science 自己的 runtime 数据�
 
 Gateway 同样只监听 loopback。端口健康不等于身份健康；公共网络暴露不属于当前合同。
 
+## 一键启动的事务快照边界
+
+CSSwitch 是启动与路由插件，不拥有 Science 的语言环境。冷启动事务只快照可能被 CSSwitch 启动准备流程改写、且失败时必须精确补偿的受保护状态：
+
+- `encryption.key`、`.oauth-tokens/`、`active-org.json`、`.key-backups/`、`auth-owner.lock`；
+- `config.toml`、`csswitch-ssh-bridge.v1.json`、`mcp/`、`.csswitch-route-state.json`；
+- `orgs/`（包含组织数据库、历史和组织内 Skills，不能按缓存处理）。
+
+`conda/`、`runtime/`、`seed-assets/`、`r-libs/`、`sbx-bind-src/` 是 Science-owned opaque roots。CSSwitch 只对这五个固定顶层入口做 no-follow 的目录、owner、权限和 device/inode 绑定校验，并在任何受保护写入前及 `serve` spawn 紧前重验；不得递归遍历、读取、复制、fsync、删除或回滚其内容。未知的其他顶层入口同样按外部状态原地保留，除非它与受保护入口冲突或根目录身份不安全。这个边界不依赖 APFS clone，也不把环境误称为可重建缓存。
+
+私有快照根一旦建立，就在复制任何受保护状态之前，以 marker、精确 path/device/inode 和原子 manifest 的 `active_recovery` disposition 持久登记；完整快照仍必须在任何 OAuth、SSH bridge、MCP 或路由写入之前完成。只有成功、完整补偿或无需继续恢复的选择分支，才能通过 compare-and-swap 把同一票据转成 `cleanup_only`，随后才允许删除；因此 capture 中途崩溃不会留下未登记的敏感 orphan，config journal 即使被补偿回滚，也不能把仍需恢复的快照误删。进程若在活动事务中崩溃，下一次启动不得自动删除这份快照，也不得把可能的部分写入态当作新基线；当前策略是保留快照并要求人工恢复。旧版 `start_science` 日志没有 runtime 指纹，升级后按 `environment_uncertain`、`newer_runtime_required` 失败关闭，不得跨 runtime 自动启动。
+
+事务在调用 `claude-science serve` 前失败时，可以精确补偿受保护状态。调用后，Science 可能已经迁移或修改自身环境，即使受保护状态已恢复，结果也必须标为 `environment_uncertain`；跨 runtime 失败不得用旧 runtime 自动重启这个已暴露环境。无法证明候选 Science 已停止时，不得在其下方恢复凭据或组织数据库，必须保留受限恢复快照并返回 `cleanup_required`。
+
 ## 运行中身份与恢复
 
 CSSwitch 在内存中记录实际 launch binary path、来源（`explicit`、`official_updated`、`installed_app` 或 `cached_once`）、版本和选择时文件指纹。启动、复用、恢复、生成受管 URL 与停止操作使用这份 runtime metadata，并在需要控制 daemon 的边界做强身份检查。

@@ -1,6 +1,6 @@
 # 当前已知问题与证据缺口
 
-最后整理：2026-07-23。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
+最后整理：2026-07-28。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
 
 ## v0.8.2 已发布后的边界
 
@@ -29,6 +29,8 @@
 - 第三方 Science 以 `--no-auto-update` 运行；其设置页更新不会应用。先在官方 Science 完成更新，再停止并启动 CSSwitch 管理链。
 - Agent 控制面配置是多个顺序请求，不是原子事务；失败只降级为 warning，已完成步骤不会自动回滚。
 - 系统 SSH 默认关闭；opt-in 后 config / wrapper 校验 fail closed，未对特定用户的真实 SSH server 做连通性验证。
+- `BUG-083-SSH-LATE` 已完成源码级修复：SSH 可预检项先于 OAuth，生命周期串行区会重检精确候选与既有受管 Gateway 上下文，真正晚失败会精确补偿 OAuth、active profile、Gateway、Science、managed stub、journal 与耐久清理状态。当前证据仅来自临时 HOME、假凭证、假 Science、本地 Gateway 和 loopback；production artifact/runtime、已安装 App、真实 provider、真实 SSH server、签名和公开发布仍未验证，产品 gate 保持 open。
+- fresh xhigh 复审接受一个与本 bug 分离的 P3 威胁模型边界：最终校验后，若同 UID 对 CSSwitch 私有根实施恶意 pathname 替换，当前实现并非全程 fd-relative。该边界沿用[既有 runtime / 安全记录](../../docs/evidence/investigations/2026-07-18-v070-ui-redesign-runtime-security-review.md)，在当前私有根威胁模型内不阻断 `BUG-083-SSH-LATE`，本窗口不另建 bug。
 
 ## 测试
 

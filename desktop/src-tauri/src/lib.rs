@@ -99,6 +99,9 @@ pub(crate) struct AppState {
     /// 当前代理进程所用 key 的非加密指纹（仅内存、绝不落盘/打印）。
     /// 换 key/换上游后指纹变化 → 触发重启，避免复用带旧配置的代理。
     pub(crate) key_fp: u64,
+    /// The exact in-memory launch recipe for the currently tracked Gateway.
+    /// It may contain profile credentials, so it is never serialized or logged.
+    pub(crate) gateway_launch_context: Option<GatewayLaunchContext>,
     pub(crate) sandbox: Option<Child>,
     pub(crate) sandbox_port: u16,
     pub(crate) sandbox_url: Option<String>,
@@ -111,11 +114,21 @@ pub(crate) struct AppState {
     /// One-shot, backend-only mapping for the v0.8.0 multi-history recovery UI.
     /// Neither organization UUIDs nor filesystem paths cross the invoke boundary.
     pub(crate) history_recovery: Option<HistoryRecoverySession>,
+    /// Exact private rollback roots whose cleanup previously failed. Paths are
+    /// backend-only and retried before the next one-click mutation.
+    pub(crate) pending_authority_cleanup: Vec<std::path::PathBuf>,
     boot: BootState,
     pub(crate) boot_error: Option<String>,
     pub(crate) boot_attention: Option<serde_json::Value>,
 }
 
+#[derive(Clone, PartialEq)]
+pub(crate) struct GatewayLaunchContext {
+    pub(crate) profile: config::Profile,
+    pub(crate) science_runtime: Option<runtime::science::ScienceRuntimeIdentity>,
+}
+
+#[derive(Clone)]
 pub(crate) struct HistoryRecoverySession {
     pub(crate) active_profile_id: String,
     pub(crate) sandbox_port: u16,
@@ -124,6 +137,7 @@ pub(crate) struct HistoryRecoverySession {
     pub(crate) choices: Vec<HistoryRecoveryChoice>,
 }
 
+#[derive(Clone)]
 pub(crate) struct HistoryRecoveryChoice {
     pub(crate) reference: String,
     pub(crate) candidate: oauth_forge::HistoryOrgCandidate,
@@ -137,6 +151,7 @@ impl AppState {
         self.shim_mode.clear();
         self.launch_id.clear();
         self.key_fp = 0;
+        self.gateway_launch_context = None;
     }
 
     pub(crate) fn stop_proxy(&mut self) {

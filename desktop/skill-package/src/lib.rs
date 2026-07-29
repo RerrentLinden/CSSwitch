@@ -26,8 +26,9 @@ pub use listing::{
     SkillFilesystemSnapshot, SkillListWarning, MAX_LISTED_SKILLS, MAX_SKILL_FRONTMATTER_BYTES,
 };
 pub use science::{
-    attach_skill, read_agent_skill_names, update_agent_skills, verify_attach_control_ready,
-    AttachError, AttachResult, BatchSkillUpdate,
+    attach_skill, open_science_health_session, open_science_health_session_before,
+    read_agent_skill_names, update_agent_skills, verify_attach_control_ready, AttachError,
+    AttachResult, BatchSkillUpdate, ScienceHealthSession,
 };
 
 pub const SCHEMA_VERSION: u64 = 2;

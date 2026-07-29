@@ -69,6 +69,8 @@ docs/*
 !docs/features/**
 !docs/evidence/
 !docs/evidence/**
+!docs/audits/
+!docs/audits/**
 !docs/EXTERNAL_SKILL_INSTALL.md
 !docs/assets/
 !docs/assets/**

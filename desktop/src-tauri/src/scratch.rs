@@ -500,9 +500,10 @@ pub fn scratch_probe(
         }
         ProbeKind::Message => {
             // model 由 CSSWITCH_RELAY_MODEL 强制，请求体模型名占位即可（会被 override）。
+            let max_tokens = message_probe_max_tokens(target.relay_thinking);
             let payload = serde_json::to_vec(&serde_json::json!({
                 "model": request_model.as_deref().unwrap_or(""),
-                "max_tokens": 1,
+                "max_tokens": max_tokens,
                 "messages": [{"role":"user","content":"ping"}]
             }))
             .unwrap_or_default();
@@ -528,6 +529,14 @@ pub fn scratch_probe(
         }
     }
     // guard drop → 杀临时代理。
+}
+
+fn message_probe_max_tokens(relay_thinking: &str) -> u64 {
+    if relay_thinking == "enabled" {
+        1025
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -565,6 +574,13 @@ mod tests {
         );
         assert_eq!(result.status, None);
         assert_eq!(result.body, "临时探测已取消");
+    }
+
+    #[test]
+    fn thinking_enabled_message_probe_uses_a_valid_minimum_envelope() {
+        assert_eq!(message_probe_max_tokens("enabled"), 1025);
+        assert_eq!(message_probe_max_tokens("adaptive"), 1);
+        assert_eq!(message_probe_max_tokens(""), 1);
     }
 
     #[test]

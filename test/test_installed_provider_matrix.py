@@ -173,6 +173,11 @@ class InstalledProviderMatrixTests(unittest.TestCase):
                 for step in silicon.steps[1:]
             )
         )
+        kimi = build_case_scenario(CASE_DEFINITIONS["kimi"])
+        scratch = next(step for step in kimi.steps if step.phase == "scratch")
+        scratch_equals = scratch.checks["body"]["equals"]
+        self.assertEqual(scratch_equals["/max_tokens"], 1025)
+        self.assertEqual(scratch_equals["/thinking/budget_tokens"], 1024)
 
     def test_acceptance_bundle_and_data_root_can_be_selected_explicitly(self):
         info_path = self.app_bundle / "Contents/Info.plist"

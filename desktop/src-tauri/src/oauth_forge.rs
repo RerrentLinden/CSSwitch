@@ -230,7 +230,7 @@ fn safe_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     let parent = path.parent().ok_or("目标无父目录")?;
     let suffix = hex(&rand_bytes(6).map_err(|e| e.to_string())?);
     let tmp = parent.join(format!(".tmp-{suffix}"));
-    {
+    let result = (|| -> Result<(), String> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true) // O_CREAT|O_EXCL
@@ -239,11 +239,16 @@ fn safe_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
             .map_err(|e| format!("建临时文件失败：{e}"))?;
         f.write_all(data)
             .map_err(|e| format!("写临时文件失败：{e}"))?;
+        drop(f);
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename 失败：{e}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("chmod 失败：{e}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename 失败：{e}"))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|e| format!("chmod 失败：{e}"))?;
-    Ok(())
+    result
 }
 
 fn chmod_best_effort(p: &Path, mode: u32) {
@@ -1004,6 +1009,16 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("active-org.json")).unwrap())
                 .unwrap();
         assert_eq!(org["org_uuid"], r.org_uuid);
+        let blocked_target = dir.join("blocked-target");
+        std::fs::create_dir(&blocked_target).unwrap();
+        assert!(safe_write(&blocked_target, b"must-fail", 0o600).is_err());
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp-")),
+            "a failed owned write must clean its own credential-bearing temp file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&fake_real);
     }

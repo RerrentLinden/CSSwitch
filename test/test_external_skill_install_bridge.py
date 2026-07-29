@@ -318,11 +318,15 @@ class ExternalSkillInstallBridge(unittest.TestCase):
 
     def test_science_startup_registration_is_best_effort_and_prelaunch(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
-        registration = session.index("register_before_science_start(")
-        launch = session.index('let status = Command::new("zsh")')
+        one_click = session.split("fn one_click_login_with_options", 1)[1].split(
+            "\n#[cfg(test)]\nmod transaction_tests", 1
+        )[0]
+        registration = one_click.index("register_before_science_start(")
+        launch = one_click.index('let launch_child = Command::new("zsh")')
         self.assertLess(registration, launch)
-        self.assertIn("失败只降级该工具，绝不阻断 Science 启动", session)
-        self.assertNotIn("register_before_science_start(&app, &auth_dir)?", session)
+        self.assertIn(".spawn();", one_click[launch:])
+        self.assertIn("RegistrationStatus::Warning(error)", one_click)
+        self.assertNotIn("register_before_science_start(&app, &auth_dir)?", one_click)
 
     def test_route_is_ensured_and_combined_connector_is_registered(self):
         route = (
@@ -368,6 +372,9 @@ class ExternalSkillInstallBridge(unittest.TestCase):
             ROOT / "desktop/src-tauri/src/runtime/skill_install_bridge.rs"
         ).read_text()
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
+        one_click = session.split("fn one_click_login_with_options", 1)[1].split(
+            "\n#[cfg(test)]\nmod transaction_tests", 1
+        )[0]
         self.assertIn('ROUTE_SKILL_NAME: &str = "csswitch-external-skill-tools"', gateway)
         self.assertIn('matches!(url.host_str(), Some("127.0.0.1" | "localhost"))', gateway)
         self.assertIn('/api/agents/OPERON/skills', gateway)
@@ -378,8 +385,8 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         self.assertIn(
             "configure_third_party_after_science_start(app, &control_url)", session
         )
-        self.assertIn("let url = sandbox_url(sport, &launch_runtime);", session)
-        self.assertIn("A dedicated control URL is only", session)
+        self.assertIn("let url = sandbox_url(sport, &launch_runtime);", one_click)
+        self.assertIn("let installer = configure_third_party_best_effort(", one_click)
 
     def test_skill_installer_targets_active_org_and_never_version_runtime(self):
         installer = (ROOT / "desktop/gateway/src/skill_install.rs").read_text()

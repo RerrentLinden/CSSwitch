@@ -4,8 +4,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::runtime::provider::{
-    assert_format_supported, is_native_adapter, reject_openai_custom_anthropic_base,
-    resolve_launch_plan, resolve_template_plan, PublicPlanView,
+    assert_format_supported, catalog_fingerprint, current_shim_mode_for_adapter, is_native_adapter,
+    reject_openai_custom_anthropic_base, resolve_launch_plan, resolve_template_plan,
+    route_fingerprint, PublicPlanView,
 };
 use crate::{config, scratch, templates};
 
@@ -94,8 +95,32 @@ pub(crate) fn profile_capabilities(p: &config::Profile) -> serde_json::Value {
 }
 
 /// 组装 get_config 返回体：profiles 的 key 只回掩码，全 key 绝不出后端。
+fn selection_pending_from_config(cfg: &config::Config) -> Result<bool, String> {
+    let Some(profile) = cfg.active_profile() else {
+        return Ok(false);
+    };
+    if cfg.runtime_transaction.is_some() {
+        return Ok(true);
+    }
+    let Some(binding) = cfg.runtime_binding.as_ref() else {
+        return Ok(true);
+    };
+    if binding.profile_id != profile.id {
+        return Ok(true);
+    }
+    let launch = resolve_launch_plan(profile)?.formal();
+    let route_fp = route_fingerprint(
+        profile,
+        &launch,
+        current_shim_mode_for_adapter(&launch.adapter),
+    );
+    let catalog_fp = catalog_fingerprint(profile)?;
+    Ok(binding.route_fp != route_fp || binding.catalog_fp != catalog_fp)
+}
+
 pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
     let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
+    let selection_pending = selection_pending_from_config(&cfg).unwrap_or(true);
     let resolved_codex_network = csswitch_codex_network::resolve_from_process(&cfg.codex_network)
         .map(|route| {
             json!({
@@ -136,7 +161,10 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
         })
         .collect();
     Ok(json!({
-        "schema_version": cfg.schema_version, "active_id": cfg.active_id, "profiles": profiles,
+        "schema_version": cfg.schema_version, "active_id": cfg.active_id,
+        "applied_profile_id": cfg.runtime_binding.as_ref().map(|binding| binding.profile_id.clone()),
+        "selection_pending": selection_pending,
+        "profiles": profiles,
         "templates": build_list_templates(cfg.experimental_codex_enabled), "proxy_port": cfg.proxy_port,
         "sandbox_port": cfg.sandbox_port, "reuse_system_ssh": cfg.reuse_system_ssh,
         "experimental_codex_enabled": cfg.experimental_codex_enabled,
@@ -487,10 +515,20 @@ pub(crate) fn update_profile_metadata_inner(
 }
 
 pub(crate) fn clear_profile_key_inner(dir: &Path, id: &str) -> Result<(), String> {
-    config::update(dir, |c| {
+    config::update_result(dir, |c| {
+        config::require_no_runtime_transaction(c)?;
+        let was_applied = c
+            .runtime_binding
+            .as_ref()
+            .map(|binding| binding.profile_id.as_str())
+            == Some(id);
         if let Some(p) = c.profile_by_id_mut(id) {
             p.api_key.clear();
         }
+        if was_applied {
+            c.runtime_binding = None;
+        }
+        Ok(((), true))
     })
     .map_err(|e| e.to_string())?;
     config::drop_rolling_backup(dir); // 清 key 后净化滚动备份，旧明文不可从 .bak 恢复
@@ -498,11 +536,20 @@ pub(crate) fn clear_profile_key_inner(dir: &Path, id: &str) -> Result<(), String
 }
 
 pub(crate) fn delete_profile_inner(dir: &Path, id: &str) -> Result<(), String> {
-    config::update(dir, |c| {
+    config::update_result(dir, |c| {
+        config::require_no_runtime_transaction(c)?;
         c.profiles.retain(|p| p.id != id);
         if c.active_id == id {
             c.active_id.clear(); // 删 active → 置空
         }
+        if c.runtime_binding
+            .as_ref()
+            .map(|binding| binding.profile_id.as_str())
+            == Some(id)
+        {
+            c.runtime_binding = None;
+        }
+        Ok(((), true))
     })
     .map_err(|e| e.to_string())?;
     config::drop_rolling_backup(dir);
@@ -565,8 +612,8 @@ pub(crate) fn persist_profile_candidate_inner(
         return Err("profile candidate identity mismatch".into());
     }
     resolve_launch_plan(candidate)?;
-    config::write_rolling_backup(dir).ok();
-    config::update_result(dir, |cfg| {
+    config::update_result_with_rolling_backup(dir, |cfg| {
+        config::require_no_runtime_transaction(cfg)?;
         let profile = cfg
             .profile_by_id_mut(id)
             .ok_or_else(|| format!("找不到 profile：{id}"))?;
@@ -745,7 +792,13 @@ mod tests {
         update_profile_connection_inner, update_profile_metadata_inner, CatalogEdit,
         ConnectionEdit, EnsureCodexProfileDisposition,
     };
-    use crate::config;
+    use crate::{
+        config,
+        runtime::provider::{
+            catalog_fingerprint, current_shim_mode_for_adapter, resolve_launch_plan,
+            route_fingerprint,
+        },
+    };
 
     /// 每个测试用独立临时 `.csswitch` 目录（进程 id + 线程 id + 随机后缀），互不干扰。
     fn tmpdir_profile() -> std::path::PathBuf {
@@ -1203,8 +1256,29 @@ mod tests {
             Some("glm-5.2"),
         )
         .unwrap();
+        let saved = config::load_from(&d).unwrap();
+        let profile = saved.profile_by_id(&id).unwrap();
+        let launch = resolve_launch_plan(profile).unwrap().formal();
+        let route_fp = route_fingerprint(
+            profile,
+            &launch,
+            current_shim_mode_for_adapter(&launch.adapter),
+        );
+        let catalog_fp = catalog_fingerprint(profile).unwrap();
+        config::update(&d, |cfg| {
+            cfg.active_id = id.clone();
+            cfg.runtime_binding = Some(config::RuntimeBindingCommit {
+                profile_id: id.clone(),
+                route_fp: route_fp.clone(),
+                catalog_fp: catalog_fp.clone(),
+                binding_fp: "binding".into(),
+            });
+        })
+        .unwrap();
         let v = build_get_config(&d).unwrap();
         assert_eq!(v["schema_version"], 4);
+        assert_eq!(v["applied_profile_id"], id);
+        assert_eq!(v["selection_pending"], false);
         let arr = v["profiles"].as_array().unwrap();
         let p = arr.iter().find(|p| p["id"] == id).unwrap();
         assert!(p["key"].as_str().unwrap().ends_with("9999"));
@@ -1212,6 +1286,15 @@ mod tests {
             !p["key"].as_str().unwrap().contains("longsecret"),
             "只回掩码"
         );
+        config::update(&d, |cfg| {
+            let changed = cfg.profile_by_id_mut(&id).unwrap();
+            changed.model_catalog[0].upstream_model = "glm-changed".into();
+            changed.model = "glm-changed".into();
+        })
+        .unwrap();
+        assert_eq!(build_get_config(&d).unwrap()["selection_pending"], true);
+        config::update(&d, |cfg| cfg.runtime_binding = None).unwrap();
+        assert_eq!(build_get_config(&d).unwrap()["selection_pending"], true);
         assert!(
             p.get("api_key").is_none() || p["api_key"].is_null(),
             "全 key 不出后端"

@@ -470,6 +470,61 @@ pub(crate) fn prepare_science_ssh_bridge(sandbox_home: &Path) -> Result<Vec<Stri
     prepare_science_ssh_bridge_for(sandbox_home, &home)
 }
 
+pub(crate) fn prevalidate_science_ssh_bridge(
+    sandbox_home: &Path,
+    enabled: bool,
+) -> Result<Vec<String>, String> {
+    reject_symlink_components(sandbox_home)?;
+    let data_dir = sandbox_home.join(".claude-science");
+    let config_path = data_dir.join("config.toml");
+    let state_path = data_dir.join(STATE_FILE);
+    reject_symlink_components(&config_path)?;
+    reject_symlink_components(&state_path)?;
+    if enabled {
+        // This is deliberately a metadata-only check. The one-click transaction
+        // must reject an authority that is statically non-writable before OAuth
+        // or journal mutation without leaving a write-probe artifact behind.
+        let uid = unsafe { libc::geteuid() };
+        if let Ok(metadata) = fs::symlink_metadata(&data_dir) {
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != uid
+                || metadata.permissions().mode() & 0o200 == 0
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err("隔离 Science SSH authority 不可写".into());
+            }
+        }
+        for path in [&config_path, &state_path] {
+            if let Ok(metadata) = fs::symlink_metadata(path) {
+                if !metadata.file_type().is_file()
+                    || metadata.uid() != uid
+                    || metadata.permissions().mode() & 0o200 == 0
+                    || metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err("隔离 Science SSH authority 不可写".into());
+                }
+            }
+        }
+    }
+    let document = read_document(&config_path)?;
+    let current = read_ssh_hosts(&document)?;
+    let prior = read_state(&state_path)?;
+    if let Some(state) = &prior {
+        if !current_matches_owned_state(current.as_deref(), state) {
+            return Err(
+                "隔离 Science ssh_hosts 在授权期间被外部修改；已保持原样，请先人工确认冲突".into(),
+            );
+        }
+    }
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("无法确认系统 HOME，不能启用系统 SSH 配置。")?;
+    system_ssh_hosts_for_home(&home)
+}
+
 pub(crate) fn revoke_science_ssh_bridge(sandbox_home: &Path) -> Result<(), String> {
     reject_symlink_components(sandbox_home)?;
     let data_dir = sandbox_home.join(".claude-science");

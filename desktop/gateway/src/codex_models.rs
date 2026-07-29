@@ -341,7 +341,7 @@ impl CodexModelsSnapshot {
     }
 
     pub(crate) fn response_body(&self) -> Value {
-        let data: Vec<Value> = self
+        let mut data: Vec<Value> = self
             .models
             .iter()
             .map(|model| {
@@ -355,6 +355,21 @@ impl CodexModelsSnapshot {
                 })
             })
             .collect();
+        for (id, canonical_name) in crate::static_profile::SCIENCE_CANONICAL_ROLE_MODELS {
+            let Ok(model) = self.resolve_request_model(id) else {
+                continue;
+            };
+            data.push(json!({
+                "type": "model",
+                "id": id,
+                "display_name": format!(
+                    "{canonical_name} · {SCIENCE_DISPLAY_PREFIX}{}",
+                    model.model.display_name
+                ),
+                "supports_tools": true,
+                "created_at": CREATED_AT,
+            }));
+        }
         json!({
             "data": data,
             "has_more": false,
@@ -1901,7 +1916,7 @@ mod tests {
             .map(|model| model["id"].as_str().unwrap())
             .collect();
         assert_eq!(
-            ids,
+            &ids[..3],
             [
                 "claude-csswitch-codex-gpt-5.6-sol",
                 "claude-csswitch-codex-gpt-5.6-terra",
@@ -1936,6 +1951,46 @@ mod tests {
             Err(CodexModelResolutionError::NoCompatibleStandardResponsesModel)
         ));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn routable_canonical_roles_are_published_for_science_settings() {
+        let body = serde_json::to_vec(&json!({"models": [{
+            "slug": "gpt-standard",
+            "display_name": "GPT Standard",
+            "visibility": "list",
+            "priority": 1,
+            "supports_reasoning_summaries": true,
+            "use_responses_lite": false
+        }]}))
+        .unwrap();
+        let (endpoint, _count, _requests, server) =
+            serve_responses(vec![response("200 OK", &body, "")]);
+        let root = private_root();
+        let snapshot = CodexModelCatalog::for_test(endpoint, root.clone())
+            .unwrap()
+            .list_at(&secrets(), 10_000)
+            .unwrap();
+        server.join().unwrap();
+        let response = snapshot.response_body();
+        let data = response["data"].as_array().unwrap();
+        for id in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(
+                data.iter().any(|model| model["id"] == id),
+                "Science canonical model {id} must be listed when it is routable"
+            );
+            assert_eq!(
+                snapshot.resolve_request_model(id).unwrap().raw_id(),
+                "gpt-standard"
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 

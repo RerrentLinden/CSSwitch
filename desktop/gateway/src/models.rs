@@ -6,6 +6,64 @@ use crate::config::{DEEPSEEK_MODELS, QWEN_MODELS};
 
 const CREATED_AT: &str = "2026-01-01T00:00:00Z";
 
+fn display_token(token: &str) -> String {
+    match token.to_ascii_lowercase().as_str() {
+        "claude" => "Claude".into(),
+        "deepseek" => "DeepSeek".into(),
+        "glm" => "GLM".into(),
+        "gpt" => "GPT".into(),
+        "kimi" => "Kimi".into(),
+        "minimax" => "MiniMax".into(),
+        "mimo" => "MiMo".into(),
+        "qwen" => "Qwen".into(),
+        _ => {
+            let mut chars = token.chars();
+            match chars.next() {
+                Some(first) if first.is_ascii_alphabetic() => {
+                    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+                }
+                _ => token.to_string(),
+            }
+        }
+    }
+}
+
+fn humanize_model_id(id: &str) -> Option<String> {
+    if id.is_empty()
+        || !id.is_ascii()
+        || id.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'/'))
+        })
+    {
+        return None;
+    }
+    let segments: Vec<String> = id
+        .split('/')
+        .map(|segment| {
+            segment
+                .split(['-', '_'])
+                .filter(|part| !part.is_empty())
+                .map(display_token)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    (!segments.iter().any(String::is_empty)).then(|| segments.join(" / "))
+}
+
+pub(crate) fn science_safe_display_name(id: &str, candidate: &str) -> String {
+    let claude_like = id
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| segment.to_ascii_lowercase().starts_with("claude-"));
+    if claude_like && candidate.eq_ignore_ascii_case(id) {
+        if let Some(generated) = humanize_model_id(id) {
+            return generated;
+        }
+    }
+    candidate.to_string()
+}
+
 /// Process-local relay model discovery cache.
 ///
 /// The cache deliberately has no TTL, persistence, or cross-process sharing. Only a
@@ -95,10 +153,16 @@ pub fn normalize_live_models(raw: &Value) -> (Value, Vec<String>) {
             .map(|params| params.iter().any(|param| param.as_str() == Some("tools")))
             .map(Value::Bool)
             .unwrap_or(Value::Null);
+        let display_name = science_safe_display_name(
+            id,
+            item.get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or(id),
+        );
         out.push(json!({
             "type": "model",
             "id": id,
-            "display_name": item.get("display_name").and_then(Value::as_str).unwrap_or(id),
+            "display_name": display_name,
             "supports_tools": supports_tools,
             "created_at": CREATED_AT,
         }));
@@ -197,6 +261,28 @@ mod tests {
         assert_eq!(ids, vec!["first", "last"]);
         assert_eq!(response["first_id"], "first");
         assert_eq!(response["last_id"], "last");
+    }
+
+    #[test]
+    fn normalize_live_models_humanizes_machine_displays_without_changing_ids() {
+        let response = normalize_live_models_response(&json!({"data": [
+            {"id": "kimi-k3"},
+            {"id": "qwen-plus-latest", "display_name": "qwen-plus-latest"},
+            {"id": "claude-sonnet-5", "display_name": "claude-sonnet-5"},
+            {"id": "vendor/model-v2", "display_name": "compact-label"},
+            {"id": "vendor-model", "display_name": "Vendor Model Pro"}
+        ]}));
+        let data = response["data"].as_array().unwrap();
+        assert_eq!(data[0]["id"], "kimi-k3");
+        assert_eq!(data[0]["display_name"], "kimi-k3");
+        assert_eq!(data[1]["id"], "qwen-plus-latest");
+        assert_eq!(data[1]["display_name"], "qwen-plus-latest");
+        assert_eq!(data[2]["id"], "claude-sonnet-5");
+        assert_eq!(data[2]["display_name"], "Claude Sonnet 5");
+        assert_eq!(data[3]["id"], "vendor/model-v2");
+        assert_eq!(data[3]["display_name"], "compact-label");
+        assert_eq!(data[4]["id"], "vendor-model");
+        assert_eq!(data[4]["display_name"], "Vendor Model Pro");
     }
 
     #[test]

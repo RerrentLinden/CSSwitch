@@ -17,6 +17,8 @@ fn stage_gateway_sidecar() {
         return;
     };
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let out_dir =
+        PathBuf::from(std::env::var_os("OUT_DIR").expect("Desktop build must provide an OUT_DIR"));
     let manifest_dir = PathBuf::from(manifest_dir);
     let gateway_dir = manifest_dir.join("../gateway");
     if !gateway_dir.join("Cargo.toml").is_file() {
@@ -40,9 +42,15 @@ fn stage_gateway_sidecar() {
         );
     }
 
+    // Never inherit the outer CARGO_TARGET_DIR for the nested build and then
+    // read from a different default target directory. A private target root
+    // under this exact Desktop build binds the copied sidecar to this build,
+    // target triple, and feature selection.
+    let gateway_target_dir = out_dir.join("gateway-target");
     let mut command = Command::new(&cargo);
     command
         .current_dir(&gateway_dir)
+        .env("CARGO_TARGET_DIR", &gateway_target_dir)
         .arg("build")
         .arg("--release")
         .arg("--target")
@@ -55,8 +63,7 @@ fn stage_gateway_sidecar() {
         panic!("failed to build csswitch-gateway sidecar for target {target}");
     }
 
-    let built = gateway_dir
-        .join("target")
+    let built = gateway_target_dir
         .join(&target)
         .join("release")
         .join(gateway_bin_name());

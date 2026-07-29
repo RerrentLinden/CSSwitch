@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.8.2"
+version = "0.8.4"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -827,9 +827,11 @@ dependencies = [
  "glob",
  "hkdf",
  "libc",
+ "proc-macro2",
  "serde",
  "serde_json",
  "sha2",
+ "syn 2.0.118",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
