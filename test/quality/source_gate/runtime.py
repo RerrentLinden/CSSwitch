@@ -69,14 +69,7 @@ _DIGEST_KEYS = frozenset({
     "sanitized_environment",
     "tools",
 })
-_CARGO_CONFIG = (
-    b"[source.crates-io]\n"
-    b"replace-with = 'rsproxy-sparse'\n\n"
-    b"[source.rsproxy-sparse]\n"
-    b'registry = "sparse+https://rsproxy.cn/index/"\n\n'
-    b"[net]\n"
-    b"offline = true\n"
-)
+_CARGO_CONFIG = b"[net]\noffline = true\n"
 _DEPENDENCY_MAX_ENTRIES = 100_000
 _DEPENDENCY_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _DEPENDENCY_MAX_FILE_BYTES = 128 * 1024 * 1024

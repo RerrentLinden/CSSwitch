@@ -325,7 +325,8 @@ bytes into the private per-run Cargo home, verifies the source again after the
 copy, and requires the private inventory to equal the bound source inventory.
 Cargo receives only that private content-bound view and a fixed offline
 configuration; credentials and ambient Cargo configuration are not copied or
-read, and the real Cargo cache is never a child write target. The fixed
+read, crates.io is not remapped to an author-specific mirror, and the real
+Cargo cache is never a child write target. The fixed
 `config.toml` mode, owner, link count, size, and digest are re-read with the
 private dependency inventory at every post-materialization recheck.
 

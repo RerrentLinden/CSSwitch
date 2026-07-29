@@ -288,9 +288,9 @@ class SourceGateRuntime(unittest.TestCase):
             (cargo_home / "registry/index/config.json").read_bytes(),
             b"{}\n",
         )
-        self.assertIn(
-            "offline = true",
+        self.assertEqual(
             (cargo_home / "config.toml").read_text("utf-8"),
+            "[net]\noffline = true\n",
         )
         source_tmp = self.root / "state" / "t"
         source_tmp_fd = os.open(
