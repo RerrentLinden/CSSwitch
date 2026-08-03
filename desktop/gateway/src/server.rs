@@ -127,11 +127,19 @@ impl StreamFilter {
 
     fn log_stats(&self) {
         match self {
-            StreamFilter::Kimi(filter) if filter.dropped() > 0 => {
-                eprintln!(
-                    "relay stream rules=tool.kimi.web_search.server-tool-filter dropped={}",
-                    filter.dropped()
-                );
+            StreamFilter::Kimi(filter) => {
+                if filter.dropped_server_tools() > 0 {
+                    eprintln!(
+                        "relay stream rules=tool.kimi.unsupported-server-tool-filter dropped={}",
+                        filter.dropped_server_tools()
+                    );
+                }
+                if filter.dropped_empty_thinking() > 0 {
+                    eprintln!(
+                        "relay stream rules=provider.kimi.relay-thinking-enabled dropped_empty_thinking={}",
+                        filter.dropped_empty_thinking()
+                    );
+                }
             }
             StreamFilter::DsmlDetect(detector) if detector.found => {
                 eprintln!("deepseek stream DSML detect found=true");
@@ -881,7 +889,8 @@ where
 {
     let mut validator = crate::anthropic_sse::Validator::default();
 
-    let filter_error = |emit: &mut F| {
+    let filter_error = |emit: &mut F, detail: &str| {
+        eprintln!("POST /v1/messages stream_failure stage=kimi_filter detail={detail}");
         if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
             StreamTermination::DownstreamWriteError
         } else {
@@ -895,7 +904,8 @@ where
                    emit: &mut F| {
         let validated = match validator.feed(chunk) {
             Ok(validated) => validated,
-            Err(_) => {
+            Err(error) => {
+                eprintln!("POST /v1/messages stream_failure stage=anthropic_sse detail={error}");
                 if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
                     return Some(StreamTermination::DownstreamWriteError);
                 }
@@ -923,7 +933,7 @@ where
     let first = match filter.as_mut() {
         Some(filter) => match filter.feed(first) {
             Ok(chunk) => chunk,
-            Err(_) => return filter_error(&mut emit),
+            Err(error) => return filter_error(&mut emit, &error),
         },
         None => first.to_vec(),
     };
@@ -938,7 +948,7 @@ where
                 if let Some(filter) = filter.as_mut() {
                     let tail = match filter.finalize() {
                         Ok(tail) => tail,
-                        Err(_) => return filter_error(&mut emit),
+                        Err(error) => return filter_error(&mut emit, &error),
                     };
                     if let Some(termination) =
                         process(&tail, &mut validator, &mut collector, &mut emit)
@@ -989,7 +999,10 @@ where
                             }
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        eprintln!(
+                            "POST /v1/messages stream_failure stage=anthropic_sse detail={error}"
+                        );
                         if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
                             StreamTermination::DownstreamWriteError
                         } else {
@@ -1002,7 +1015,7 @@ where
                 let chunk = if let Some(filter) = filter.as_mut() {
                     match filter.feed(&buf[..n]) {
                         Ok(chunk) => chunk,
-                        Err(_) => return filter_error(&mut emit),
+                        Err(error) => return filter_error(&mut emit, &error),
                     }
                 } else {
                     buf[..n].to_vec()
@@ -4461,11 +4474,11 @@ mod tests {
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{\"query\":\"weather\"}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_result_1\",\"content\":[]}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
             "event: content_block_start\n",
@@ -4688,24 +4701,43 @@ mod tests {
     fn kimi_native_anthropic_sse_preserves_server_tool_lifecycle_verbatim() {
         let first = complete_kimi_envelope();
         let mut upstream = Cursor::new(Vec::<u8>::new());
-        let mut filter = None;
+        let mut filter = Some(StreamFilter::Kimi(
+            crate::anthropic_compat::KimiServerToolFilter::new(),
+        ));
+        let mut collector = AnthropicStreamMessageCollector::default();
+        let mut captured = None;
+        let mut success_rollback = None;
         let mut output = Vec::new();
-        let termination = forward_stream_body(&mut upstream, &first, &mut filter, |chunk| {
-            output.extend_from_slice(chunk);
-            Ok(())
-        });
+        let termination = forward_stream_body_with_capture(
+            &mut upstream,
+            &first,
+            &mut filter,
+            Some(&mut collector),
+            &mut success_rollback,
+            |chunk| {
+                output.extend_from_slice(chunk);
+                Ok(())
+            },
+            |message| {
+                captured = message;
+                Ok(None)
+            },
+        );
         let text = String::from_utf8(output).unwrap();
         assert_eq!(termination, StreamTermination::NormalEof);
         assert!(text.contains("\"thinking\":\"plan\""));
         assert!(text.contains("\"signature\":\"opaque\""));
         assert!(text.contains("\"type\":\"server_tool_use\""));
         assert!(text.contains("\"type\":\"web_search_tool_result\""));
-        assert!(text.contains("\"tool_use_id\":\"srv_1\""));
+        assert!(text.contains("\"tool_use_id\":\"srv_result_1\""));
         assert!(text.contains("\"index\":3"));
         assert!(text.contains("\"stop_reason\":\"end_turn\""));
         assert!(text.contains("\"output_tokens\":9"));
         assert_eq!(text.matches("event: message_stop").count(), 1);
         assert!(!text.contains("event: error"));
+        let captured = captured.expect("complete Kimi message");
+        assert_eq!(captured["content"][1]["id"], "srv_1");
+        assert_eq!(captured["content"][2]["tool_use_id"], "srv_result_1");
     }
 
     #[test]

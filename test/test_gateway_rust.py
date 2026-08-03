@@ -3330,15 +3330,14 @@ class RustGatewayLoopback(unittest.TestCase):
             self.stop_gateway(proc)
             upstream.close()
 
-    def test_relay_kimi_stream_filters_server_tool_blocks(self):
+    def test_relay_kimi_stream_preserves_valid_web_search_blocks(self):
         payload = b"".join([
             b'event: message_start\ndata: {"type":"message_start","message":{"id":"m_kimi","type":"message","role":"assistant","model":"kimi-k2.7-code","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
-            b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","name":"web_search"}}\n\n',
-            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srv_search","name":"web_search","input":{"query":"x"}}}\n\n',
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
-            b'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","content":[]}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_search","content":[]}}\n\n',
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":3,"content_block":{"type":"thinking","thinking":"","signature":""}}\n\n',
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":3}\n\n',
@@ -3400,12 +3399,15 @@ class RustGatewayLoopback(unittest.TestCase):
             status, headers, body = parse_raw_response(raw)
             self.assertEqual(status, 200)
             self.assertEqual(headers["transfer-encoding"], "chunked")
-            self.assertNotIn(b"server_tool_use", body)
-            self.assertNotIn(b"web_search_tool_result", body)
+            self.assertIn(b'"type":"server_tool_use"', body)
+            self.assertIn(b'"id":"srv_search"', body)
+            self.assertIn(b'"type":"web_search_tool_result"', body)
+            self.assertIn(b'"tool_use_id":"srv_search"', body)
             self.assertNotIn(b'"type":"thinking","thinking":"","signature":""', body)
             self.assertIn(b'"type":"thinking","thinking":"plan","signature":"opaque"', body)
             self.assertIn(b'"index":1', body)
             self.assertIn(b'"index":2', body)
+            self.assertIn(b'"index":4', body)
             self.assertIn(b'"text":"OK"', body)
         finally:
             self.stop_gateway(proc)
@@ -3464,10 +3466,10 @@ class RustGatewayLoopback(unittest.TestCase):
             self.stop_gateway(proc)
             upstream.close()
 
-    def test_v081_relay_kimi_stream_rejects_malformed_dropped_delta(self):
+    def test_v081_relay_kimi_stream_rejects_malformed_web_search_delta(self):
         payload = b"".join([
             b'event: message_start\ndata: {"type":"message_start","message":{"id":"m_bad_hidden_delta","type":"message","role":"assistant","model":"kimi-k3","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
-            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search"}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv_search","name":"web_search","input":{"query":"x"}}}\n\n',
             b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0}\n\n',
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
@@ -3521,7 +3523,7 @@ class RustGatewayLoopback(unittest.TestCase):
             self.stop_gateway(proc)
             upstream.close()
 
-    def test_relay_kimi_raw_k3_nonstream_filters_server_tool_envelopes_and_preserves_two_round_history(self):
+    def test_relay_kimi_raw_k3_nonstream_preserves_web_search_and_result_only_history(self):
         upstream = MockUpstream(json.dumps({
             "id": "msg_kimi_nonstream",
             "type": "message",
@@ -3529,9 +3531,14 @@ class RustGatewayLoopback(unittest.TestCase):
             "model": "k3-256k",
             "content": [
                 {"type": "thinking", "thinking": "", "signature": ""},
-                {"type": "server_tool_use", "id": "srv_search", "name": "web_search"},
-                {"type": "web_search_tool_result", "tool_use_id": "srv_search", "content": []},
                 {"type": "thinking", "thinking": "plan", "signature": "opaque"},
+                {
+                    "type": "server_tool_use",
+                    "id": "srv_search",
+                    "name": "web_search",
+                    "input": {"query": "current fact"},
+                },
+                {"type": "web_search_tool_result", "tool_use_id": "srv_search", "content": []},
                 {"type": "text", "text": "answer"},
             ],
             "stop_reason": "end_turn",
@@ -3546,18 +3553,28 @@ class RustGatewayLoopback(unittest.TestCase):
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}",
             openai_model="k3-256k",
             relay_thinking="enabled",
+            launch_id="2" * 32,
         )
 
-        tools = [
-            {"type": "web_search_20250305", "name": "web_search"},
-            {"type": "web_fetch_20260209", "name": "web_fetch"},
-            {"type": "code_execution_20250825", "name": "code_execution"},
-            {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
-            {"name": "web_search", "input_schema": {"type": "object"}},
-            {"name": "python", "input_schema": {"type": "object"}},
-            {"name": "bash", "input_schema": {"type": "object"}},
-            {"name": "compute", "input_schema": {"type": "object"}},
+        typed_web_search = {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5,
+            "allowed_domains": ["example.invalid"],
+        }
+        ordinary_tools = [
+            {
+                "name": "web_search" if index == 0 else f"science_tool_{index}",
+                "description": f"Science client tool {index}",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            }
+            for index in range(25)
         ]
+        tools = [typed_web_search, *ordinary_tools]
 
         def post(messages):
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -3590,6 +3607,13 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(status, 200, body)
             self.assertEqual(body["content"], [
                 {"type": "thinking", "thinking": "plan", "signature": "opaque"},
+                {
+                    "type": "server_tool_use",
+                    "id": "srv_search",
+                    "name": "web_search",
+                    "input": {"query": "current fact"},
+                },
+                {"type": "web_search_tool_result", "tool_use_id": "srv_search", "content": []},
                 {"type": "text", "text": "answer"},
             ])
             self.assertEqual(body["stop_reason"], "end_turn")
@@ -3605,20 +3629,13 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertIn("anthropic-version", upstream.requests[0]["headers"])
             self.assertEqual(first_upstream["model"], "k3-256k")
             self.assertEqual(first_upstream["messages"][0], first_user)
+            self.assertEqual(len(first_upstream["tools"]), 26)
+            self.assertEqual(first_upstream["tools"][0], typed_web_search)
+            self.assertEqual(first_upstream["tools"][1:], ordinary_tools)
             self.assertEqual(
-                first_upstream["tools"],
-                [
-                    {"name": "web_search", "input_schema": {"type": "object", "properties": {}}},
-                    {"name": "python", "input_schema": {"type": "object", "properties": {}}},
-                    {"name": "bash", "input_schema": {"type": "object", "properties": {}}},
-                    {"name": "compute", "input_schema": {"type": "object", "properties": {}}},
-                ],
+                sum("type" not in tool for tool in first_upstream["tools"]),
+                25,
             )
-            self.assertTrue(all(
-                tool["input_schema"] == {"type": "object", "properties": {}}
-                for tool in first_upstream["tools"]
-            ))
-            self.assertTrue(all("type" not in tool for tool in first_upstream["tools"]))
             self.assertNotIn("mcp_servers", first_upstream)
 
             upstream.response_body = json.dumps({
@@ -3626,24 +3643,41 @@ class RustGatewayLoopback(unittest.TestCase):
                 "type": "message",
                 "role": "assistant",
                 "model": "k3-256k",
-                "content": [{"type": "text", "text": "continued"}],
+                "content": [
+                    {"type": "thinking", "thinking": "follow-up plan", "signature": "opaque-2"},
+                    {"type": "text", "text": "continued"},
+                ],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 5, "output_tokens": 1},
             }).encode()
             round_two_messages = [
                 first_user,
-                {"role": "assistant", "content": body["content"]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        block
+                        for block in body["content"]
+                        if block.get("type") in {"web_search_tool_result", "text"}
+                    ],
+                },
                 {"role": "user", "content": "continue"},
             ]
             status, second = post(round_two_messages)
             self.assertEqual(status, 200, second)
-            self.assertEqual(second["content"][0]["text"], "continued")
+            self.assertEqual(second["content"][1]["text"], "continued")
             second_upstream = json.loads(upstream.requests[1]["body"])
-            self.assertEqual(second_upstream["messages"], round_two_messages)
+            follow_up_content = second_upstream["messages"][-2]["content"]
+            self.assertEqual(follow_up_content[0], {
+                "type": "thinking",
+                "thinking": "plan",
+                "signature": "opaque",
+            })
+            self.assertEqual(follow_up_content[1]["type"], "web_search_tool_result")
+            self.assertEqual(follow_up_content[1]["tool_use_id"], "srv_search")
+            self.assertEqual(follow_up_content[2], {"type": "text", "text": "answer"})
             self.assertFalse(any(
-                block.get("type") in {"server_tool_use", "web_search_tool_result"}
-                for message in second_upstream["messages"]
-                for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+                block.get("type") == "server_tool_use"
+                for block in follow_up_content
             ))
 
             upstream.response_body = json.dumps({

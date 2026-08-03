@@ -88,6 +88,7 @@ pub(crate) fn validate_catalog(catalog: &CapabilityCatalog) -> Result<(), String
     let actions = [
         "none",
         "normalize",
+        "preserve",
         "drop",
         "disable",
         "degrade",
@@ -340,7 +341,7 @@ mod tests {
         let active = ids(&v, "active_rules");
         assert!(active.contains(&"provider.relay.force-model-shell".to_string()));
         assert!(active.contains(&"provider.kimi.relay-thinking-enabled".to_string()));
-        assert!(!active.contains(&"tool.kimi.web_search.server-tool-filter".to_string()));
+        assert!(!active.contains(&"tool.kimi.web_search.server-tool-preserve".to_string()));
         assert!(!active.contains(&"tool.relay.input-schema-normalize".to_string()));
         assert!(!active.contains(&"tool.siliconflow.forced-named-to-any".to_string()));
 
