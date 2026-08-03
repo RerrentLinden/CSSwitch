@@ -212,12 +212,14 @@ impl KimiServerToolFilter {
                     self.dropped_server_tools += 1;
                     return Ok(Vec::new());
                 }
-                let id = (block.get("type").and_then(Value::as_str)
-                    == Some("server_tool_use")
-                    && block.get("input").is_none_or(Value::is_object))
-                .then(|| valid_web_search_id(block.get("id")))
-                .flatten()
-                .ok_or("Kimi web search server tool is invalid")?;
+                let id = valid_web_search_id(block.get("id"))
+                    .ok_or("Kimi web search server tool id is invalid")?;
+                if block
+                    .get("input")
+                    .is_some_and(|input| !input.is_null() && !input.is_object())
+                {
+                    return Err("Kimi web search server tool input is invalid".into());
+                }
                 if !self.seen_web_search_ids.insert(id.to_string()) {
                     return Err("Kimi web search server tool id is duplicated".into());
                 }
@@ -1972,8 +1974,14 @@ mod tests {
             invalid_input
                 .feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv\",\"name\":\"web_search\",\"input\":[]}}\n\n")
                 .unwrap_err(),
-            "Kimi web search server tool is invalid"
+            "Kimi web search server tool input is invalid"
         );
+
+        let mut null_input = KimiServerToolFilter::new();
+        assert!(!null_input
+            .feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv\",\"name\":\"web_search\",\"input\":null}}\n\n")
+            .unwrap()
+            .is_empty());
 
         let mut ambiguous = KimiServerToolFilter::new();
         ambiguous

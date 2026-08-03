@@ -306,6 +306,23 @@ fn not_found_json(stream: &mut TcpStream, path: &str) {
 }
 
 fn api_error_json(stream: &mut TcpStream, status: u16, detail: &str) {
+    if status == 429 {
+        let body = json_bytes(json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": detail,
+            },
+        }));
+        let _ = write!(
+            stream,
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nretry-after: 30\r\nconnection: close\r\n\r\n",
+            body.len(),
+        )
+        .and_then(|_| stream.write_all(&body))
+        .and_then(|_| stream.flush());
+        return;
+    }
     typed_error_json(stream, status, status_reason(status), "api_error", detail);
 }
 
@@ -2972,7 +2989,8 @@ mod tests {
         forward_stream_body_with_capture, forward_stream_body_with_completion,
         handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_post,
         map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream,
-        relay_server_tool_types, relay_thinking_type, restore_continuity_or_reject,
+        relay_server_tool_types, relay_thinking_type, report_upstream_failure,
+        restore_continuity_or_reject,
         stream_error_event, write_anthropic_response_with_continuity, write_codex_models_response,
         AnthropicStreamMessageCollector, CodexComponents, CodexNonstreamError, CodexPumpError,
         RequestHead, RequestNonceGenerator, StreamFilter, StreamTermination,
@@ -3930,6 +3948,22 @@ mod tests {
                 assert_eq!(text.matches("event: error").count(), 1);
             }
         }
+
+        let response = capture_tcp_response(|stream| {
+            report_upstream_failure(
+                stream,
+                "open_stream",
+                &crate::messages::UpstreamError {
+                    status: 429,
+                    upstream_status: Some(429),
+                    detail: "upstream 429: rate_limit_error".into(),
+                },
+            )
+        });
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(text.contains("\r\nretry-after: 30\r\n"));
+        assert!(text.contains("rate_limit_error"));
     }
 
     struct OneReadThenPanic {
