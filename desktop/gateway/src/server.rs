@@ -4512,7 +4512,7 @@ mod tests {
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_result_1\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[]}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
             "event: content_block_start\n",
@@ -4763,7 +4763,7 @@ mod tests {
         assert!(text.contains("\"signature\":\"opaque\""));
         assert!(text.contains("\"type\":\"server_tool_use\""));
         assert!(text.contains("\"type\":\"web_search_tool_result\""));
-        assert!(text.contains("\"tool_use_id\":\"srv_result_1\""));
+        assert!(text.contains("\"tool_use_id\":\"srv_1\""));
         assert!(text.contains("\"index\":3"));
         assert!(text.contains("\"stop_reason\":\"end_turn\""));
         assert!(text.contains("\"output_tokens\":9"));
@@ -4771,7 +4771,7 @@ mod tests {
         assert!(!text.contains("event: error"));
         let captured = captured.expect("complete Kimi message");
         assert_eq!(captured["content"][1]["id"], "srv_1");
-        assert_eq!(captured["content"][2]["tool_use_id"], "srv_result_1");
+        assert_eq!(captured["content"][2]["tool_use_id"], "srv_1");
     }
 
     #[test]

@@ -202,8 +202,9 @@ impl KimiServerToolFilter {
                 .get("content_block")
                 .and_then(Value::as_object)
                 .and_then(|block| block.get("type"))
-                .and_then(Value::as_str);
-            if block_type == Some("server_tool_use") {
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if block_type.as_deref() == Some("server_tool_use") {
                 let block = obj
                     .get("content_block")
                     .ok_or("Kimi web search server tool is invalid")?;
@@ -212,34 +213,55 @@ impl KimiServerToolFilter {
                     self.dropped_server_tools += 1;
                     return Ok(Vec::new());
                 }
-                let id = valid_web_search_id(block.get("id"))
-                    .ok_or("Kimi web search server tool id is invalid")?;
+                let upstream_id = valid_web_search_id(block.get("id")).map(str::to_string);
                 if block
                     .get("input")
                     .is_some_and(|input| !input.is_null() && !input.is_object())
                 {
                     return Err("Kimi web search server tool input is invalid".into());
                 }
-                if !self.seen_web_search_ids.insert(id.to_string()) {
+                let id = upstream_id
+                    .clone()
+                    .unwrap_or_else(|| format!("srvtoolu_kimi_{idx}"));
+                if upstream_id.is_none() {
+                    obj.get_mut("content_block")
+                        .and_then(Value::as_object_mut)
+                        .expect("validated content block")
+                        .insert("id".into(), Value::String(id.clone()));
+                }
+                if !self.seen_web_search_ids.insert(id.clone()) {
                     return Err("Kimi web search server tool id is duplicated".into());
                 }
-                self.pending_web_search_ids.insert(id.to_string());
-            } else if block_type == Some("web_search_tool_result") {
+                self.pending_web_search_ids.insert(id);
+            } else if block_type.as_deref() == Some("web_search_tool_result") {
                 let block = obj
                     .get("content_block")
                     .ok_or("Kimi web search tool result is invalid")?;
-                let id = valid_web_search_tool_result_id(block)
-                    .ok_or("Kimi web search tool result is invalid")?;
-                if !self.pending_web_search_ids.remove(id) {
-                    // Kimi stream results may use a distinct ID; one pending search is unambiguous.
+                let result_id = valid_web_search_tool_result_id(block).map(str::to_string);
+                let matched = result_id
+                    .as_deref()
+                    .is_some_and(|id| self.pending_web_search_ids.remove(id));
+                if !matched {
+                    // Kimi stream results may omit or replace the call ID; one pending search is
+                    // unambiguous, so keep the downstream server-tool lifecycle consistent.
                     if self.pending_web_search_ids.len() != 1 {
                         return Err("Kimi web search tool result is orphaned".into());
                     }
+                    let id = self
+                        .pending_web_search_ids
+                        .iter()
+                        .next()
+                        .cloned()
+                        .expect("one pending web search id");
                     self.pending_web_search_ids.clear();
+                    obj.get_mut("content_block")
+                        .and_then(Value::as_object_mut)
+                        .expect("validated content block")
+                        .insert("tool_use_id".into(), Value::String(id));
                 }
                 self.has_web_search_result = true;
             }
-            if block_type == Some("thinking") {
+            if block_type.as_deref() == Some("thinking") {
                 let block = obj
                     .get("content_block")
                     .and_then(Value::as_object)
@@ -267,7 +289,7 @@ impl KimiServerToolFilter {
                 });
                 return Ok(Vec::new());
             }
-            if block_type == Some("text")
+            if block_type.as_deref() == Some("text")
                 && obj
                     .get("content_block")
                     .and_then(Value::as_object)
@@ -277,7 +299,7 @@ impl KimiServerToolFilter {
             {
                 self.has_terminal_text = true;
             }
-            if block_type == Some("tool_use") {
+            if block_type.as_deref() == Some("tool_use") {
                 self.has_client_tool_use = true;
             }
             if let Some(obj_map) = obj.as_object_mut() {
@@ -1789,13 +1811,26 @@ mod tests {
         assert!(text.contains("server_tool_use"));
         assert!(!text.contains("srv_other"));
         assert!(text.contains("web_search_tool_result"));
-        assert!(text.contains("\"tool_use_id\":\"srv_result_1\""));
+        assert!(text.contains("\"tool_use_id\":\"srv_1\""));
         assert!(!text.contains("\"type\":\"thinking\""));
         assert!(text.contains("\"index\":3"));
         assert!(text.contains("\"text\":\"OK\""));
         assert_eq!(filter.dropped(), 2);
         assert_eq!(filter.dropped_server_tools(), 1);
         assert_eq!(filter.dropped_empty_thinking(), 1);
+
+        let missing_ids = concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"name\":\"web_search\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"content\":[]}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut filter = KimiServerToolFilter::new();
+        let text = String::from_utf8(filter.feed(missing_ids.as_bytes()).unwrap()).unwrap();
+        assert!(text.contains("\"id\":\"srvtoolu_kimi_0\""));
+        assert!(text.contains("\"tool_use_id\":\"srvtoolu_kimi_0\""));
     }
 
     #[test]
