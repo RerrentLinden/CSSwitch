@@ -85,7 +85,7 @@ mkdir -p "$OUTER_HOME/.claude-science/runtime"
 mkdir -p "$OUTER_HOME/.ssh"
 printf 'must-not-copy\n' > "$OUTER_HOME/.claude-science/runtime/real-user-sentinel"
 printf 'Host test-only\n  HostName 127.0.0.1\n' > "$OUTER_HOME/.ssh/config"
-printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nif [ -n "${CAPTURE_ENV:-}" ]; then printf "PATH=%%s\\nSSH_CONFIG=%%s\\nSSH_HOSTS=%%s\\nHOME=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "${CSSWITCH_SYSTEM_SSH_HOSTS:-}" "$HOME" > "$CAPTURE_ENV"; fi\nexit 0\n' > "$FAKE_CAPTURE"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nif [ -n "${CAPTURE_ENV:-}" ]; then printf "PATH=%%s\\nSSH_CONFIG=%%s\\nSSH_HOSTS=%%s\\nHOME=%%s\\nHTTPS_PROXY=%%s\\nhttps_proxy=%%s\\nNO_PROXY=%%s\\nno_proxy=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "${CSSWITCH_SYSTEM_SSH_HOSTS:-}" "$HOME" "${HTTPS_PROXY:-}" "${https_proxy:-}" "${NO_PROXY:-}" "${no_proxy:-}" > "$CAPTURE_ENV"; fi\nexit 0\n' > "$FAKE_CAPTURE"
 chmod +x "$FAKE_CAPTURE"
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=1 CSSWITCH_SYSTEM_SSH_HOSTS="test-only second-alias" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && grep -qx -- '--host' "$CAPTURE_FILE" && grep -qx -- '127.0.0.1' "$CAPTURE_FILE" && grep -qx -- '--sandbox-port' "$CAPTURE_FILE" && grep -qx -- '9941' "$CAPTURE_FILE"; then ok "launch pins loopback host and explicit Science preview port"; else no "launch omitted explicit loopback/preview port (rc=$rc): $out"; fi
@@ -100,6 +100,8 @@ mkdir "$OPAQUE_SANDBOX/.claude-science/conda"
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$OPAQUE_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CSSWITCH_RUNTIME_VERSION_PRECHECKED=1 CSSWITCH_SCIENCE_OPAQUE_BINDINGS="$OPAQUE_BINDINGS" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9946 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "opaque root 启动绑定已变化"; then ok "launch rejects opaque-root rebind immediately before Science serve"; else no "launch accepted rebound opaque root (rc=$rc): $out"; fi
 if grep -Fq "PATH=$ROOT/scripts/ssh-bridge:" "$CAPTURE_ENV" && grep -Fxq "SSH_CONFIG=$OUTER_HOME/.ssh/config" "$CAPTURE_ENV" && grep -Fxq "SSH_HOSTS=test-only second-alias" "$CAPTURE_ENV" && grep -Fxq "HOME=$T/vh-capture" "$CAPTURE_ENV"; then ok "launch scopes SSH bridge to the isolated Science environment"; else no "launch omitted isolated SSH bridge environment"; fi
+EXPECTED_NO_PROXY="127.0.0.1,localhost,::1,pubmed.mcp.claude.com,hcls.mcp.claude.com"
+if grep -Fxq "NO_PROXY=$EXPECTED_NO_PROXY" "$CAPTURE_ENV" && grep -Fxq "no_proxy=$EXPECTED_NO_PROXY" "$CAPTURE_ENV" && grep -Fxq "HTTPS_PROXY=http://127.0.0.1:18991" "$CAPTURE_ENV" && grep -Fxq "https_proxy=http://127.0.0.1:18991" "$CAPTURE_ENV" && ! grep -E '^NO_PROXY=.*claude\.ai|^no_proxy=.*claude\.ai' "$CAPTURE_ENV" >/dev/null; then ok "launch bypasses only anonymous official MCP hosts and keeps other HTTPS on fast-fail"; else no "launch widened or omitted the isolated Science proxy boundary"; fi
 SANDBOX_SSH_CONFIG="$T/vh-capture/.ssh/config"
 SANDBOX_SSH_MODE="$(stat -f '%Lp' "$SANDBOX_SSH_CONFIG" 2>/dev/null || true)"
 if [ -f "$SANDBOX_SSH_CONFIG" ] && [ ! -L "$SANDBOX_SSH_CONFIG" ] && [ "$SANDBOX_SSH_MODE" = "600" ]; then ok "opt-in creates a narrow regular 0600 sandbox SSH config"; else no "opt-in did not create a safe sandbox SSH config"; fi

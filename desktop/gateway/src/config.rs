@@ -19,6 +19,9 @@ pub struct GatewayConfig {
     /// themselves remain in CSSwitch private auth files.
     pub codex_state_root: Option<std::path::PathBuf>,
     pub(crate) codex_contract: Option<crate::provider_contracts::CodexRuntimeContract>,
+    /// Encrypted Anthropic thinking continuity state. Formal managed Kimi and
+    /// DeepSeek launches require it; scratch and unrelated providers leave it disabled.
+    pub(crate) reasoning_store: Option<std::sync::Arc<crate::reasoning_state::ReasoningStore>>,
     /// Opaque per-spawn identity supplied by the Tauri process manager.
     /// Standalone invocations may leave it empty, but managed launches always set it.
     pub launch_id: String,
@@ -37,6 +40,8 @@ pub struct GatewayConfig {
 }
 
 pub const GATEWAY_INTENT_ENV: &str = "CSSWITCH_GATEWAY_INTENT";
+pub const REASONING_STATE_DIR_ENV: &str = "CSSWITCH_REASONING_STATE_DIR";
+pub const REASONING_PROFILE_SCOPE_ENV: &str = "CSSWITCH_REASONING_PROFILE_SCOPE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayIntent {
@@ -229,6 +234,39 @@ fn upstream_url_for(
     }
 }
 
+fn contract_requires_reasoning_continuity(contract_id: &str) -> bool {
+    matches!(contract_id, "kimi-anthropic-relay" | "deepseek-native")
+}
+
+fn reasoning_state_path(
+    managed_launch: bool,
+    intent: GatewayIntent,
+    contract_id: &str,
+    raw: Option<std::ffi::OsString>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if !managed_launch
+        || intent != GatewayIntent::Formal
+        || !contract_requires_reasoning_continuity(contract_id)
+    {
+        return Ok(None);
+    }
+    let path = raw.map(std::path::PathBuf::from).ok_or_else(|| {
+        format!("formal managed {contract_id} gateway 缺少 {REASONING_STATE_DIR_ENV}")
+    })?;
+    if !path.is_absolute()
+        || path == std::path::Path::new("/")
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(format!("{REASONING_STATE_DIR_ENV} 必须是安全的绝对目录"));
+    }
+    Ok(Some(path))
+}
+
 impl GatewayConfig {
     pub fn from_env_args(args: Vec<String>) -> Result<Self, String> {
         let mut provider = "deepseek".to_string();
@@ -418,6 +456,44 @@ impl GatewayConfig {
                 GatewayIntent::ScratchModels => {}
             }
         }
+        let reasoning_store = reasoning_state_path(
+            managed_launch_id,
+            intent,
+            &provider_contract.contract_id,
+            std::env::var_os(REASONING_STATE_DIR_ENV),
+        )?
+        .map(|state_dir| {
+            let credential = api_key
+                .as_deref()
+                .ok_or("thinking continuity credential is unavailable")?;
+            let profile_scope = std::env::var(REASONING_PROFILE_SCOPE_ENV)
+                .ok()
+                .filter(|value| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+                .ok_or("thinking continuity profile scope is unavailable")?;
+            let catalog_fp = static_model_resolver
+                .as_ref()
+                .ok_or("thinking continuity model catalog is unavailable")?
+                .catalog_fp();
+            let profile_scope = format!(
+                "profile={profile_scope};provider-catalog={};model-catalog={catalog_fp}",
+                provider_contract.catalog_digest,
+            );
+            crate::reasoning_state::ReasoningStore::open(
+                &state_dir,
+                credential,
+                &provider_contract.contract_id,
+                &upstream_url,
+                &profile_scope,
+            )
+            .map(std::sync::Arc::new)
+            .map_err(|error| format!("thinking continuity store unavailable: {error}"))
+        })
+        .transpose()?;
         Ok(Self {
             provider,
             port: port.ok_or("--port 必填")?,
@@ -432,6 +508,7 @@ impl GatewayConfig {
             shim_mode: shim.to_string(),
             codex_state_root,
             codex_contract,
+            reasoning_store,
             launch_id,
             skill_data_dir,
             skill_bridge_dir,
@@ -445,7 +522,7 @@ impl GatewayConfig {
 mod tests {
     use super::{
         canonical_shim_mode, joined_endpoints, normalize_openai_base, openai_endpoint,
-        provider_supported, shim_mode, upstream_url_for,
+        provider_supported, reasoning_state_path, shim_mode, upstream_url_for, GatewayIntent,
     };
     use crate::provider_contracts::EndpointJoin;
 
@@ -493,6 +570,51 @@ mod tests {
         assert!(!provider_supported("relay", "rewrite"));
         assert!(provider_supported("codex", "off"));
         assert!(!provider_supported("codex", "rewrite"));
+    }
+
+    #[test]
+    fn reasoning_state_is_required_only_for_exact_formal_managed_anthropic_contracts() {
+        for contract in ["kimi-anthropic-relay", "deepseek-native"] {
+            assert!(reasoning_state_path(true, GatewayIntent::Formal, contract, None).is_err());
+            assert!(reasoning_state_path(
+                true,
+                GatewayIntent::Formal,
+                contract,
+                Some("relative/state".into())
+            )
+            .is_err());
+            assert!(reasoning_state_path(
+                true,
+                GatewayIntent::Formal,
+                contract,
+                Some("/private/tmp/../unsafe".into())
+            )
+            .is_err());
+            assert_eq!(
+                reasoning_state_path(
+                    true,
+                    GatewayIntent::Formal,
+                    contract,
+                    Some("/private/tmp/csswitch-reasoning-test".into())
+                )
+                .unwrap(),
+                Some(std::path::PathBuf::from(
+                    "/private/tmp/csswitch-reasoning-test"
+                ))
+            );
+            assert_eq!(
+                reasoning_state_path(true, GatewayIntent::ScratchMessage, contract, None).unwrap(),
+                None
+            );
+            assert_eq!(
+                reasoning_state_path(false, GatewayIntent::Formal, contract, None).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            reasoning_state_path(true, GatewayIntent::Formal, "anthropic-relay", None).unwrap(),
+            None
+        );
     }
 
     #[test]

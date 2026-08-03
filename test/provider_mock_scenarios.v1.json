@@ -63,7 +63,7 @@
               "equals": {
                 "/model": "deepseek-v4-pro",
                 "/max_tokens": 65536,
-                "/thinking/type": "adaptive"
+                "/thinking/type": "auto"
               }
             }
           },
@@ -78,9 +78,10 @@
             "headers": {"x-api-key": {"equals_secret": "provider_key"}},
             "body": {
               "json": true,
-              "required": ["/model", "/messages", "/tools"],
+              "required": ["/model", "/messages", "/tools", "/tools/1/type", "/tools/2/name", "/tools/3/name", "/tools/4/name", "/tools/5/name"],
+              "absent": ["/tools/6", "/mcp_servers"],
               "types": {"/tools": "array"},
-              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536}
+              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536, "/tools/1/type": "web_search_20250305", "/tools/2/name": "web_search", "/tools/3/name": "python", "/tools/4/name": "bash", "/tools/5/name": "compute"}
             }
           },
           "action": {"type": "dsml", "model": "deepseek-v4-pro"}
@@ -94,9 +95,10 @@
             "headers": {"x-api-key": {"equals_secret": "provider_key"}},
             "body": {
               "json": true,
-              "required": ["/model", "/messages", "/tools"],
+              "required": ["/model", "/messages", "/tools", "/tools/1/type", "/tools/2/name", "/tools/3/name", "/tools/4/name", "/tools/5/name"],
+              "absent": ["/tools/6", "/mcp_servers"],
               "types": {"/tools": "array"},
-              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536}
+              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536, "/tools/1/type": "web_search_20250305", "/tools/2/name": "web_search", "/tools/3/name": "python", "/tools/4/name": "bash", "/tools/5/name": "compute"}
             }
           },
           "action": {"type": "dsml", "model": "deepseek-v4-pro"}
@@ -110,8 +112,9 @@
             "headers": {"x-api-key": {"equals_secret": "provider_key"}},
             "body": {
               "json": true,
-              "required": ["/model", "/messages", "/tools", "/stream"],
-              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536, "/stream": true}
+              "required": ["/model", "/messages", "/tools", "/stream", "/tools/1/type", "/tools/2/name", "/tools/3/name", "/tools/4/name", "/tools/5/name"],
+              "absent": ["/tools/6", "/mcp_servers"],
+              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536, "/stream": true, "/tools/1/type": "web_search_20250305", "/tools/2/name": "web_search", "/tools/3/name": "python", "/tools/4/name": "bash", "/tools/5/name": "compute"}
             }
           },
           "action": {"type": "dsml", "stream": true, "model": "deepseek-v4-pro"}
@@ -380,7 +383,7 @@
       ]
     },
     "installed_relay_matrix": {
-      "description": "Relay discovery, force, thinking, schema normalization, Kimi request filtering, reuse, and restart.",
+      "description": "Relay discovery, force, thinking, schema normalization, exact-contract Kimi typed-tool policy, response filtering, reuse, and restart.",
       "phases": ["discovery", "scratch", "formal", "reuse", "restart"],
       "steps": [
         {
@@ -389,7 +392,7 @@
           "method": "GET",
           "path": "/relay/v1/models",
           "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}, "anthropic-version": {"equals": "2023-06-01"}}},
-          "action": {"type": "models_json", "models": ["MiniMax-M2", "kimi-k2.7-code"]}
+          "action": {"type": "models_json", "models": ["MiniMax-M2", "k3-256k"]}
         },
         {
           "id": "relay-scratch-force",
@@ -426,12 +429,12 @@
             "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}},
             "body": {
               "json": true,
-              "required": ["/tools/0/name", "/tools/1/name"],
-              "absent": ["/tools/2", "/tool_choice"],
-              "equals": {"/model": "kimi-k2.7-code", "/thinking/type": "enabled", "/thinking/budget_tokens": 1024, "/tools/0/name": "lookup", "/tools/1/name": "empty", "/tools/0/input_schema/type": "object"}
+              "required": ["/tools/0/name", "/tools/1/name", "/tools/2/type", "/tools/3/name", "/tools/4/name", "/tools/5/name", "/tools/6/name"],
+              "absent": ["/tools/7", "/mcp_servers", "/tool_choice"],
+              "equals": {"/model": "k3-256k", "/thinking/type": "enabled", "/thinking/budget_tokens": 1024, "/tools/0/name": "lookup", "/tools/1/name": "empty", "/tools/2/type": "web_search_20250305", "/tools/3/name": "web_search", "/tools/4/name": "python", "/tools/5/name": "bash", "/tools/6/name": "compute", "/tools/0/input_schema/type": "object"}
             }
           },
-          "action": {"type": "anthropic_json", "model": "kimi-k2.7-code"}
+          "action": {"type": "anthropic_json", "model": "k3-256k"}
         },
         {
           "id": "relay-formal-kimi-stream",
@@ -440,7 +443,7 @@
           "path": "/relay/v1/messages",
           "checks": {
             "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}},
-            "body": {"json": true, "absent": ["/tool_choice"], "equals": {"/model": "kimi-k2.7-code", "/stream": true, "/thinking/type": "enabled", "/thinking/budget_tokens": 1024}}
+            "body": {"json": true, "absent": ["/tool_choice"], "equals": {"/model": "k3-256k", "/stream": true, "/thinking/type": "enabled", "/thinking/budget_tokens": 1024}}
           },
           "action": {"type": "kimi_sse"}
         },

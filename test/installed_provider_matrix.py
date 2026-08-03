@@ -155,9 +155,9 @@ CASE_DEFINITIONS: Dict[str, CaseDefinition] = {
     ),
     "kimi": CaseDefinition(
         "kimi", "kimi", "Installed Kimi", "cn_official",
-        "anthropic", "relay", "off", "kimi-k2.7-code", "loopback",
+        "anthropic", "relay", "off", "k3-256k", "loopback",
         "/relay", "/relay/v1/messages", "/relay/v1/models",
-        "installed_relay_matrix", "relay-formal-kimi-thinking-filter", "stream-tools", "kimi-k2.7-code",
+        "installed_relay_matrix", "relay-formal-kimi-thinking-filter", "stream-tools", "k3-256k",
     ),
     "siliconflow": CaseDefinition(
         "siliconflow", "siliconflow", "Installed SiliconFlow", "cn_official",
@@ -363,12 +363,20 @@ def build_case_scenario(case: CaseDefinition) -> Scenario:
             body = item["checks"].setdefault("body", {})
             body.setdefault("required", []).extend(
                 pointer
-                for pointer in ("/tools/0/name", "/tools/1/name")
+                for pointer in (
+                    "/tools/0/name",
+                    "/tools/1/name",
+                    "/tools/2/type",
+                    "/tools/3/name",
+                    "/tools/4/name",
+                    "/tools/5/name",
+                    "/tools/6/name",
+                )
                 if pointer not in body.setdefault("required", [])
             )
             body.setdefault("absent", []).extend(
                 pointer
-                for pointer in ("/tools/2", "/tool_choice")
+                for pointer in ("/tools/7", "/mcp_servers", "/tool_choice")
                 if pointer not in body.setdefault("absent", [])
             )
             body.setdefault("equals", {})["/stream"] = True
@@ -1775,6 +1783,20 @@ esac
                         "input_schema": {},
                     }
                 )
+            if self.case.case_id == "kimi" or self.case.adapter == "deepseek":
+                payload["tools"].extend([
+                    {"type": "web_search_20250305", "name": "web_search"},
+                    {"name": "web_search", "input_schema": {"type": "object"}},
+                    {"name": "python", "input_schema": {"type": "object"}},
+                    {"name": "bash", "input_schema": {"type": "object"}},
+                    {"name": "compute", "input_schema": {"type": "object"}},
+                    {"type": "web_fetch_20260209", "name": "web_fetch"},
+                    {"type": "code_execution_20250825", "name": "code_execution"},
+                    {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
+                ])
+                payload["mcp_servers"] = [
+                    {"type": "url", "url": "https://example.invalid"}
+                ]
             payload["tool_choice"] = {"type": "tool", "name": "lookup"}
         if self.case.case_id in {"qwen-tools", "responses"}:
             payload["messages"] = [

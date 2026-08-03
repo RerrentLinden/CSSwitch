@@ -365,7 +365,7 @@ class SourceGateRuntime(unittest.TestCase):
             if plan.suite["id"] == "SUITE-RUST-DESKTOP"
         )
         bound = source_runtime._source_observation_size_bound(desktop)
-        self.assertEqual(len(desktop.expected_test_ids), 445)
+        self.assertEqual(len(desktop.expected_test_ids), 450)
         self.assertGreater(bound, 64 * 1024)
         self.assertLessEqual(
             bound,

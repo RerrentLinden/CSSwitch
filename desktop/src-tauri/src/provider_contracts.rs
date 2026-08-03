@@ -350,7 +350,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 },
             };
             let expected_auth_scheme = match contract.id.as_str() {
-                "opencode-go-anthropic" => AuthScheme::Bearer,
+                "kimi-anthropic-relay" | "opencode-go-anthropic" => AuthScheme::Bearer,
                 _ => match contract.adapter.as_str() {
                     "deepseek" => AuthScheme::AnthropicXApiKey,
                     "relay" => AuthScheme::AnthropicDual,
@@ -430,7 +430,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     Transport::AnthropicMessages,
                     EndpointPolicy::ProfileRequired,
                     EndpointJoin::AnthropicV1,
-                    AuthScheme::AnthropicDual,
+                    AuthScheme::Bearer,
                     "enabled",
                 ),
                 "custom-anthropic" => (

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,10 +11,11 @@ use serde_json::{json, Map, Value};
 use crate::auth::{strip_path_secret, AuthResult};
 use crate::config::GatewayConfig;
 use crate::{
-    anthropic_compat::{self, AnthropicMetadata, KimiServerToolFilter},
+    anthropic_compat::{self, AnthropicMetadata},
     codex_auth, codex_models, codex_protocol, codex_transport, connect,
     dsml_shim::{DsmlDetector, DsmlStreamRewriter},
     messages, models, openai_chat, openai_responses, policy,
+    reasoning_state::{ReasoningStore, RestorePolicy},
 };
 
 const BRIDGE_REPLAY_WINDOW_SECONDS: u64 = 185;
@@ -32,6 +33,12 @@ struct RequestHead {
     method: String,
     target: String,
     headers: HashMap<String, String>,
+}
+
+impl RequestHead {
+    fn anthropic_transport(&self) -> Result<messages::AnthropicTransport, String> {
+        messages::AnthropicTransport::from_inbound(&self.target, &self.headers)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -77,9 +84,16 @@ impl RequestNonceGenerator {
 }
 
 enum StreamFilter {
-    Kimi(KimiServerToolFilter),
+    Kimi(anthropic_compat::KimiServerToolFilter),
     DsmlDetect(DsmlDetector),
     DsmlRewrite(DsmlStreamRewriter),
+}
+
+struct ContinuityCapture {
+    store: Arc<ReasoningStore>,
+    request: Value,
+    model: String,
+    policy: RestorePolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,14 +208,15 @@ fn write_response(
     reason: &str,
     content_type: &str,
     body: &[u8],
-) {
-    let _ = write!(
+) -> bool {
+    write!(
         stream,
         "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
-    );
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
+    )
+    .and_then(|_| stream.write_all(body))
+    .and_then(|_| stream.flush())
+    .is_ok()
 }
 
 fn write_json(stream: &mut TcpStream, status: u16, reason: &str, value: Value) {
@@ -284,6 +299,15 @@ fn not_found_json(stream: &mut TcpStream, path: &str) {
 
 fn api_error_json(stream: &mut TcpStream, status: u16, detail: &str) {
     typed_error_json(stream, status, status_reason(status), "api_error", detail);
+}
+
+fn report_upstream_failure(
+    stream: &mut TcpStream,
+    operation: &'static str,
+    error: &messages::UpstreamError,
+) {
+    eprintln!("{}", messages::upstream_failure_metadata(operation, error));
+    api_error_json(stream, error.status, &error.detail);
 }
 
 fn upstream_protocol_error_json(stream: &mut TcpStream, detail: &str) {
@@ -508,15 +532,352 @@ fn sse_event(event: &str, data: &Value) -> Vec<u8> {
     .into_bytes()
 }
 
+#[cfg(test)]
 fn forward_stream_body<R, F>(
     upstream: &mut R,
     first: &[u8],
     filter: &mut Option<StreamFilter>,
-    mut emit: F,
+    emit: F,
 ) -> StreamTermination
 where
     R: Read,
     F: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    forward_stream_body_with_completion(upstream, first, filter, emit, || Ok(None))
+}
+
+type StreamRollback = Box<dyn FnOnce() -> Result<(), String>>;
+
+const MAX_CONTINUITY_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct AnthropicStreamMessageCollector {
+    message: Option<Value>,
+    open_block: Option<usize>,
+    partial_tool_input: HashMap<usize, String>,
+    total_bytes: usize,
+}
+
+impl AnthropicStreamMessageCollector {
+    fn feed(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(bytes.len())
+            .filter(|total| *total <= MAX_CONTINUITY_STREAM_BYTES)
+            .ok_or_else(|| "thinking continuity stream exceeds the bounded buffer".to_string())?;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            if remaining.iter().all(u8::is_ascii_whitespace) {
+                break;
+            }
+            let end = sse_frame_end(remaining)
+                .ok_or_else(|| "thinking continuity received a partial SSE frame".to_string())?;
+            self.feed_frame(&remaining[..end])?;
+            remaining = &remaining[end..];
+        }
+        Ok(())
+    }
+
+    fn feed_frame(&mut self, frame: &[u8]) -> Result<(), String> {
+        let text = std::str::from_utf8(frame)
+            .map_err(|_| "thinking continuity SSE is not valid UTF-8".to_string())?;
+        let mut data_lines = Vec::new();
+        for line in text.lines() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("data:") {
+                data_lines.push(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        if data_lines.is_empty() {
+            return Ok(());
+        }
+        let event: Value = serde_json::from_str(&data_lines.join("\n"))
+            .map_err(|_| "thinking continuity SSE data is not valid JSON".to_string())?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("ping") => Ok(()),
+            Some("message_start") => self.start_message(&event),
+            Some("content_block_start") => self.start_block(&event),
+            Some("content_block_delta") => self.apply_block_delta(&event),
+            Some("content_block_stop") => self.stop_block(&event),
+            Some("message_delta") => self.apply_message_delta(&event),
+            Some(other) => Err(format!(
+                "thinking continuity cannot reconstruct SSE event {other}"
+            )),
+            None => Err("thinking continuity SSE event type is missing".into()),
+        }
+    }
+
+    fn start_message(&mut self, event: &Value) -> Result<(), String> {
+        if self.message.is_some() {
+            return Err("thinking continuity message started twice".into());
+        }
+        let mut message = event
+            .get("message")
+            .and_then(Value::as_object)
+            .cloned()
+            .ok_or_else(|| "thinking continuity message_start is invalid".to_string())?;
+        match message.get("content") {
+            None => {
+                message.insert("content".into(), Value::Array(Vec::new()));
+            }
+            Some(Value::Array(content)) if content.is_empty() => {}
+            _ => return Err("thinking continuity message_start content is invalid".into()),
+        }
+        self.message = Some(Value::Object(message));
+        Ok(())
+    }
+
+    fn start_block(&mut self, event: &Value) -> Result<(), String> {
+        if self.open_block.is_some() {
+            return Err("thinking continuity content blocks overlap".into());
+        }
+        let index = event_index_usize(event)?;
+        let mut block = event
+            .get("content_block")
+            .and_then(Value::as_object)
+            .cloned()
+            .ok_or_else(|| "thinking continuity content block is invalid".to_string())?;
+        if block.get("type").and_then(Value::as_str) == Some("thinking") {
+            for field in ["thinking", "signature"] {
+                match block.get(field) {
+                    None => {
+                        block.insert(field.into(), Value::String(String::new()));
+                    }
+                    Some(Value::String(_)) => {}
+                    Some(_) => {
+                        return Err(format!("thinking continuity {field} field is invalid"));
+                    }
+                }
+            }
+        }
+        let content = self.message_content_mut()?;
+        if index != content.len() {
+            return Err("thinking continuity content block index is invalid".into());
+        }
+        content.push(Value::Object(block));
+        self.open_block = Some(index);
+        Ok(())
+    }
+
+    fn apply_block_delta(&mut self, event: &Value) -> Result<(), String> {
+        let index = event_index_usize(event)?;
+        if self.open_block != Some(index) {
+            return Err("thinking continuity content block delta is out of order".into());
+        }
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "thinking continuity content block delta is invalid".to_string())?;
+        let delta_type = delta
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "thinking continuity content block delta type is missing".to_string())?;
+        match delta_type {
+            "text_delta" => {
+                let value = delta
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "thinking continuity text delta is invalid".to_string())?;
+                append_block_text(self.message_content_mut()?, index, "text", value)
+            }
+            "thinking_delta" => {
+                let value = delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "thinking continuity thinking delta is invalid".to_string())?;
+                append_block_text(self.message_content_mut()?, index, "thinking", value)
+            }
+            "signature_delta" => {
+                let value = delta
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "thinking continuity signature delta is invalid".to_string())?;
+                append_block_text(self.message_content_mut()?, index, "signature", value)
+            }
+            "input_json_delta" => {
+                let value = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "thinking continuity input JSON delta is invalid".to_string())?;
+                let partial = self.partial_tool_input.entry(index).or_default();
+                if partial.len().saturating_add(value.len()) > MAX_CONTINUITY_STREAM_BYTES {
+                    return Err("thinking continuity tool input exceeds the bounded buffer".into());
+                }
+                partial.push_str(value);
+                Ok(())
+            }
+            "citations_delta" => {
+                let citation = delta
+                    .get("citation")
+                    .cloned()
+                    .ok_or_else(|| "thinking continuity citation delta is invalid".to_string())?;
+                let content = self.message_content_mut()?;
+                let block = content
+                    .get_mut(index)
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| "thinking continuity content block is invalid".to_string())?;
+                let citations = block
+                    .entry("citations")
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .ok_or_else(|| "thinking continuity citations are invalid".to_string())?;
+                citations.push(citation);
+                Ok(())
+            }
+            _ => Err(format!(
+                "thinking continuity cannot reconstruct content delta {delta_type}"
+            )),
+        }
+    }
+
+    fn stop_block(&mut self, event: &Value) -> Result<(), String> {
+        let index = event_index_usize(event)?;
+        if self.open_block != Some(index) {
+            return Err("thinking continuity content block stop is out of order".into());
+        }
+        if let Some(partial) = self.partial_tool_input.remove(&index) {
+            let input: Value = serde_json::from_str(&partial)
+                .map_err(|_| "thinking continuity tool input JSON is invalid".to_string())?;
+            let block = self
+                .message_content_mut()?
+                .get_mut(index)
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| "thinking continuity content block is invalid".to_string())?;
+            block.insert("input".into(), input);
+        }
+        self.open_block = None;
+        Ok(())
+    }
+
+    fn apply_message_delta(&mut self, event: &Value) -> Result<(), String> {
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "thinking continuity message delta is invalid".to_string())?;
+        let message = self
+            .message
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| "thinking continuity message is unavailable".to_string())?;
+        for (key, value) in delta {
+            message.insert(key.clone(), value.clone());
+        }
+        if let Some(usage) = event.get("usage") {
+            message.insert("usage".into(), usage.clone());
+        }
+        Ok(())
+    }
+
+    fn message_content_mut(&mut self) -> Result<&mut Vec<Value>, String> {
+        self.message
+            .as_mut()
+            .and_then(|message| message.get_mut("content"))
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "thinking continuity message content is unavailable".to_string())
+    }
+
+    fn finish(self) -> Result<Value, String> {
+        if self.open_block.is_some() || !self.partial_tool_input.is_empty() {
+            return Err("thinking continuity stream ended with an open content block".into());
+        }
+        self.message
+            .ok_or_else(|| "thinking continuity stream has no message".to_string())
+    }
+}
+
+fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
+    let lf = buffer
+        .windows(2)
+        .position(|part| part == b"\n\n")
+        .map(|index| index + 2);
+    let crlf = buffer
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .map(|index| index + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn event_index_usize(event: &Value) -> Result<usize, String> {
+    event
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| "thinking continuity SSE block index is invalid".to_string())
+}
+
+fn append_block_text(
+    content: &mut [Value],
+    index: usize,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    let target = content
+        .get_mut(index)
+        .and_then(Value::as_object_mut)
+        .and_then(|block| block.get_mut(field))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("thinking continuity {field} field is invalid"))?;
+    if target.len().saturating_add(value.len()) > MAX_CONTINUITY_STREAM_BYTES {
+        return Err(format!(
+            "thinking continuity {field} exceeds the bounded buffer"
+        ));
+    }
+    let mut joined = String::with_capacity(target.len() + value.len());
+    joined.push_str(target);
+    joined.push_str(value);
+    content[index]
+        .as_object_mut()
+        .expect("validated content block")
+        .insert(field.into(), Value::String(joined));
+    Ok(())
+}
+
+#[cfg(test)]
+fn forward_stream_body_with_completion<R, F, C>(
+    upstream: &mut R,
+    first: &[u8],
+    filter: &mut Option<StreamFilter>,
+    emit: F,
+    mut on_complete: C,
+) -> StreamTermination
+where
+    R: Read,
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+    C: FnMut() -> Result<Option<StreamRollback>, String>,
+{
+    let mut success_rollback = None;
+    forward_stream_body_with_capture(
+        upstream,
+        first,
+        filter,
+        None,
+        &mut success_rollback,
+        emit,
+        move |_| on_complete(),
+    )
+}
+
+fn forward_stream_body_with_capture<R, F, C>(
+    upstream: &mut R,
+    first: &[u8],
+    filter: &mut Option<StreamFilter>,
+    mut collector: Option<&mut AnthropicStreamMessageCollector>,
+    success_rollback: &mut Option<StreamRollback>,
+    mut emit: F,
+    mut on_complete: C,
+) -> StreamTermination
+where
+    R: Read,
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+    C: FnMut(Option<Value>) -> Result<Option<StreamRollback>, String>,
 {
     let mut validator = crate::anthropic_sse::Validator::default();
 
@@ -528,7 +889,10 @@ where
         }
     };
 
-    let process = |chunk: &[u8], validator: &mut crate::anthropic_sse::Validator, emit: &mut F| {
+    let process = |chunk: &[u8],
+                   validator: &mut crate::anthropic_sse::Validator,
+                   collector: &mut Option<&mut AnthropicStreamMessageCollector>,
+                   emit: &mut F| {
         let validated = match validator.feed(chunk) {
             Ok(validated) => validated,
             Err(_) => {
@@ -538,6 +902,16 @@ where
                 return Some(StreamTermination::ProtocolError);
             }
         };
+        if !validated.bytes.is_empty()
+            && collector
+                .as_deref_mut()
+                .is_some_and(|collector| collector.feed(&validated.bytes).is_err())
+        {
+            if emit(&stream_error_event("thinking continuity capture failed")).is_err() {
+                return Some(StreamTermination::DownstreamWriteError);
+            }
+            return Some(StreamTermination::ProtocolError);
+        }
         if !validated.bytes.is_empty() && emit(&validated.bytes).is_err() {
             return Some(StreamTermination::DownstreamWriteError);
         }
@@ -553,7 +927,7 @@ where
         },
         None => first.to_vec(),
     };
-    if let Some(termination) = process(&first, &mut validator, &mut emit) {
+    if let Some(termination) = process(&first, &mut validator, &mut collector, &mut emit) {
         return termination;
     }
 
@@ -566,16 +940,53 @@ where
                         Ok(tail) => tail,
                         Err(_) => return filter_error(&mut emit),
                     };
-                    if let Some(termination) = process(&tail, &mut validator, &mut emit) {
+                    if let Some(termination) =
+                        process(&tail, &mut validator, &mut collector, &mut emit)
+                    {
                         return termination;
                     }
                 }
                 return match validator.finish() {
                     Ok(terminal) => {
-                        if !terminal.is_empty() && emit(&terminal).is_err() {
-                            StreamTermination::DownstreamWriteError
-                        } else {
-                            StreamTermination::NormalEof
+                        let message = match collector.take() {
+                            Some(collector) => match std::mem::take(collector).finish() {
+                                Ok(message) => Some(message),
+                                Err(_) => {
+                                    if emit(&stream_error_event(
+                                        "thinking continuity capture failed",
+                                    ))
+                                    .is_err()
+                                    {
+                                        return StreamTermination::DownstreamWriteError;
+                                    }
+                                    return StreamTermination::ProtocolError;
+                                }
+                            },
+                            None => None,
+                        };
+                        match on_complete(message) {
+                            Ok(rollback) => {
+                                if !terminal.is_empty() && emit(&terminal).is_err() {
+                                    if let Some(rollback) = rollback {
+                                        if rollback().is_err() {
+                                            eprintln!("thinking continuity rollback failed");
+                                        }
+                                    }
+                                    StreamTermination::DownstreamWriteError
+                                } else {
+                                    *success_rollback = rollback;
+                                    StreamTermination::NormalEof
+                                }
+                            }
+                            Err(_) => {
+                                if emit(&stream_error_event("thinking continuity persist failed"))
+                                    .is_err()
+                                {
+                                    StreamTermination::DownstreamWriteError
+                                } else {
+                                    StreamTermination::ProtocolError
+                                }
+                            }
                         }
                     }
                     Err(_) => {
@@ -596,7 +1007,9 @@ where
                 } else {
                     buf[..n].to_vec()
                 };
-                if let Some(termination) = process(&chunk, &mut validator, &mut emit) {
+                if let Some(termination) =
+                    process(&chunk, &mut validator, &mut collector, &mut emit)
+                {
                     return termination;
                 }
             }
@@ -610,16 +1023,115 @@ where
     }
 }
 
+fn restore_continuity(
+    cfg: &GatewayConfig,
+    request: &mut Value,
+    model: &str,
+    policy: RestorePolicy,
+) -> Result<Option<ContinuityCapture>, String> {
+    let thinking_type = request
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str);
+    let Some(store) = cfg.reasoning_store.as_ref() else {
+        return Ok(None);
+    };
+    match thinking_type {
+        Some("disabled" | "none") if policy == RestorePolicy::DeepSeekToolUse => {}
+        Some(kind) if !matches!(kind, "disabled" | "none") => {
+            store.restore_request(request, model, policy)?;
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(ContinuityCapture {
+        store: Arc::clone(store),
+        request: request.clone(),
+        model: model.to_string(),
+        policy,
+    }))
+}
+
+fn restore_continuity_or_reject(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    request: &mut Value,
+    model: &str,
+    policy: RestorePolicy,
+) -> Result<Option<ContinuityCapture>, ()> {
+    restore_continuity(cfg, request, model, policy).map_err(|error| {
+        invalid_request_json(stream, &error);
+    })
+}
+
+fn commit_continuity(
+    capture: Option<ContinuityCapture>,
+    response: &Value,
+) -> Result<Option<crate::reasoning_state::CommittedEntry>, String> {
+    let Some(capture) = capture else {
+        return Ok(None);
+    };
+    let pending = capture.store.capture_message(
+        &capture.request,
+        response,
+        &capture.model,
+        capture.policy,
+    )?;
+    pending
+        .map(|pending| capture.store.commit(pending))
+        .transpose()
+}
+
+fn write_anthropic_response_with_continuity(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    capture: Option<ContinuityCapture>,
+) {
+    let committed = if capture.is_some() {
+        let response: Value = match serde_json::from_slice(body) {
+            Ok(response) => response,
+            Err(_) => {
+                api_error_json(
+                    stream,
+                    502,
+                    "thinking continuity response is not valid JSON",
+                );
+                return;
+            }
+        };
+        match commit_continuity(capture, &response) {
+            Ok(committed) => committed,
+            Err(_) => {
+                api_error_json(stream, 502, "thinking continuity persist failed");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if !write_response(stream, status, status_reason(status), content_type, body) {
+        if let Some(committed) = committed {
+            if committed.rollback().is_err() {
+                eprintln!("thinking continuity rollback failed");
+            }
+        }
+    }
+}
+
 fn handle_stream(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
     body: Vec<u8>,
+    transport: Option<&messages::AnthropicTransport>,
     mut filter: Option<StreamFilter>,
+    mut continuity: Option<ContinuityCapture>,
 ) {
-    let mut upstream = match messages::open_stream(cfg, body) {
+    let mut upstream = match messages::open_stream(cfg, body, transport) {
         Ok(upstream) => upstream,
         Err(error) => {
-            api_error_json(stream, error.status, &error.detail);
+            report_upstream_failure(stream, "open_stream", &error);
             return;
         }
     };
@@ -632,9 +1144,27 @@ fn handle_stream(
     {
         return;
     }
-    let termination = forward_stream_body(&mut upstream.response, &[], &mut filter, |chunk| {
-        write_chunk(stream, chunk)
-    });
+    let mut collector = continuity
+        .as_ref()
+        .map(|_| AnthropicStreamMessageCollector::default());
+    let mut success_rollback = None;
+    let termination = forward_stream_body_with_capture(
+        &mut upstream.response,
+        &[],
+        &mut filter,
+        collector.as_mut(),
+        &mut success_rollback,
+        |chunk| write_chunk(stream, chunk),
+        |message| {
+            let Some(capture) = continuity.take() else {
+                return Ok(None);
+            };
+            let message = message
+                .ok_or_else(|| "thinking continuity stream message is unavailable".to_string())?;
+            let committed = commit_continuity(Some(capture), &message)?;
+            Ok(committed.map(|committed| Box::new(move || committed.rollback()) as StreamRollback))
+        },
+    );
     match termination {
         StreamTermination::NormalEof => {
             if let Some(filter) = filter.as_ref() {
@@ -646,19 +1176,123 @@ fn handle_stream(
         | StreamTermination::ProtocolError => {}
         StreamTermination::DownstreamWriteError => return,
     }
-    let _ = stream.write_all(b"0\r\n\r\n");
-    let _ = stream.flush();
+    if stream
+        .write_all(b"0\r\n\r\n")
+        .and_then(|_| stream.flush())
+        .is_err()
+    {
+        if let Some(rollback) = success_rollback {
+            if rollback().is_err() {
+                eprintln!("thinking continuity rollback failed");
+            }
+        }
+    }
 }
 
-fn log_relay_metadata(metadata: &AnthropicMetadata, is_stream: bool, message_count: usize) {
+fn safe_relay_server_tool_type(tool_type: &str) -> &str {
+    if ["web_search_", "web_fetch_", "code_execution_"]
+        .iter()
+        .any(|prefix| {
+            tool_type.strip_prefix(prefix).is_some_and(|version| {
+                version.len() == 8 && version.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+    {
+        return tool_type;
+    }
+    match tool_type {
+        "mcp_toolset" | "mcp_servers" => tool_type,
+        value if value.starts_with("tool_search_tool_") => "tool_search_tool_*",
+        value if value.starts_with("advisor_") => "advisor_*",
+        _ => "other",
+    }
+}
+
+fn relay_server_tool_types(request: &Value) -> String {
+    let mut counts = BTreeMap::new();
+    for tool in request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(tool_type) = tool
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|tool_type| !tool_type.is_empty())
+        else {
+            continue;
+        };
+        *counts
+            .entry(safe_relay_server_tool_type(tool_type))
+            .or_insert(0_usize) += 1;
+    }
+    if counts.is_empty() {
+        "-".into()
+    } else {
+        counts
+            .into_iter()
+            .map(|(tool_type, count)| format!("{tool_type}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn relay_thinking_type(request: &Value) -> &'static str {
+    match request.pointer("/thinking/type").and_then(Value::as_str) {
+        Some("enabled") => "enabled",
+        Some("adaptive") => "adaptive",
+        Some("disabled") => "disabled",
+        Some("auto") => "auto",
+        Some(_) => "other",
+        None => "-",
+    }
+}
+
+fn log_relay_metadata(
+    metadata: &AnthropicMetadata,
+    request: &Value,
+    is_stream: bool,
+    message_count: usize,
+) {
     let rules = if metadata.rule_ids.is_empty() {
         "-".to_string()
     } else {
         metadata.rule_ids.join(",")
     };
     eprintln!(
-        "POST /v1/messages relay target={} stream={} msgs={} rules={}",
-        metadata.target_model, is_stream, message_count, rules
+        "POST /v1/messages relay target={} stream={} msgs={} thinking_type={} budget_tokens={:?} max_tokens={:?} server_tool_types={} dropped_server_tools={} rules={}",
+        metadata.target_model,
+        is_stream,
+        message_count,
+        relay_thinking_type(request),
+        request
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64),
+        request.get("max_tokens").and_then(Value::as_u64),
+        relay_server_tool_types(request),
+        metadata.dropped_server_tools,
+        rules
+    );
+}
+
+fn log_deepseek_metadata(
+    metadata: &policy::DeepSeekMetadata,
+    is_stream: bool,
+    message_count: usize,
+) {
+    let rules = if metadata.rule_ids.is_empty() {
+        "-".to_string()
+    } else {
+        metadata.rule_ids.join(",")
+    };
+    eprintln!(
+        "POST /v1/messages provider=deepseek target={} stream={} msgs={} dropped_server_tools={} rules={}",
+        metadata.target_model,
+        is_stream,
+        message_count,
+        metadata.dropped_server_tools,
+        rules
     );
 }
 
@@ -698,6 +1332,9 @@ fn known_tools_from_request(raw: &Value) -> Map<String, Value> {
         return out;
     };
     for tool in tools {
+        if !anthropic_compat::is_anthropic_client_tool(tool) {
+            continue;
+        }
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
         };
@@ -1316,6 +1953,7 @@ fn handle_messages(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
     body: Vec<u8>,
+    anthropic_transport: Option<&messages::AnthropicTransport>,
     request_nonces: Option<&RequestNonceGenerator>,
     _relay_models: &models::RelayModelCache,
     codex: CodexComponents<'_>,
@@ -1419,7 +2057,7 @@ fn handle_messages(
         if let Some(metadata) = responses_metadata.as_ref() {
             log_responses_metadata(&transformed, metadata, is_stream);
         }
-        match messages::post_nonstream(cfg, body) {
+        match messages::post_nonstream(cfg, body, None) {
             Ok(resp) => {
                 let openai_resp: Value = match serde_json::from_slice(&resp.body) {
                     Ok(v) => v,
@@ -1469,29 +2107,49 @@ fn handle_messages(
                     write_json(stream, 200, "OK", anthropic_resp);
                 }
             }
-            Err(e) => api_error_json(stream, e.status, &e.detail),
+            Err(e) => report_upstream_failure(stream, "post_nonstream", &e),
         }
         return;
     }
     if cfg.provider == "relay" {
-        let (transformed, metadata) = match anthropic_compat::transform_relay_request(
-            raw,
-            &target_model,
-            cfg.relay_thinking.as_deref(),
-            &cfg.upstream_url,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                invalid_request_json(stream, &e);
-                return;
+        let provider_contract_id = cfg
+            .provider_contract
+            .as_ref()
+            .map(|contract| contract.contract_id.as_str());
+        let (mut transformed, metadata) =
+            match anthropic_compat::transform_relay_request_for_contract(
+                raw,
+                &target_model,
+                cfg.relay_thinking.as_deref(),
+                &cfg.upstream_url,
+                provider_contract_id,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    invalid_request_json(stream, &e);
+                    return;
+                }
+            };
+        let continuity = if metadata.kimi_compatibility {
+            match restore_continuity_or_reject(
+                stream,
+                cfg,
+                &mut transformed,
+                &target_model,
+                RestorePolicy::KimiAll,
+            ) {
+                Ok(capture) => capture,
+                Err(()) => return,
             }
+        } else {
+            None
         };
         let message_count = transformed
             .get("messages")
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or(0);
-        log_relay_metadata(&metadata, is_stream, message_count);
+        log_relay_metadata(&metadata, &transformed, is_stream, message_count);
         let transformed = match serde_json::to_vec(&transformed) {
             Ok(body) => body,
             Err(e) => {
@@ -1500,17 +2158,22 @@ fn handle_messages(
             }
         };
         if is_stream {
-            let filter = if metadata.target_model.to_ascii_lowercase().contains("kimi") {
-                Some(StreamFilter::Kimi(KimiServerToolFilter::new()))
-            } else {
-                None
-            };
-            handle_stream(stream, cfg, transformed, filter);
+            let filter = metadata.kimi_compatibility.then(|| {
+                StreamFilter::Kimi(anthropic_compat::KimiServerToolFilter::new())
+            });
+            handle_stream(
+                stream,
+                cfg,
+                transformed,
+                anthropic_transport,
+                filter,
+                continuity,
+            );
             return;
         }
-        match messages::post_nonstream(cfg, transformed) {
+        match messages::post_nonstream(cfg, transformed, anthropic_transport) {
             Ok(mut resp) => {
-                if metadata.target_model.to_ascii_lowercase().contains("kimi") {
+                if metadata.kimi_compatibility {
                     resp.body = match anthropic_compat::filter_kimi_nonstream_response(&resp.body) {
                         Ok(body) => body,
                         Err(error) => {
@@ -1519,43 +2182,81 @@ fn handle_messages(
                         }
                     };
                 }
-                write_response(
+                write_anthropic_response_with_continuity(
                     stream,
                     resp.status,
-                    status_reason(resp.status),
                     &resp.content_type,
                     &resp.body,
-                )
+                    continuity,
+                );
             }
-            Err(e) => api_error_json(stream, e.status, &e.detail),
+            Err(e) => report_upstream_failure(stream, "post_nonstream", &e),
         }
         return;
     }
-    let transformed = match policy::transform_request(raw, &target_model) {
-        Ok(body) => body,
+    let message_count = raw
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let (transformed, metadata) = match policy::transform_request_with_metadata(raw, &target_model)
+    {
+        Ok(result) => result,
         Err(e) => {
             invalid_request_json(stream, &e);
             return;
         }
     };
+    let mut transformed: Value = match serde_json::from_slice(&transformed) {
+        Ok(transformed) => transformed,
+        Err(_) => {
+            invalid_request_json(stream, "DeepSeek request transform produced invalid JSON");
+            return;
+        }
+    };
+    let continuity = match restore_continuity_or_reject(
+        stream,
+        cfg,
+        &mut transformed,
+        &target_model,
+        RestorePolicy::DeepSeekToolUse,
+    ) {
+        Ok(capture) => capture,
+        Err(()) => return,
+    };
+    let transformed = match serde_json::to_vec(&transformed) {
+        Ok(transformed) => transformed,
+        Err(_) => {
+            invalid_request_json(stream, "DeepSeek request transform produced invalid JSON");
+            return;
+        }
+    };
+    log_deepseek_metadata(&metadata, is_stream, message_count);
     if is_stream {
         let filter = dsml_stream_filter(cfg, &known_tools, dsml_request_nonce.as_deref());
-        handle_stream(stream, cfg, transformed, filter);
+        handle_stream(
+            stream,
+            cfg,
+            transformed,
+            anthropic_transport,
+            filter,
+            continuity,
+        );
         return;
     }
-    match messages::post_nonstream(cfg, transformed) {
+    match messages::post_nonstream(cfg, transformed, anthropic_transport) {
         Ok(resp) => {
             let body =
                 apply_dsml_nonstream(cfg, &known_tools, resp.body, dsml_request_nonce.as_deref());
-            write_response(
+            write_anthropic_response_with_continuity(
                 stream,
                 resp.status,
-                status_reason(resp.status),
                 &resp.content_type,
                 &body,
-            )
+                continuity,
+            );
         }
-        Err(e) => api_error_json(stream, e.status, &e.detail),
+        Err(e) => report_upstream_failure(stream, "post_nonstream", &e),
     }
 }
 
@@ -1601,7 +2302,29 @@ fn handle_post(
         not_found_json(stream, &path);
         return;
     }
-    handle_messages(stream, cfg, body, request_nonces, relay_models, codex);
+    let anthropic_transport = if matches!(
+        cfg.provider.as_str(),
+        "qwen" | "openai-custom" | "openai-responses" | "codex"
+    ) {
+        None
+    } else {
+        match head.anthropic_transport() {
+            Ok(transport) => Some(transport),
+            Err(error) => {
+                invalid_request_json(stream, &error);
+                return;
+            }
+        }
+    };
+    handle_messages(
+        stream,
+        cfg,
+        body,
+        anthropic_transport.as_ref(),
+        request_nonces,
+        relay_models,
+        codex,
+    );
 }
 
 #[cfg(unix)]
@@ -2218,7 +2941,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::io::{Cursor, Error, ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2233,10 +2956,13 @@ mod tests {
     };
     use super::{
         apply_dsml_nonstream, collect_codex_nonstream, dsml_stream_filter, forward_stream_body,
+        forward_stream_body_with_capture, forward_stream_body_with_completion,
         handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_post,
-        map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
-        write_codex_models_response, CodexComponents, CodexNonstreamError, CodexPumpError,
-        KimiServerToolFilter, RequestHead, RequestNonceGenerator, StreamFilter, StreamTermination,
+        map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream,
+        relay_server_tool_types, relay_thinking_type, restore_continuity_or_reject,
+        stream_error_event, write_anthropic_response_with_continuity, write_codex_models_response,
+        AnthropicStreamMessageCollector, CodexComponents, CodexNonstreamError, CodexPumpError,
+        RequestHead, RequestNonceGenerator, StreamFilter, StreamTermination,
     };
     use crate::codex_auth::{InferenceSecrets, OAuthErrorCode, OAuthFlowError};
     use crate::codex_models::CodexModelCatalog;
@@ -2245,8 +2971,39 @@ mod tests {
     use crate::config::{GatewayConfig, DEFAULT_CODEX_UPSTREAM_URL};
     use crate::dsml_shim::DsmlStreamRewriter;
     use crate::models::RelayModelCache;
+    use crate::reasoning_state::{ReasoningStore, RestorePolicy};
 
     struct FailingReader;
+
+    #[test]
+    fn relay_metadata_projects_only_safe_server_tool_types_and_thinking_enum() {
+        let request = json!({
+            "max_tokens": 8192,
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 1024,
+                "sidecar": "sidecar-name-must-not-leak",
+            },
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "tool-name-must-not-leak",
+                    "input_schema": {"secret": "schema-must-not-leak"},
+                },
+                {"type": "web_search_20260803", "description": "must-not-leak"},
+                {"type": "vendor_private_sidecar", "name": "must-not-leak"},
+                {"name": "ordinary-client-tool", "input_schema": {}},
+            ],
+        });
+        let types = relay_server_tool_types(&request);
+        assert_eq!(types, "other:1,web_search_20250305:1,web_search_20260803:1");
+        assert_eq!(relay_thinking_type(&request), "enabled");
+        assert!(!types.contains("private"));
+        assert_eq!(
+            relay_thinking_type(&json!({"thinking": {"type": "secret-sidecar"}})),
+            "other"
+        );
+    }
 
     impl Read for FailingReader {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
@@ -3366,6 +4123,7 @@ mod tests {
             shim_mode: "off".into(),
             codex_state_root: None,
             codex_contract: None,
+            reasoning_store: None,
             launch_id: "test".into(),
             skill_data_dir: None,
             skill_bridge_dir: None,
@@ -3410,6 +4168,91 @@ mod tests {
         ));
         std::fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn continuity_restore_errors_surface_sanitized_reason_for_kimi_and_deepseek() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = bridge_temp_dir("continuity-errors");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (provider, contract, policy) in [
+            ("relay", "kimi-anthropic-relay", RestorePolicy::KimiAll),
+            (
+                "deepseek",
+                "deepseek-native",
+                RestorePolicy::DeepSeekToolUse,
+            ),
+        ] {
+            let credential = "provider-credential-must-not-leak";
+            let cfg = GatewayConfig {
+                provider: provider.into(),
+                port: 0,
+                auth_secret: Some("request-path-secret-must-not-leak".into()),
+                api_key: Some(credential.into()),
+                upstream_url: "https://provider.invalid/private/path/v1/messages".into(),
+                models_url: None,
+                relay_thinking: None,
+                provider_contract: None,
+                intent: crate::config::GatewayIntent::Formal,
+                static_model_resolver: None,
+                shim_mode: "off".into(),
+                codex_state_root: None,
+                codex_contract: None,
+                reasoning_store: Some(Arc::new(
+                    ReasoningStore::open(
+                        &root,
+                        credential,
+                        contract,
+                        "https://provider.invalid/private/path/v1/messages",
+                        "profile-scope-must-not-leak",
+                    )
+                    .unwrap(),
+                )),
+                launch_id: "launch-id-must-not-leak".into(),
+                skill_data_dir: None,
+                skill_bridge_dir: None,
+                skill_bridge_token: None,
+                science_host_context: None,
+            };
+            let mut request = json!({
+                "thinking": {"type": "enabled"},
+                "messages": [
+                    {"role": "user", "content": "prompt-must-not-leak"},
+                    {"role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "id": "tool-id-must-not-leak",
+                        "name": "private-tool-name-must-not-leak",
+                        "input": {"path": "/private/request/path-must-not-leak"},
+                    }]},
+                ],
+            });
+            let response = capture_tcp_response(|stream| {
+                assert!(restore_continuity_or_reject(
+                    stream,
+                    &cfg,
+                    &mut request,
+                    "model-id-must-not-leak",
+                    policy,
+                )
+                .is_err());
+            });
+
+            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+            let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "thinking continuity state is missing",
+                    },
+                })
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -3618,15 +4461,19 @@ mod tests {
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"name\":\"web_search\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{\"query\":\"weather\"}}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[]}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
             "event: message_delta\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
             "event: message_stop\n",
@@ -3634,6 +4481,137 @@ mod tests {
         )
         .as_bytes()
         .to_vec()
+    }
+
+    #[test]
+    fn continuity_stream_collector_rebuilds_thinking_and_tool_input_before_commit() {
+        let payload = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-reasoner\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"signed\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"lookup\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"x\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut collector = AnthropicStreamMessageCollector::default();
+        let mut captured = None;
+        let mut output = Vec::new();
+        let mut success_rollback = None;
+        let termination = forward_stream_body_with_capture(
+            &mut Cursor::new(payload.as_bytes()),
+            &[],
+            &mut None,
+            Some(&mut collector),
+            &mut success_rollback,
+            |chunk| {
+                output.extend_from_slice(chunk);
+                Ok(())
+            },
+            |message| {
+                captured = message;
+                Ok(None)
+            },
+        );
+        assert_eq!(termination, StreamTermination::NormalEof);
+        let captured = captured.expect("complete message");
+        assert_eq!(captured["content"][0]["thinking"], "plan");
+        assert_eq!(captured["content"][0]["signature"], "signed");
+        assert_eq!(captured["content"][1]["input"], json!({"q": "x"}));
+        assert_eq!(captured["stop_reason"], "tool_use");
+        assert_eq!(captured["usage"]["output_tokens"], 7);
+        assert!(String::from_utf8_lossy(&output).contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_completion_persists_before_message_stop_and_rolls_back_on_write_failure() {
+        let payload = complete_kimi_envelope();
+        let committed = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let completion_flag = Arc::clone(&committed);
+        let rollback_flag = Arc::clone(&rollback_called);
+        let emit_flag = Arc::clone(&committed);
+        let mut output = Vec::new();
+        let termination = forward_stream_body_with_completion(
+            &mut Cursor::new(payload),
+            &[],
+            &mut None,
+            |chunk| {
+                if chunk.windows(12).any(|part| part == b"message_stop") {
+                    assert!(emit_flag.load(Ordering::SeqCst));
+                }
+                output.extend_from_slice(chunk);
+                Ok(())
+            },
+            move || {
+                completion_flag.store(true, Ordering::SeqCst);
+                let rollback_flag = Arc::clone(&rollback_flag);
+                Ok(Some(Box::new(move || {
+                    rollback_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                }) as super::StreamRollback))
+            },
+        );
+        assert_eq!(termination, StreamTermination::NormalEof);
+        assert!(committed.load(Ordering::SeqCst));
+        assert!(!rollback_called.load(Ordering::SeqCst));
+        assert!(String::from_utf8_lossy(&output).contains("message_stop"));
+
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let rollback_flag = Arc::clone(&rollback_called);
+        let termination = forward_stream_body_with_completion(
+            &mut Cursor::new(complete_kimi_envelope()),
+            &[],
+            &mut None,
+            |chunk| {
+                if chunk.windows(12).any(|part| part == b"message_stop") {
+                    Err(Error::new(ErrorKind::BrokenPipe, "downstream closed"))
+                } else {
+                    Ok(())
+                }
+            },
+            move || {
+                let rollback_flag = Arc::clone(&rollback_flag);
+                Ok(Some(Box::new(move || {
+                    rollback_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                }) as super::StreamRollback))
+            },
+        );
+        assert_eq!(termination, StreamTermination::DownstreamWriteError);
+        assert!(rollback_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stream_completion_failure_emits_error_without_message_stop() {
+        let mut output = Vec::new();
+        let termination = forward_stream_body_with_completion(
+            &mut Cursor::new(complete_kimi_envelope()),
+            &[],
+            &mut None,
+            |chunk| {
+                output.extend_from_slice(chunk);
+                Ok(())
+            },
+            || Err("persist failed".into()),
+        );
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(termination, StreamTermination::ProtocolError);
+        assert!(output.contains("thinking continuity persist failed"));
+        assert!(!output.contains("message_stop"));
     }
 
     fn dsml_complete_start_then_partial_tool_delta() -> Vec<u8> {
@@ -3684,7 +4662,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_read_error_is_terminal_and_does_not_finalize_buffer() {
+    fn native_anthropic_read_error_is_terminal_after_forwarding_first_bytes() {
         let first = concat!(
             "event: message_start\n",
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"}}\n\n",
@@ -3693,7 +4671,7 @@ mod tests {
         )
         .as_bytes();
         let mut upstream = FailingReader;
-        let mut filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
+        let mut filter = None;
         let mut output = Vec::new();
 
         let termination = forward_stream_body(&mut upstream, first, &mut filter, |chunk| {
@@ -3704,17 +4682,13 @@ mod tests {
         assert_eq!(termination, StreamTermination::UpstreamReadError);
         assert!(String::from_utf8_lossy(&output).contains("event: message_start"));
         assert!(output.ends_with(&stream_error_event("upstream stream read failed")));
-        let StreamFilter::Kimi(filter) = filter.as_mut().unwrap() else {
-            panic!("expected Kimi filter");
-        };
-        assert!(filter.finalize().is_err(), "buffer must remain unflushed");
     }
 
     #[test]
-    fn kimi_complete_envelope_preserves_thinking_usage_terminal_and_compacts_indexes() {
+    fn kimi_native_anthropic_sse_preserves_server_tool_lifecycle_verbatim() {
         let first = complete_kimi_envelope();
         let mut upstream = Cursor::new(Vec::<u8>::new());
-        let mut filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
+        let mut filter = None;
         let mut output = Vec::new();
         let termination = forward_stream_body(&mut upstream, &first, &mut filter, |chunk| {
             output.extend_from_slice(chunk);
@@ -3724,8 +4698,10 @@ mod tests {
         assert_eq!(termination, StreamTermination::NormalEof);
         assert!(text.contains("\"thinking\":\"plan\""));
         assert!(text.contains("\"signature\":\"opaque\""));
-        assert!(!text.contains("server_tool_use"));
-        assert!(text.contains("\"index\":1"));
+        assert!(text.contains("\"type\":\"server_tool_use\""));
+        assert!(text.contains("\"type\":\"web_search_tool_result\""));
+        assert!(text.contains("\"tool_use_id\":\"srv_1\""));
+        assert!(text.contains("\"index\":3"));
         assert!(text.contains("\"stop_reason\":\"end_turn\""));
         assert!(text.contains("\"output_tokens\":9"));
         assert_eq!(text.matches("event: message_stop").count(), 1);
@@ -3733,35 +4709,26 @@ mod tests {
     }
 
     #[test]
-    fn kimi_invalid_thinking_emits_one_terminal_error_without_message_stop() {
-        let first = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"}}\n\n",
-            "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"secret\",\"signature\":\"\"}}\n\n",
-        );
-        let tail = concat!(
-            "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n\n",
-        );
-        let mut upstream = Cursor::new(tail.as_bytes());
-        let mut filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
-        let mut output = Vec::new();
-        let termination =
-            forward_stream_body(&mut upstream, first.as_bytes(), &mut filter, |chunk| {
-                output.extend_from_slice(chunk);
-                Ok(())
-            });
-        let text = String::from_utf8(output).unwrap();
-        assert_eq!(termination, StreamTermination::ProtocolError);
-        assert!(text.contains("event: message_start"));
-        assert_eq!(text.matches("event: error").count(), 1);
-        assert!(!text.contains("message_stop"));
-        assert!(!text.contains("secret"));
+    fn kimi_native_anthropic_json_preserves_server_tool_lifecycle_verbatim() {
+        let body = serde_json::to_vec(&json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "weather"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []},
+                {"type": "text", "text": "answer"}
+            ],
+            "stop_reason": "end_turn"
+        }))
+        .unwrap();
+        let response = capture_tcp_response(|stream| {
+            write_anthropic_response_with_continuity(stream, 200, "application/json", &body, None)
+        });
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("\"type\":\"server_tool_use\""));
+        assert!(response.contains("\"type\":\"web_search_tool_result\""));
+        assert!(response.contains("\"tool_use_id\":\"srv_1\""));
     }
 
     #[test]
@@ -3782,6 +4749,7 @@ mod tests {
             shim_mode: "off".into(),
             codex_state_root: None,
             codex_contract: None,
+            reasoning_store: None,
             launch_id: "test".into(),
             skill_data_dir: None,
             skill_bridge_dir: None,
@@ -3826,6 +4794,7 @@ mod tests {
             shim_mode: "off".into(),
             codex_state_root: None,
             codex_contract: None,
+            reasoning_store: None,
             launch_id: "launch-a".into(),
             skill_data_dir: None,
             skill_bridge_dir: None,
@@ -3921,21 +4890,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_clean_eof_finalizes_filters_but_fails_protocol() {
-        let kimi_first = kimi_complete_then_partial();
-        let mut kimi_upstream = Cursor::new(Vec::<u8>::new());
-        let mut kimi_filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
-        let mut kimi_output = Vec::new();
-        let kimi_termination =
-            forward_stream_body(&mut kimi_upstream, &kimi_first, &mut kimi_filter, |chunk| {
-                kimi_output.extend_from_slice(chunk);
-                Ok(())
-            });
-        assert_eq!(kimi_termination, StreamTermination::ProtocolError);
-        assert!(String::from_utf8_lossy(&kimi_output).contains("message_start"));
-        assert!(String::from_utf8_lossy(&kimi_output).contains("event: error"));
-        assert!(!String::from_utf8_lossy(&kimi_output).contains("message_stop"));
-
+    fn incomplete_clean_eof_finalizes_dsml_filter_but_fails_protocol() {
         let dsml_first = dsml_complete_start_then_partial_tool_delta();
         let mut dsml_upstream = Cursor::new(Vec::<u8>::new());
         let mut dsml_filter = dsml_filter();
@@ -3952,10 +4907,10 @@ mod tests {
     }
 
     #[test]
-    fn downstream_write_error_stops_before_more_reads_or_finalize() {
+    fn downstream_write_error_stops_before_more_upstream_reads() {
         let first = kimi_complete_then_partial();
         let mut upstream = CountingEofReader { reads: 0 };
-        let mut filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
+        let mut filter = None;
 
         let termination = forward_stream_body(&mut upstream, &first, &mut filter, |_chunk| {
             Err(Error::new(ErrorKind::BrokenPipe, "mock client closed"))
@@ -3965,13 +4920,6 @@ mod tests {
         assert_eq!(
             upstream.reads, 0,
             "must stop reading after client write failure"
-        );
-        let StreamFilter::Kimi(filter) = filter.as_mut().unwrap() else {
-            panic!("expected Kimi filter");
-        };
-        assert!(
-            filter.finalize().is_err(),
-            "buffer must remain unflushed after client write failure"
         );
     }
 }

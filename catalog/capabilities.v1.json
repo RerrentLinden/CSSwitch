@@ -6,7 +6,8 @@
       "scope": "provider",
       "match": {
         "provider": "deepseek",
-        "api_format": "anthropic"
+        "api_format": "anthropic",
+        "provider_contract": "deepseek-native"
       },
       "status": "supported",
       "action": "normalize",
@@ -18,7 +19,7 @@
         "desktop/gateway/src/server.rs"
       ],
       "tests": [
-        "desktop/gateway/src/policy.rs::tests::resolves_deepseek_shell_models",
+        "desktop/gateway/src/models.rs::tests::models_body_matches_deepseek_shell_contract",
         "desktop/gateway/src/policy.rs::tests::forced_tool_choice_disables_thinking",
         "desktop/gateway/src/policy.rs::tests::transform_maps_model_and_normalizes_thinking",
         "test.test_gateway_rust.RustGatewayLoopback.test_nonstream_maps_request_and_preserves_content_length"
@@ -52,7 +53,7 @@
       "scope": "provider",
       "match": {
         "provider": "relay",
-        "model_contains": "kimi",
+        "provider_contract": "kimi-anthropic-relay",
         "thinking_policy": "enabled"
       },
       "status": "limited",
@@ -65,7 +66,7 @@
         "test/golden/relay_anthropic.json"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_removed_tool_choice_degrades_to_auto_without_enabled_thinking",
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_drops_typed_web_search_and_invalid_forced_choice",
         "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
         "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
       ]
@@ -103,22 +104,117 @@
       "scope": "tool",
       "match": {
         "provider": "relay",
-        "model_contains": "kimi",
-        "tool_name": "web_search"
+        "provider_contract": "kimi-anthropic-relay",
+        "tool_type_family": "web_search_*"
       },
       "status": "limited",
       "action": "drop",
-      "reason": "Kimi treats web_search as a provider server tool and may stream server_tool_use/web_search_tool_result blocks; CSSwitch keeps local known_tools but does not advertise web_search upstream and filters server-tool blocks.",
+      "reason": "Live A/B on the current Science request shape showed that the Science-supplied web_search_20250305 declaration triggers an upstream 429 while the same request succeeds when that typed declaration is removed. CSSwitch temporarily drops only Kimi typed web_search_* declarations and recomputes forced tool_choice; same-named ordinary client tools, Science-local Python/Bash/R/Compute, and host.mcp remain untouched. The same Coding Plan can execute the versioned tool through Claude Code plus an upstream cc-switch passthrough, so this is a request-shape workaround rather than a permanent provider capability verdict. web_search_20250305 is an Anthropic GA versioned schema: CSSwitch neither strips its suffix nor adds guessed beta routing. /coding/v1/search is a separate host-service endpoint and is not evidence for Messages server-tool compatibility.",
       "evidence": [
         "desktop/gateway/src/anthropic_compat.rs",
-        "desktop/gateway/src/anthropic_compat.rs",
+        ".trellis/tasks/08-03-kimi-protocol-compatibility/research/kimi-first-turn-429-regression-audit.md",
         "test/golden/relay_anthropic.json"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools",
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_drops_server_tool_blocks_and_compacts_indexes",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_drops_server_tool_blocks_and_compacts_indexes",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_nonstream_filter_preserves_signed_thinking_and_rejects_unsigned_content",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_nonstream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses",
         "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
+      ]
+    },
+    {
+      "id": "tool.kimi.unsupported-server-tool-filter",
+      "scope": "tool",
+      "match": {
+        "provider": "relay",
+        "provider_contract": "kimi-anthropic-relay",
+        "tool_type_family": [
+          "web_fetch_*",
+          "code_execution_*",
+          "mcp_toolset",
+          "mcp_servers",
+          "tool_search_tool_*",
+          "advisor_*"
+        ]
+      },
+      "status": "unsupported",
+      "action": "drop",
+      "reason": "Kimi Code's Anthropic endpoint has no verified execution contract for these provider-owned declarations. CSSwitch drops only the typed forms and recomputes tool_choice; ordinary Python, Bash, Compute, web_search functions and host.mcp orchestration remain client-owned.",
+      "evidence": [
+        "desktop/gateway/src/anthropic_compat.rs",
+        ".trellis/tasks/08-03-kimi-protocol-compatibility/research/official-provider-capability-matrix.md"
+      ],
+      "tests": [
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools"
+      ]
+    },
+    {
+      "id": "tool.deepseek.web_search.server-tool-preserve",
+      "scope": "tool",
+      "match": {
+        "provider": "deepseek",
+        "provider_contract": "deepseek-native",
+        "tool_type_family": "web_search_*"
+      },
+      "status": "supported",
+      "action": "none",
+      "reason": "DeepSeek's native Anthropic contract supports provider-side Web Search. CSSwitch preserves the typed declaration and its server_tool_use/web_search_tool_result history without treating it as a DSML client function.",
+      "evidence": [
+        "desktop/gateway/src/policy.rs",
+        "desktop/gateway/src/server.rs",
+        "https://api-docs.deepseek.com/guides/anthropic_api/"
+      ],
+      "tests": [
+        "desktop/gateway/src/policy.rs::tests::deepseek_server_tool_policy_preserves_web_search_and_client_tools_only",
+        "test.test_gateway_rust.RustGatewayLoopback.test_deepseek_anthropic_server_tool_policy_and_web_search_two_round_history"
+      ]
+    },
+    {
+      "id": "tool.deepseek.unsupported-server-tool-filter",
+      "scope": "tool",
+      "match": {
+        "provider": "deepseek",
+        "provider_contract": "deepseek-native",
+        "tool_type_family": [
+          "web_fetch_*",
+          "code_execution_*",
+          "mcp_toolset",
+          "mcp_servers",
+          "tool_search_tool_*",
+          "advisor_*"
+        ]
+      },
+      "status": "unsupported",
+      "action": "drop",
+      "reason": "DeepSeek documents provider-side code execution and MCP as unsupported or ignored and does not publish stable Web Fetch, tool-search or advisor executors. CSSwitch drops only those typed declarations and recomputes tool_choice instead of accepting a 2xx as fake execution success.",
+      "evidence": [
+        "desktop/gateway/src/anthropic_compat.rs",
+        "desktop/gateway/src/policy.rs",
+        "https://api-docs.deepseek.com/guides/anthropic_api/"
+      ],
+      "tests": [
+        "desktop/gateway/src/policy.rs::tests::deepseek_server_tool_policy_preserves_web_search_and_client_tools_only",
+        "test.test_gateway_rust.RustGatewayLoopback.test_deepseek_anthropic_server_tool_policy_and_web_search_two_round_history"
+      ]
+    },
+    {
+      "id": "tool.anthropic.unknown-server-tool-preserve",
+      "scope": "tool",
+      "match": {
+        "api_format": "anthropic",
+        "tool_type_family": "unknown_typed_vendor_tool"
+      },
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "Unknown non-empty typed vendor tools are preserved opaquely for compatibility and produce a rule-only diagnostic. CSSwitch does not claim an executor or rewrite their payloads.",
+      "evidence": [
+        "desktop/gateway/src/anthropic_compat.rs"
+      ],
+      "tests": [
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools",
+        "desktop/gateway/src/policy.rs::tests::deepseek_server_tool_policy_preserves_web_search_and_client_tools_only"
       ]
     },
     {

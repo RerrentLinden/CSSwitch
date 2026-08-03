@@ -324,7 +324,7 @@ echo "  账号     = $EMAIL （本地假账号，不用真实凭证）"
 
 # Keep local inference traffic on loopback and fail closed for blocked upstreams.
 _FASTFAIL_PROXY="http://$_PROXY_HOSTPORT"
-_NO_PROXY="127.0.0.1,localhost,::1"
+_NO_PROXY="127.0.0.1,localhost,::1,pubmed.mcp.claude.com,hcls.mcp.claude.com"
 echo "  外联防卡 = Anthropic HTTPS fast-fail（经 $_FASTFAIL_PROXY，no_proxy=$_NO_PROXY）"
 echo
 

@@ -57,6 +57,10 @@ REQUIRED_RULE_IDS = {
     "provider.kimi.relay-thinking-enabled",
     "provider.dashscope.responses-tools-cap",
     "tool.kimi.web_search.server-tool-filter",
+    "tool.kimi.unsupported-server-tool-filter",
+    "tool.deepseek.web_search.server-tool-preserve",
+    "tool.deepseek.unsupported-server-tool-filter",
+    "tool.anthropic.unknown-server-tool-preserve",
     "tool.relay.input-schema-normalize",
     "tool.deepseek.forced-tool-choice-disable-thinking",
     "tool.dashscope.responses.web_search-drop",
@@ -70,6 +74,10 @@ RUNTIME_OBSERVABILITY_RULE_IDS = {
     "provider.kimi.relay-thinking-enabled",
     "provider.dashscope.responses-tools-cap",
     "tool.kimi.web_search.server-tool-filter",
+    "tool.kimi.unsupported-server-tool-filter",
+    "tool.deepseek.web_search.server-tool-preserve",
+    "tool.deepseek.unsupported-server-tool-filter",
+    "tool.anthropic.unknown-server-tool-preserve",
     "tool.relay.input-schema-normalize",
     "tool.deepseek.forced-tool-choice-disable-thinking",
     "tool.dashscope.responses.web_search-drop",
@@ -146,6 +154,27 @@ class CapabilityCatalogSchema(unittest.TestCase):
                 self.assertEqual(match["endpoint_hosts"], ["dashscope.aliyuncs.com"])
                 self.assertNotIn("base_url_contains", match)
 
+    def test_kimi_and_deepseek_anthropic_rules_use_exact_provider_contracts(self):
+        data = load_catalog()
+        rules = {
+            entry["id"]: entry
+            for section in SECTIONS
+            for entry in data[section]
+        }
+        expected = {
+            "provider.kimi.relay-thinking-enabled": "kimi-anthropic-relay",
+            "tool.kimi.web_search.server-tool-filter": "kimi-anthropic-relay",
+            "tool.kimi.unsupported-server-tool-filter": "kimi-anthropic-relay",
+            "provider.deepseek.anthropic-native": "deepseek-native",
+            "tool.deepseek.web_search.server-tool-preserve": "deepseek-native",
+            "tool.deepseek.unsupported-server-tool-filter": "deepseek-native",
+        }
+        for rule_id, contract_id in expected.items():
+            with self.subTest(rule_id=rule_id):
+                match = rules[rule_id]["match"]
+                self.assertEqual(match["provider_contract"], contract_id)
+                self.assertNotIn("model_contains", match)
+
     def test_migrated_rules_include_rust_evidence_and_tests(self):
         data = load_catalog()
         rules = {
@@ -159,6 +188,10 @@ class CapabilityCatalogSchema(unittest.TestCase):
             "provider.kimi.relay-thinking-enabled",
             "provider.dashscope.responses-tools-cap",
             "tool.kimi.web_search.server-tool-filter",
+            "tool.kimi.unsupported-server-tool-filter",
+            "tool.deepseek.web_search.server-tool-preserve",
+            "tool.deepseek.unsupported-server-tool-filter",
+            "tool.anthropic.unknown-server-tool-preserve",
             "tool.relay.input-schema-normalize",
             "tool.siliconflow.forced-named-to-any",
             "tool.deepseek.forced-tool-choice-disable-thinking",

@@ -163,6 +163,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

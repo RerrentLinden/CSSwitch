@@ -15,6 +15,7 @@ pub mod openai_chat;
 pub mod openai_responses;
 pub mod policy;
 pub(crate) mod provider_contracts;
+pub(crate) mod reasoning_state;
 pub mod science_control;
 pub mod server;
 pub mod skill_install;

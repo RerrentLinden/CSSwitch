@@ -1095,6 +1095,7 @@ pub fn migrate_v3_to_v4(v3: crate::config_legacy::ConfigV3) -> io::Result<Config
 pub(crate) const CONFIG_DIR_NAME: &str = ".csswitch";
 #[cfg(feature = "acceptance-build")]
 pub(crate) const CONFIG_DIR_NAME: &str = ".csswitch-acceptance";
+const REASONING_STATE_DIR_NAME: &str = "reasoning-state";
 
 fn default_dir_from_home(home: &Path) -> PathBuf {
     home.join(CONFIG_DIR_NAME)
@@ -1107,6 +1108,23 @@ pub fn default_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     default_dir_from_home(&home)
+}
+
+/// Create and return the private Gateway reasoning state directory below the
+/// compile-time-selected CSSwitch config root. The path is never selected by a
+/// profile or inherited process environment.
+pub(crate) fn prepare_reasoning_state_dir() -> io::Result<PathBuf> {
+    prepare_reasoning_state_dir_from_config_root(&default_dir())
+}
+
+fn prepare_reasoning_state_dir_from_config_root(config_root: &Path) -> io::Result<PathBuf> {
+    if !config_root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CSSwitch reasoning 状态根必须是绝对路径",
+        ));
+    }
+    SecureDir::open(config_root, true)?.ensure_private_child_dir(REASONING_STATE_DIR_NAME)
 }
 
 pub(crate) fn read_pending_authority_cleanup_manifest(dir: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -1237,6 +1255,46 @@ impl SecureDir {
         }
         CString::new(name.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "配置目录内部文件名包含 NUL"))
+    }
+
+    fn ensure_private_child_dir(&self, name: &str) -> io::Result<PathBuf> {
+        let path = self.path.join(name);
+        let name = Self::name(name)?;
+        let created = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
+        if !created {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error);
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let directory = unsafe { fs::File::from_raw_fd(fd) };
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CSSwitch reasoning 状态目录身份非法",
+            ));
+        }
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        if directory.metadata()?.permissions().mode() & 0o777 != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CSSwitch reasoning 状态目录权限非法",
+            ));
+        }
+        directory.sync_all()?;
+        self.sync()?;
+        Ok(path)
     }
 
     fn read_regular_snapshot(&self, name: &str) -> io::Result<Option<(Vec<u8>, u32)>> {
@@ -2510,6 +2568,36 @@ mod tests {
         assert_eq!(got, home.join(".csswitch-acceptance"));
         #[cfg(not(feature = "acceptance-build"))]
         assert_eq!(got, home.join(".csswitch"));
+    }
+
+    #[test]
+    fn reasoning_state_dir_is_private_and_compile_time_isolated() {
+        let home = tmpdir();
+        let config_root = default_dir_from_home(&home);
+        let got = prepare_reasoning_state_dir_from_config_root(&config_root).unwrap();
+        assert!(got.is_absolute());
+        assert_eq!(got, config_root.join(REASONING_STATE_DIR_NAME));
+        assert_eq!(mode_of(&config_root), 0o700);
+        assert_eq!(mode_of(&got), 0o700);
+        #[cfg(feature = "acceptance-build")]
+        assert_eq!(got, home.join(".csswitch-acceptance/reasoning-state"));
+        #[cfg(not(feature = "acceptance-build"))]
+        assert_eq!(got, home.join(".csswitch/reasoning-state"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reasoning_state_dir_rejects_symlink_without_touching_target() {
+        let home = tmpdir();
+        let config_root = default_dir_from_home(&home);
+        save_to(&config_root, &Config::default()).unwrap();
+        let target = home.join("foreign-reasoning-state");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, config_root.join(REASONING_STATE_DIR_NAME)).unwrap();
+
+        assert!(prepare_reasoning_state_dir_from_config_root(&config_root).is_err());
+        assert_eq!(mode_of(&target), 0o755);
     }
 
     #[test]

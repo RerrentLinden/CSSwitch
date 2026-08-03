@@ -381,6 +381,15 @@ class RustGatewayLoopback(unittest.TestCase):
         cls.bin = gateway_bin()
         if cls.bin is None:
             raise unittest.SkipTest("csswitch-gateway binary not built")
+        cls.reasoning_state_tmp = tempfile.TemporaryDirectory(
+            prefix="csswitch-gateway-reasoning-"
+        )
+        cls.reasoning_state_dir = os.path.realpath(cls.reasoning_state_tmp.name)
+        os.chmod(cls.reasoning_state_dir, 0o700)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.reasoning_state_tmp.cleanup()
 
     def start_gateway(
         self,
@@ -589,6 +598,8 @@ class RustGatewayLoopback(unittest.TestCase):
             "all_proxy": None,
             "NO_PROXY": "*",
             "no_proxy": "*",
+            "CSSWITCH_REASONING_STATE_DIR": self.reasoning_state_dir,
+            "CSSWITCH_REASONING_PROFILE_SCOPE": "f" * 64,
         }
         isolated_env.update(env_overrides or {})
         kwargs["env_overrides"] = isolated_env
@@ -832,14 +843,199 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(req["path"], "/anthropic/v1/messages")
             self.assertEqual(req["headers"]["x-api-key"], "fake-deepseek-key")
             self.assertEqual(req["headers"]["anthropic-version"], "2023-06-01")
+            self.assertNotIn("authorization", req["headers"])
             mapped = json.loads(req["body"])
             self.assertEqual(mapped["model"], "deepseek-v4-pro")
             self.assertEqual(mapped["max_tokens"], 65536)
-            self.assertEqual(mapped["thinking"]["type"], "adaptive")
+            self.assertEqual(mapped["thinking"]["type"], "auto")
         finally:
             self.stop_gateway(proc)
             upstream.shutdown()
             upstream.server_close()
+
+    def test_deepseek_anthropic_server_tool_policy_and_web_search_two_round_history(self):
+        first_response = {
+            "id": "msg_deepseek_search",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4-pro",
+            "content": [
+                {"type": "thinking", "thinking": "search-plan", "signature": "opaque"},
+                {
+                    "type": "server_tool_use",
+                    "id": "srv_search",
+                    "name": "web_search",
+                    "input": {"query": "current fact"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srv_search",
+                    "content": [{"type": "web_search_result", "url": "https://example.invalid"}],
+                },
+                {"type": "text", "text": "search answer"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 4, "output_tokens": 3},
+        }
+        upstream = MockUpstream(json.dumps(first_response).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_current_gateway(
+            provider="deepseek",
+            contract_id="deepseek-native",
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages",
+            launch_id="e" * 32,
+        )
+        strict_schema = {
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+            "additionalProperties": False,
+        }
+        tools = [
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"type": "web_fetch_20260209", "name": "web_fetch"},
+            {"type": "code_execution_20250825", "name": "code_execution"},
+            {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
+            {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+            {"type": "advisor_20251001", "name": "advisor"},
+            {"name": "web_search", "input_schema": {"type": "object"}},
+            {"name": "python", "input_schema": strict_schema},
+            {"name": "bash", "input_schema": strict_schema},
+            {"name": "compute", "input_schema": strict_schema},
+        ]
+
+        def post(messages):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 128,
+                    "thinking": {"type": "auto"},
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": {"type": "auto"},
+                    "mcp_servers": [{"type": "url", "url": "https://example.invalid"}],
+                }).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+            return response.status, body
+
+        client_history = [{"role": "user", "content": "search now"}]
+        try:
+            status, first = post(client_history)
+            self.assertEqual(status, 200, first)
+            self.assertEqual(first["content"], first_response["content"])
+            first_upstream = json.loads(upstream.requests[0]["body"])
+            self.assertEqual(first_upstream["messages"], client_history)
+            self.assertEqual(
+                first_upstream["tools"],
+                [tools[0], tools[6], tools[7], tools[8], tools[9]],
+            )
+            self.assertEqual(first_upstream["tools"][2]["input_schema"], strict_schema)
+            self.assertNotIn("mcp_servers", first_upstream)
+
+            upstream.response_body = json.dumps({
+                "id": "msg_deepseek_followup",
+                "type": "message",
+                "role": "assistant",
+                "model": "deepseek-v4-pro",
+                "content": [{"type": "text", "text": "followup answer"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 8, "output_tokens": 2},
+            }).encode()
+            second_messages = client_history + [
+                {
+                    "role": "assistant",
+                    "content": [
+                        block for block in first["content"] if block.get("type") != "thinking"
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ]
+            status, second = post(second_messages)
+            self.assertEqual(status, 200, second)
+            self.assertEqual(second["content"][0]["text"], "followup answer")
+            second_upstream = json.loads(upstream.requests[1]["body"])
+            self.assertEqual(
+                second_upstream["messages"][-2]["content"],
+                first_response["content"],
+            )
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_deepseek_streaming_web_search_envelopes_pass_without_dsml_client_rewrite(self):
+        dsml = (
+            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="web_search">'
+            '<｜｜DSML｜｜parameter name="query" string="true">x</｜｜DSML｜｜parameter>'
+            '</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>'
+        )
+        payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m_search","type":"message","role":"assistant","model":"deepseek-v4-pro","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"search-plan","signature":"opaque"}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srv_search","name":"web_search","input":{"query":"x"}}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_search","content":[]}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}\n\n',
+            ("event: content_block_delta\ndata: " + json.dumps({"type": "content_block_delta", "index": 3, "delta": {"type": "text_delta", "text": dsml}}, ensure_ascii=False) + "\n\n").encode(),
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":3}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ])
+
+        def handler(conn):
+            with conn:
+                conn.recv(65536)
+                head = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream\r\n"
+                    f"Content-Length: {len(payload)}\r\n\r\n"
+                )
+                conn.sendall(head.encode() + payload)
+
+        upstream = RawUpstream(handler)
+        proc, port = self.start_current_gateway(
+            provider="deepseek",
+            contract_id="deepseek-native",
+            upstream_url=upstream.url,
+            shim_mode="rewrite",
+            launch_id="f" * 32,
+        )
+        try:
+            request_body = json.dumps({
+                "model": "claude-opus-4-8",
+                "stream": True,
+                "thinking": {"type": "auto"},
+                "messages": [{"role": "user", "content": "search"}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            }).encode()
+            raw = self.raw_request(
+                port,
+                b"POST /secret/v1/messages HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(request_body)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + request_body,
+            )
+            status, _, body = parse_raw_response(raw)
+            self.assertEqual(status, 200)
+            self.assertIn(b'"type":"server_tool_use"', body)
+            self.assertIn(b'"type":"web_search_tool_result"', body)
+            self.assertNotIn(b'"type":"tool_use"', body)
+            self.assertIn("DSML".encode(), body)
+        finally:
+            self.stop_gateway(proc)
+            upstream.close()
 
     def test_deepseek_dsml_rewrite_nonstream_opt_in(self):
         dsml = (
@@ -1533,7 +1729,7 @@ class RustGatewayLoopback(unittest.TestCase):
             provider="openai-custom",
             contract_id="opencode-go-openai-chat",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/zen/go/v1",
-            openai_model="kimi-k3",
+            openai_model="k3",
         )
 
         def post(request):
@@ -2857,6 +3053,7 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(req["headers"]["authorization"], "Bearer fake-relay-key")
             self.assertEqual(req["headers"]["x-api-key"], "fake-relay-key")
             self.assertEqual(req["headers"]["anthropic-version"], "2023-06-01")
+            self.assertNotIn("anthropic-beta", req["headers"])
             mapped = json.loads(req["body"])
             self.assertEqual(mapped["model"], "MiniMax-M2")
             self.assertEqual(mapped["max_tokens"], 1000000)
@@ -3173,9 +3370,15 @@ class RustGatewayLoopback(unittest.TestCase):
         upstream = RawUpstream(kimi_stream_handler)
         proc, port = self.start_gateway(
             provider="relay",
+            contract_id="kimi-anthropic-relay",
             upstream_url=upstream.url,
             openai_base_url=f"http://127.0.0.1:{upstream.port}/up",
-            openai_model="kimi-k2.7-code",
+            openai_model="k3-256k",
+            launch_id="1" * 32,
+            env_overrides={
+                "CSSWITCH_REASONING_STATE_DIR": self.reasoning_state_dir,
+                "CSSWITCH_REASONING_PROFILE_SCOPE": "f" * 64,
+            },
         )
         try:
             request = {
@@ -3230,9 +3433,10 @@ class RustGatewayLoopback(unittest.TestCase):
         upstream = RawUpstream(invalid_index_handler)
         proc, port = self.start_gateway(
             provider="relay",
+            contract_id="kimi-anthropic-relay",
             upstream_url=upstream.url,
             openai_base_url=f"http://127.0.0.1:{upstream.port}/up",
-            openai_model="kimi-k3",
+            openai_model="k3",
         )
         try:
             request = {
@@ -3286,9 +3490,10 @@ class RustGatewayLoopback(unittest.TestCase):
         upstream = RawUpstream(malformed_delta_handler)
         proc, port = self.start_gateway(
             provider="relay",
+            contract_id="kimi-anthropic-relay",
             upstream_url=upstream.url,
             openai_base_url=f"http://127.0.0.1:{upstream.port}/up",
-            openai_model="kimi-k3",
+            openai_model="k3",
         )
         try:
             request = {
@@ -3316,14 +3521,16 @@ class RustGatewayLoopback(unittest.TestCase):
             self.stop_gateway(proc)
             upstream.close()
 
-    def test_v081_relay_kimi_nonstream_drops_only_zero_information_thinking(self):
+    def test_relay_kimi_raw_k3_nonstream_filters_server_tool_envelopes_and_preserves_two_round_history(self):
         upstream = MockUpstream(json.dumps({
             "id": "msg_kimi_nonstream",
             "type": "message",
             "role": "assistant",
-            "model": "kimi-k2.7-code",
+            "model": "k3-256k",
             "content": [
                 {"type": "thinking", "thinking": "", "signature": ""},
+                {"type": "server_tool_use", "id": "srv_search", "name": "web_search"},
+                {"type": "web_search_tool_result", "tool_use_id": "srv_search", "content": []},
                 {"type": "thinking", "thinking": "plan", "signature": "opaque"},
                 {"type": "text", "text": "answer"},
             ],
@@ -3335,12 +3542,24 @@ class RustGatewayLoopback(unittest.TestCase):
         thread.start()
         proc, port = self.start_current_gateway(
             provider="relay",
-            contract_id="custom-anthropic",
-            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
-            openai_model="kimi-k2.7-code",
+            contract_id="kimi-anthropic-relay",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}",
+            openai_model="k3-256k",
+            relay_thinking="enabled",
         )
 
-        def post():
+        tools = [
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"type": "web_fetch_20260209", "name": "web_fetch"},
+            {"type": "code_execution_20250825", "name": "code_execution"},
+            {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
+            {"name": "web_search", "input_schema": {"type": "object"}},
+            {"name": "python", "input_schema": {"type": "object"}},
+            {"name": "bash", "input_schema": {"type": "object"}},
+            {"name": "compute", "input_schema": {"type": "object"}},
+        ]
+
+        def post(messages):
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             conn.request(
                 "POST",
@@ -3348,7 +3567,9 @@ class RustGatewayLoopback(unittest.TestCase):
                 body=json.dumps({
                     "model": "claude-opus-4-8",
                     "max_tokens": 128,
-                    "messages": [{"role": "user", "content": "hi"}],
+                    "messages": messages,
+                    "tools": tools,
+                    "mcp_servers": [{"type": "url", "url": "https://example.invalid"}],
                 }).encode(),
                 headers={"content-type": "application/json"},
             )
@@ -3358,7 +3579,14 @@ class RustGatewayLoopback(unittest.TestCase):
             return response.status, json.loads(raw)
 
         try:
-            status, body = post()
+            first_user = {
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "AA=="},
+                }],
+            }
+            status, body = post([first_user])
             self.assertEqual(status, 200, body)
             self.assertEqual(body["content"], [
                 {"type": "thinking", "thinking": "plan", "signature": "opaque"},
@@ -3366,6 +3594,57 @@ class RustGatewayLoopback(unittest.TestCase):
             ])
             self.assertEqual(body["stop_reason"], "end_turn")
             self.assertEqual(body["usage"], {"input_tokens": 2, "output_tokens": 3})
+            first_upstream = json.loads(upstream.requests[0]["body"])
+            self.assertEqual(upstream.requests[0]["path"], "/v1/messages?beta=true")
+            self.assertEqual(
+                upstream.requests[0]["headers"]["anthropic-beta"],
+                "claude-code-20250219",
+            )
+            self.assertIn("authorization", upstream.requests[0]["headers"])
+            self.assertNotIn("x-api-key", upstream.requests[0]["headers"])
+            self.assertIn("anthropic-version", upstream.requests[0]["headers"])
+            self.assertEqual(first_upstream["model"], "k3-256k")
+            self.assertEqual(first_upstream["messages"][0], first_user)
+            self.assertEqual(
+                first_upstream["tools"],
+                [
+                    {"name": "web_search", "input_schema": {"type": "object", "properties": {}}},
+                    {"name": "python", "input_schema": {"type": "object", "properties": {}}},
+                    {"name": "bash", "input_schema": {"type": "object", "properties": {}}},
+                    {"name": "compute", "input_schema": {"type": "object", "properties": {}}},
+                ],
+            )
+            self.assertTrue(all(
+                tool["input_schema"] == {"type": "object", "properties": {}}
+                for tool in first_upstream["tools"]
+            ))
+            self.assertTrue(all("type" not in tool for tool in first_upstream["tools"]))
+            self.assertNotIn("mcp_servers", first_upstream)
+
+            upstream.response_body = json.dumps({
+                "id": "msg_kimi_round_two",
+                "type": "message",
+                "role": "assistant",
+                "model": "k3-256k",
+                "content": [{"type": "text", "text": "continued"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            }).encode()
+            round_two_messages = [
+                first_user,
+                {"role": "assistant", "content": body["content"]},
+                {"role": "user", "content": "continue"},
+            ]
+            status, second = post(round_two_messages)
+            self.assertEqual(status, 200, second)
+            self.assertEqual(second["content"][0]["text"], "continued")
+            second_upstream = json.loads(upstream.requests[1]["body"])
+            self.assertEqual(second_upstream["messages"], round_two_messages)
+            self.assertFalse(any(
+                block.get("type") in {"server_tool_use", "web_search_tool_result"}
+                for message in second_upstream["messages"]
+                for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+            ))
 
             upstream.response_body = json.dumps({
                 "id": "msg_kimi_bad",
@@ -3381,12 +3660,295 @@ class RustGatewayLoopback(unittest.TestCase):
                 "usage": {"input_tokens": 1, "output_tokens": 1},
             }).encode()
             before = len(upstream.requests)
-            status, body = post()
+            status, body = post([{"role": "user", "content": "invalid thinking"}])
             self.assertEqual(status, 502, body)
             self.assertEqual(body["error"]["type"], "api_error")
             self.assertEqual(len(upstream.requests), before + 1)
         finally:
             self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_managed_kimi_reasoning_continuity_survives_gateway_restart(self):
+        upstream = MockUpstream(json.dumps({
+            "id": "msg_kimi_restart",
+            "type": "message",
+            "role": "assistant",
+            "model": "k3",
+            "content": [
+                {"type": "thinking", "thinking": "kimi-authentic-plan", "signature": "opaque"},
+                {"type": "text", "text": "first answer"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+
+        def post(port, messages):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 128,
+                    "messages": messages,
+                }).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+            return response.status, body
+
+        first_proc = second_proc = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="csswitch-kimi-reasoning-") as state_dir:
+                os.chmod(state_dir, 0o700)
+                state_dir = os.path.realpath(state_dir)
+                common = {
+                    "provider": "relay",
+                    "contract_id": "kimi-anthropic-relay",
+                    "openai_base_url": f"http://127.0.0.1:{upstream.server_port}/coding",
+                    "openai_model": "k3",
+                    "relay_thinking": "enabled",
+                    "env_overrides": {
+                        "CSSWITCH_REASONING_STATE_DIR": state_dir,
+                        "CSSWITCH_REASONING_PROFILE_SCOPE": "1" * 64,
+                    },
+                }
+                first_proc, first_port = self.start_current_gateway(
+                    launch_id="a" * 32,
+                    **common,
+                )
+                status, body = post(first_port, [{"role": "user", "content": "hello"}])
+                self.assertEqual(status, 200, body)
+                self.stop_gateway(first_proc)
+                first_proc = None
+
+                second_proc, second_port = self.start_current_gateway(
+                    launch_id="b" * 32,
+                    **common,
+                )
+                stripped = [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": [{"type": "text", "text": "first answer"}]},
+                    {"role": "user", "content": "follow up"},
+                ]
+                status, body = post(second_port, stripped)
+                self.assertEqual(status, 200, body)
+                mapped = json.loads(upstream.requests[-1]["body"])
+                self.assertEqual(
+                    mapped["messages"][1]["content"][0],
+                    {"type": "thinking", "thinking": "kimi-authentic-plan", "signature": "opaque"},
+                )
+                self.assertEqual(mapped["messages"][1]["content"][1]["text"], "first answer")
+        finally:
+            if first_proc is not None:
+                self.stop_gateway(first_proc)
+            if second_proc is not None:
+                self.stop_gateway(second_proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_managed_deepseek_tool_reasoning_continuity_survives_gateway_restart(self):
+        upstream = MockUpstream(json.dumps({
+            "id": "msg_deepseek_restart",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4-pro",
+            "content": [
+                {"type": "thinking", "thinking": "deepseek-authentic-plan", "signature": "opaque"},
+                {"type": "tool_use", "id": "toolu_python", "name": "python", "input": {"code": "1+1"}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+
+        def post(port, messages):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 128,
+                    "thinking": {"type": "auto"},
+                    "tools": [{"name": "python", "input_schema": {"type": "object"}}],
+                    "messages": messages,
+                }).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+            return response.status, body
+
+        first_proc = second_proc = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="csswitch-deepseek-reasoning-") as state_dir:
+                os.chmod(state_dir, 0o700)
+                state_dir = os.path.realpath(state_dir)
+                common = {
+                    "provider": "deepseek",
+                    "contract_id": "deepseek-native",
+                    "upstream_url": f"http://127.0.0.1:{upstream.server_port}/v1/messages",
+                    "env_overrides": {
+                        "CSSWITCH_REASONING_STATE_DIR": state_dir,
+                        "CSSWITCH_REASONING_PROFILE_SCOPE": "2" * 64,
+                    },
+                }
+                first_proc, first_port = self.start_current_gateway(
+                    launch_id="c" * 32,
+                    **common,
+                )
+                status, body = post(first_port, [{"role": "user", "content": "calculate"}])
+                self.assertEqual(status, 200, body)
+                self.stop_gateway(first_proc)
+                first_proc = None
+
+                second_proc, second_port = self.start_current_gateway(
+                    launch_id="d" * 32,
+                    **common,
+                )
+                stripped = [
+                    {"role": "user", "content": "calculate"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "toolu_python", "name": "python", "input": {"code": "1+1"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_python", "content": "2"},
+                    ]},
+                ]
+                status, body = post(second_port, stripped)
+                self.assertEqual(status, 200, body)
+                mapped = json.loads(upstream.requests[-1]["body"])
+                self.assertEqual(mapped["thinking"]["type"], "auto")
+                self.assertEqual(
+                    mapped["messages"][1]["content"][0],
+                    {"type": "thinking", "thinking": "deepseek-authentic-plan", "signature": "opaque"},
+                )
+                self.assertEqual(mapped["messages"][1]["content"][1]["id"], "toolu_python")
+        finally:
+            if first_proc is not None:
+                self.stop_gateway(first_proc)
+            if second_proc is not None:
+                self.stop_gateway(second_proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_managed_deepseek_disabled_tool_tombstone_allows_auto_followup(self):
+        upstream = MockUpstream(json.dumps({
+            "id": "msg_deepseek_python",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4-pro",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_python_disabled",
+                "name": "python",
+                "input": {"code": "1+1"},
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+
+        def post(port, messages, tool_choice):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 128,
+                    "thinking": {"type": "auto"},
+                    "tool_choice": tool_choice,
+                    "tools": [
+                        {"name": "python", "input_schema": {"type": "object"}},
+                        {"name": "search_pubmed", "input_schema": {"type": "object"}},
+                    ],
+                    "messages": messages,
+                }).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+            return response.status, body
+
+        proc = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="csswitch-deepseek-tombstone-") as state_dir:
+                os.chmod(state_dir, 0o700)
+                proc, port = self.start_current_gateway(
+                    provider="deepseek",
+                    contract_id="deepseek-native",
+                    upstream_url=f"http://127.0.0.1:{upstream.server_port}/v1/messages",
+                    env_overrides={
+                        "CSSWITCH_REASONING_STATE_DIR": os.path.realpath(state_dir),
+                        "CSSWITCH_REASONING_PROFILE_SCOPE": "3" * 64,
+                    },
+                )
+                first_messages = [{"role": "user", "content": "calculate"}]
+                status, first = post(
+                    port,
+                    first_messages,
+                    {"type": "tool", "name": "python"},
+                )
+                self.assertEqual(status, 200, first)
+                first_upstream = json.loads(upstream.requests[0]["body"])
+                self.assertEqual(first_upstream["thinking"]["type"], "disabled")
+
+                upstream.response_body = json.dumps({
+                    "id": "msg_deepseek_pubmed",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "deepseek-v4-pro",
+                    "content": [
+                        {"type": "thinking", "thinking": "search PubMed", "signature": "opaque"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_pubmed",
+                            "name": "search_pubmed",
+                            "input": {"query": "CRISPR diagnostics"},
+                        },
+                    ],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                }).encode()
+                follow_up_messages = first_messages + [
+                    {"role": "assistant", "content": first["content"]},
+                    {"role": "user", "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_python_disabled",
+                            "content": "2",
+                        },
+                        {"type": "text", "text": "now search PubMed"},
+                    ]},
+                ]
+                status, second = post(port, follow_up_messages, {"type": "auto"})
+                self.assertEqual(status, 200, second)
+                self.assertEqual(len(upstream.requests), 2)
+                second_upstream = json.loads(upstream.requests[1]["body"])
+                self.assertEqual(second_upstream["thinking"]["type"], "auto")
+                self.assertEqual(
+                    second_upstream["messages"][1]["content"],
+                    [{
+                        "type": "tool_use",
+                        "id": "toolu_python_disabled",
+                        "name": "python",
+                        "input": {"code": "1+1"},
+                    }],
+                )
+        finally:
+            if proc is not None:
+                self.stop_gateway(proc)
             upstream.shutdown()
             upstream.server_close()
 
@@ -3989,9 +4551,10 @@ class RustGatewayLoopback(unittest.TestCase):
         upstream = RawUpstream(dropping_stream_handler_with_payload(payload))
         proc, port = self.start_gateway(
             provider="relay",
+            contract_id="kimi-anthropic-relay",
             upstream_url=upstream.url,
             openai_base_url=f"http://127.0.0.1:{upstream.port}/up",
-            openai_model="kimi-k2.7-code",
+            openai_model="k3",
         )
         try:
             request = {

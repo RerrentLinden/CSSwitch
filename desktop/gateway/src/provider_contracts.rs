@@ -369,6 +369,7 @@ mod tests {
         let kimi =
             load_runtime_contract("relay", Some("kimi-anthropic-relay"), Some(&digest)).unwrap();
         assert_eq!(kimi.contract_id, "kimi-anthropic-relay");
+        assert_eq!(kimi.auth_scheme, AuthScheme::Bearer);
         assert_eq!(kimi.endpoint_join, EndpointJoin::AnthropicV1);
         assert_eq!(kimi.transport, "anthropic_messages");
 

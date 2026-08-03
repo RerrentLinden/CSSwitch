@@ -4,6 +4,13 @@ const RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED: &str = "provider.kimi.relay-thi
 const RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE: &str = "tool.relay.input-schema-normalize";
 const RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER: &str =
     "tool.kimi.web_search.server-tool-filter";
+const RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER: &str =
+    "tool.kimi.unsupported-server-tool-filter";
+const RULE_TOOL_DEEPSEEK_WEB_SEARCH_SERVER_TOOL_PRESERVE: &str =
+    "tool.deepseek.web_search.server-tool-preserve";
+const RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER: &str =
+    "tool.deepseek.unsupported-server-tool-filter";
+const RULE_TOOL_UNKNOWN_SERVER_TOOL_PRESERVE: &str = "tool.anthropic.unknown-server-tool-preserve";
 const RULE_HISTORY_KIMI_FAILED_TAIL_NORMALIZE: &str = "history.kimi.failed-tail-normalize";
 const RULE_TOOL_SILICONFLOW_FORCED_NAMED_TO_ANY: &str = "tool.siliconflow.forced-named-to-any";
 const SILICONFLOW_API_HOSTS: [&str; 2] = ["api.siliconflow.cn", "api.siliconflow.com"];
@@ -18,6 +25,28 @@ const MAX_RELAY_HISTORY_BLOCKS: usize = 1024;
 pub struct AnthropicMetadata {
     pub target_model: String,
     pub rule_ids: Vec<String>,
+    pub kimi_compatibility: bool,
+    pub dropped_server_tools: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicServerToolPolicy {
+    Kimi,
+    DeepSeek,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicServerToolKind {
+    WebSearch,
+    Unsupported,
+    Unknown,
+}
+
+pub fn is_kimi_relay(provider_contract_id: Option<&str>, target_model: &str) -> bool {
+    match provider_contract_id {
+        Some(contract_id) => contract_id == "kimi-anthropic-relay",
+        None => target_model.to_ascii_lowercase().contains("kimi"),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -30,6 +59,9 @@ pub struct KimiServerToolFilter {
     dropped_empty_thinking: usize,
     dropped_server_block: Option<u64>,
     thinking: Option<BufferedThinkingBlock>,
+    has_terminal_text: bool,
+    has_client_tool_use: bool,
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -86,6 +118,10 @@ impl KimiServerToolFilter {
 
     pub fn dropped_empty_thinking(&self) -> usize {
         self.dropped_empty_thinking
+    }
+
+    pub fn dropped_server_tools(&self) -> usize {
+        self.dropped_server_tools
     }
 
     fn validate_block_start(&self, idx: u64) -> Result<(), String> {
@@ -193,12 +229,43 @@ impl KimiServerToolFilter {
                 });
                 return Ok(Vec::new());
             }
+            if block_type == Some("text")
+                && obj
+                    .get("content_block")
+                    .and_then(Value::as_object)
+                    .and_then(|block| block.get("text"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+            {
+                self.has_terminal_text = true;
+            }
+            if block_type == Some("tool_use") {
+                self.has_client_tool_use = true;
+            }
             if let Some(obj_map) = obj.as_object_mut() {
                 let mapped = self.next_output_index;
                 obj_map.insert("index".to_string(), Value::Number(mapped.into()));
                 self.active_output_block = Some((idx, mapped));
             }
             return Ok(render_sse(event.as_deref(), &obj));
+        }
+        if kind == "message_delta" {
+            self.stop_reason = obj
+                .get("delta")
+                .and_then(Value::as_object)
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        if kind == "message_stop"
+            && !kimi_terminal_is_safe(
+                self.dropped_server_tools,
+                self.stop_reason.as_deref(),
+                self.has_terminal_text,
+                self.has_client_tool_use,
+            )
+        {
+            return Err("Kimi server-tool response has no safe terminal answer".into());
         }
         Ok(passthrough(frame, sep))
     }
@@ -228,6 +295,20 @@ impl KimiServerToolFilter {
         }
         if !matches!(kind.as_str(), "content_block_delta" | "content_block_stop") {
             return Err("Kimi content block ended before content_block_stop".into());
+        }
+        if kind == "content_block_delta"
+            && obj
+                .get("delta")
+                .and_then(Value::as_object)
+                .is_some_and(|delta| {
+                    delta.get("type").and_then(Value::as_str) == Some("text_delta")
+                        && delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                })
+        {
+            self.has_terminal_text = true;
         }
         if let Some(obj_map) = obj.as_object_mut() {
             obj_map.insert("index".to_string(), Value::Number(mapped.into()));
@@ -405,9 +486,35 @@ fn kimi_signature_fragment_is_valid(signature: &str) -> bool {
         .any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
+fn kimi_terminal_is_safe(
+    dropped_server_tools: usize,
+    stop_reason: Option<&str>,
+    has_terminal_text: bool,
+    has_client_tool_use: bool,
+) -> bool {
+    if dropped_server_tools > 0 {
+        return stop_reason == Some("end_turn") && has_terminal_text && !has_client_tool_use;
+    }
+    match stop_reason {
+        Some("tool_use") => has_client_tool_use,
+        Some("end_turn" | "max_tokens" | "stop_sequence" | "refusal") => {
+            has_terminal_text && !has_client_tool_use
+        }
+        _ => false,
+    }
+}
+
 pub fn filter_kimi_nonstream_response(body: &[u8]) -> Result<Vec<u8>, String> {
+    filter_kimi_nonstream_response_with_count(body).map(|(body, _)| body)
+}
+
+pub fn filter_kimi_nonstream_response_with_count(body: &[u8]) -> Result<(Vec<u8>, usize), String> {
     let mut response: Value = serde_json::from_slice(body)
         .map_err(|_| "Kimi nonstream response is not valid JSON".to_string())?;
+    let stop_reason = response
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let content = response
         .get_mut("content")
         .and_then(Value::as_array_mut)
@@ -416,11 +523,20 @@ pub fn filter_kimi_nonstream_response(body: &[u8]) -> Result<Vec<u8>, String> {
         return Err("Kimi nonstream response has too many content blocks".into());
     }
     let mut kept = Vec::with_capacity(content.len());
+    let mut dropped_server_tools = 0;
     for block in content.drain(..) {
         let object = block
             .as_object()
             .ok_or("Kimi nonstream content block is invalid")?;
-        if object.get("type").and_then(Value::as_str) != Some("thinking") {
+        let block_type = object.get("type").and_then(Value::as_str);
+        if matches!(
+            block_type,
+            Some("server_tool_use" | "web_search_tool_result")
+        ) {
+            dropped_server_tools += 1;
+            continue;
+        }
+        if block_type != Some("thinking") {
             kept.push(block);
             continue;
         }
@@ -443,7 +559,27 @@ pub fn filter_kimi_nonstream_response(body: &[u8]) -> Result<Vec<u8>, String> {
         kept.push(block);
     }
     *content = kept;
-    serde_json::to_vec(&response).map_err(|_| "Kimi nonstream response serialization failed".into())
+    let has_terminal_text = content.iter().any(|block| {
+        block.get("type").and_then(Value::as_str) == Some("text")
+            && block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+    });
+    let has_client_tool_use = content
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    if !kimi_terminal_is_safe(
+        dropped_server_tools,
+        stop_reason.as_deref(),
+        has_terminal_text,
+        has_client_tool_use,
+    ) {
+        return Err("Kimi server-tool response has no safe terminal answer".into());
+    }
+    let body = serde_json::to_vec(&response)
+        .map_err(|_| "Kimi nonstream response serialization failed".to_string())?;
+    Ok((body, dropped_server_tools))
 }
 
 fn split_frame(buf: &[u8]) -> Option<(Vec<u8>, usize, Vec<u8>)> {
@@ -610,6 +746,16 @@ fn normalize_relay_input_schema(schema: Option<&Value>) -> Value {
 }
 
 fn degrade_missing_tool_choice(body: &mut Value) {
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("tool_choice");
+        }
+        return;
+    }
     let Some(choice) = body.get("tool_choice").and_then(Value::as_object) else {
         return;
     };
@@ -628,16 +774,133 @@ fn degrade_missing_tool_choice(body: &mut Value) {
     }
 }
 
-fn is_anthropic_server_tool(tool: &Value) -> bool {
-    let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
-        return false;
+pub fn is_anthropic_client_tool(tool: &Value) -> bool {
+    let typed = tool
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|tool_type| !tool_type.is_empty());
+    !typed
+        && tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+}
+
+fn classify_anthropic_server_tool(tool: &Value) -> Option<AnthropicServerToolKind> {
+    let tool_type = tool
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|tool_type| !tool_type.is_empty())?;
+    let name = tool.get("name").and_then(Value::as_str);
+    let kind = match (tool_type, name) {
+        (tool_type, Some("web_search")) if tool_type.starts_with("web_search_") => {
+            AnthropicServerToolKind::WebSearch
+        }
+        (tool_type, Some("web_fetch")) if tool_type.starts_with("web_fetch_") => {
+            AnthropicServerToolKind::Unsupported
+        }
+        (tool_type, Some("code_execution")) if tool_type.starts_with("code_execution_") => {
+            AnthropicServerToolKind::Unsupported
+        }
+        ("mcp_toolset" | "mcp_servers", _) => AnthropicServerToolKind::Unsupported,
+        (tool_type, Some(name))
+            if tool_type.starts_with("tool_search_tool_")
+                && name.starts_with("tool_search_tool_") =>
+        {
+            AnthropicServerToolKind::Unsupported
+        }
+        (tool_type, Some(name))
+            if tool_type.starts_with("advisor_") && name.starts_with("advisor") =>
+        {
+            AnthropicServerToolKind::Unsupported
+        }
+        _ => AnthropicServerToolKind::Unknown,
     };
-    matches!(tool_type, "mcp_toolset")
-        || tool_type.starts_with("web_search_")
-        || tool_type.starts_with("web_fetch_")
-        || tool_type.starts_with("code_execution_")
-        || tool_type.starts_with("tool_search_tool_")
-        || tool_type.starts_with("advisor_")
+    Some(kind)
+}
+
+pub fn apply_anthropic_server_tool_policy(
+    body: &mut Value,
+    policy: AnthropicServerToolPolicy,
+    rule_ids: &mut Vec<String>,
+) -> usize {
+    let mut dropped = 0;
+    if body
+        .as_object_mut()
+        .is_some_and(|object| object.remove("mcp_servers").is_some())
+    {
+        dropped += 1;
+        append_rule_id(
+            rule_ids,
+            match policy {
+                AnthropicServerToolPolicy::Kimi => RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER,
+                AnthropicServerToolPolicy::DeepSeek => {
+                    RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER
+                }
+            },
+        );
+    }
+
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        if dropped > 0 {
+            append_rule_id(
+                rule_ids,
+                match policy {
+                    AnthropicServerToolPolicy::Kimi => {
+                        RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER
+                    }
+                    AnthropicServerToolPolicy::DeepSeek => {
+                        RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER
+                    }
+                },
+            );
+        }
+        degrade_missing_tool_choice(body);
+        return dropped;
+    };
+    let mut filtered = Vec::with_capacity(tools.len());
+    for tool in tools {
+        match classify_anthropic_server_tool(tool) {
+            None => filtered.push(tool.clone()),
+            Some(AnthropicServerToolKind::WebSearch) => match policy {
+                AnthropicServerToolPolicy::Kimi => {
+                    dropped += 1;
+                    append_rule_id(rule_ids, RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER);
+                }
+                AnthropicServerToolPolicy::DeepSeek => {
+                    append_rule_id(rule_ids, RULE_TOOL_DEEPSEEK_WEB_SEARCH_SERVER_TOOL_PRESERVE);
+                    filtered.push(tool.clone());
+                }
+            },
+            Some(AnthropicServerToolKind::Unsupported) => {
+                dropped += 1;
+                append_rule_id(
+                    rule_ids,
+                    match policy {
+                        AnthropicServerToolPolicy::Kimi => {
+                            RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER
+                        }
+                        AnthropicServerToolPolicy::DeepSeek => {
+                            RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER
+                        }
+                    },
+                );
+            }
+            Some(AnthropicServerToolKind::Unknown) => {
+                append_rule_id(rule_ids, RULE_TOOL_UNKNOWN_SERVER_TOOL_PRESERVE);
+                filtered.push(tool.clone());
+            }
+        }
+    }
+    if filtered.is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("tools");
+        }
+    } else {
+        body["tools"] = Value::Array(filtered);
+    }
+    degrade_missing_tool_choice(body);
+    dropped
 }
 
 fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
@@ -655,12 +918,10 @@ fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
     let mut normalized = Vec::new();
     let mut normalized_client_tool = false;
     for tool in tool_items {
-        if tool
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|tool_type| !tool_type.is_empty())
-        {
-            normalized.push(tool.clone());
+        if !is_anthropic_client_tool(tool) {
+            if classify_anthropic_server_tool(tool).is_some() {
+                normalized.push(tool.clone());
+            }
             continue;
         }
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
@@ -693,34 +954,19 @@ fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
     degrade_missing_tool_choice(body);
 }
 
-fn filter_kimi_server_tools(body: &mut Value, target_model: &str, rule_ids: &mut Vec<String>) {
+fn filter_kimi_server_tools(
+    body: &mut Value,
+    kimi_compatibility: bool,
+    rule_ids: &mut Vec<String>,
+) -> usize {
     normalize_relay_tools(body, rule_ids);
-    if !target_model.to_ascii_lowercase().contains("kimi") {
-        return;
+    if !kimi_compatibility {
+        return 0;
     }
-    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
-        return;
-    };
-    let filtered: Vec<Value> = tools
-        .iter()
-        .filter(|tool| !is_anthropic_server_tool(tool))
-        .cloned()
-        .collect();
-    if filtered.len() == tools.len() {
-        return;
-    }
-    append_rule_id(rule_ids, RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER);
-    if filtered.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("tools");
-        }
-    } else {
-        body["tools"] = Value::Array(filtered);
-    }
-    degrade_missing_tool_choice(body);
+    apply_anthropic_server_tool_policy(body, AnthropicServerToolPolicy::Kimi, rule_ids)
 }
 
-fn zero_information_kimi_block(block: &Value) -> bool {
+pub(crate) fn zero_information_kimi_block(block: &Value) -> bool {
     match block.get("type").and_then(Value::as_str) {
         Some("server_tool_use" | "web_search_tool_result") => true,
         Some("text") => block.get("text").and_then(Value::as_str) == Some(""),
@@ -747,10 +993,10 @@ fn message_has_no_information(message: &Value) -> bool {
 
 fn normalize_kimi_failed_history_tail(
     body: &mut Value,
-    target_model: &str,
+    kimi_compatibility: bool,
     rule_ids: &mut Vec<String>,
 ) -> Result<(), String> {
-    if !target_model.to_ascii_lowercase().contains("kimi") {
+    if !kimi_compatibility {
         return Ok(());
     }
     let messages = body
@@ -931,10 +1177,20 @@ fn apply_siliconflow_tool_choice_compat(
 }
 
 pub fn transform_relay_request(
+    body: Value,
+    target_model: &str,
+    relay_thinking: Option<&str>,
+    upstream_url: &str,
+) -> Result<(Value, AnthropicMetadata), String> {
+    transform_relay_request_for_contract(body, target_model, relay_thinking, upstream_url, None)
+}
+
+pub fn transform_relay_request_for_contract(
     mut body: Value,
     target_model: &str,
     relay_thinking: Option<&str>,
     upstream_url: &str,
+    provider_contract_id: Option<&str>,
 ) -> Result<(Value, AnthropicMetadata), String> {
     let obj = body
         .as_object_mut()
@@ -947,21 +1203,25 @@ pub fn transform_relay_request(
         return Err("resolved upstream model is required".into());
     }
     let target_model = target_model.to_string();
+    let kimi_compatibility = is_kimi_relay(provider_contract_id, &target_model);
     let mut rule_ids = Vec::new();
-    if relay_thinking == Some("enabled") && target_model.to_ascii_lowercase().contains("kimi") {
+    if relay_thinking == Some("enabled") && kimi_compatibility {
         append_rule_id(&mut rule_ids, RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED);
     }
     obj.insert("model".to_string(), Value::String(target_model.clone()));
-    normalize_kimi_failed_history_tail(&mut body, &target_model, &mut rule_ids)?;
+    normalize_kimi_failed_history_tail(&mut body, kimi_compatibility, &mut rule_ids)?;
     validate_relay_tool_history(&body)?;
     normalize_relay_thinking(&mut body, relay_thinking);
-    filter_kimi_server_tools(&mut body, &target_model, &mut rule_ids);
+    let dropped_server_tools =
+        filter_kimi_server_tools(&mut body, kimi_compatibility, &mut rule_ids);
     apply_siliconflow_tool_choice_compat(&mut body, upstream_url, &mut rule_ids);
     Ok((
         body,
         AnthropicMetadata {
             target_model,
             rule_ids,
+            kimi_compatibility,
+            dropped_server_tools,
         },
     ))
 }
@@ -969,8 +1229,9 @@ pub fn transform_relay_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_kimi_nonstream_response, is_siliconflow_anthropic_endpoint, transform_relay_request,
-        KimiServerToolFilter, MAX_KIMI_FRAME_BYTES,
+        filter_kimi_nonstream_response, filter_kimi_nonstream_response_with_count,
+        is_siliconflow_anthropic_endpoint, transform_relay_request,
+        transform_relay_request_for_contract, KimiServerToolFilter, MAX_KIMI_FRAME_BYTES,
     };
     use serde_json::{json, Value};
 
@@ -1143,8 +1404,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_kimi_removed_tool_choice_degrades_to_auto_without_enabled_thinking() {
-        let (mapped, _metadata) = transform_relay_request(
+    fn relay_kimi_drops_typed_web_search_and_invalid_forced_choice() {
+        let (mapped, metadata) = transform_relay_request(
             json!({
                 "model": "claude-opus-4-8",
                 "messages": [],
@@ -1157,7 +1418,12 @@ mod tests {
         )
         .unwrap();
         assert!(mapped.get("tools").is_none());
-        assert_eq!(mapped["tool_choice"], json!({"type": "auto"}));
+        assert!(mapped.get("tool_choice").is_none());
+        assert_eq!(metadata.dropped_server_tools, 1);
+        assert_eq!(
+            metadata.rule_ids,
+            vec!["tool.kimi.web_search.server-tool-filter".to_string()]
+        );
     }
 
     #[test]
@@ -1211,39 +1477,140 @@ mod tests {
     }
 
     #[test]
-    fn kimi_filters_server_tools_by_type_without_deleting_same_named_client_tool() {
-        let (mapped, metadata) = transform_relay_request(
+    fn kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools() {
+        let media = json!({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}
+            }]
+        });
+        let (mapped, metadata) = transform_relay_request_for_contract(
             json!({
                 "model": "claude-sonnet-5",
-                "messages": [],
-                "tool_choice": {"type": "tool", "name": "web_search"},
+                "messages": [media.clone()],
+                "mcp_servers": [{"type": "url", "url": "https://example.invalid"}],
+                "tool_choice": {"type": "tool", "name": "web_fetch"},
                 "tools": [
                     {"type": "web_search_20250305", "name": "web_search"},
                     {"type": "web_fetch_20260209", "name": "web_fetch"},
+                    {"type": "code_execution_20250825", "name": "code_execution"},
                     {"type": "mcp_toolset", "mcp_server_name": "pubmed"},
-                    {"name": "web_search", "input_schema": {"type": "object"}}
+                    {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+                    {"type": "advisor_20251001", "name": "advisor"},
+                    {"type": "vendor_server_tool_20990101", "vendor_option": true},
+                    {"type": "web_fetch_20260209", "name": "not_web_fetch", "vendor_option": true},
+                    {"name": "web_search", "input_schema": {"type": "object"}},
+                    {"name": "python", "input_schema": {"type": "object"}},
+                    {"name": "bash", "input_schema": {"type": "object"}},
+                    {"name": "r", "input_schema": {"type": "object"}},
+                    {"name": "repl", "input_schema": {"type": "object"}},
+                    {"name": "compute", "input_schema": {"type": "object"}}
                 ]
             }),
-            "kimi-k3",
+            "k3-256k",
             None,
             "",
+            Some("kimi-anthropic-relay"),
         )
         .unwrap();
         assert_eq!(
             mapped["tools"],
-            json!([{"name": "web_search", "input_schema": {"type": "object", "properties": {}}}])
+            json!([
+                {"type": "vendor_server_tool_20990101", "vendor_option": true},
+                {"type": "web_fetch_20260209", "name": "not_web_fetch", "vendor_option": true},
+                {"name": "web_search", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "python", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "bash", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "r", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "repl", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "compute", "input_schema": {"type": "object", "properties": {}}}
+            ])
         );
-        assert_eq!(
-            mapped["tool_choice"],
-            json!({"type": "tool", "name": "web_search"})
-        );
+        assert_eq!(mapped["tool_choice"], json!({"type": "auto"}));
+        assert_eq!(mapped["messages"][0], media);
+        assert!(mapped.get("mcp_servers").is_none());
+        assert!(metadata.kimi_compatibility);
+        assert_eq!(metadata.dropped_server_tools, 7);
         assert_eq!(
             metadata.rule_ids,
             vec![
                 "tool.relay.input-schema-normalize".to_string(),
+                "tool.kimi.unsupported-server-tool-filter".to_string(),
                 "tool.kimi.web_search.server-tool-filter".to_string(),
+                "tool.anthropic.unknown-server-tool-preserve".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn kimi_contract_identity_covers_raw_k3_models_without_leaking_to_other_relays() {
+        for model in ["k3", "k3-256k"] {
+            let request = json!({
+                "messages": [
+                    {"role": "user", "content": "search"},
+                    {"role": "assistant", "content": [
+                        {"type": "server_tool_use", "name": "web_search"},
+                        {"type": "web_search_tool_result", "content": []},
+                        {"type": "text", "text": ""}
+                    ]},
+                    {"role": "user", "content": "continue"}
+                ]
+            });
+            let (mapped, metadata) = transform_relay_request_for_contract(
+                request.clone(),
+                model,
+                Some("enabled"),
+                "",
+                Some("kimi-anthropic-relay"),
+            )
+            .unwrap();
+            assert!(metadata.kimi_compatibility, "{model}");
+            assert_eq!(mapped["messages"].as_array().unwrap().len(), 2, "{model}");
+
+            let (control, metadata) = transform_relay_request_for_contract(
+                request,
+                model,
+                None,
+                "",
+                Some("custom-anthropic"),
+            )
+            .unwrap();
+            assert!(!metadata.kimi_compatibility, "{model}");
+            assert_eq!(control["messages"].as_array().unwrap().len(), 3, "{model}");
+        }
+
+        let (_, standalone) =
+            transform_relay_request(json!({"messages": []}), "kimi-legacy", None, "").unwrap();
+        assert!(standalone.kimi_compatibility);
+    }
+
+    #[test]
+    fn kimi_all_unsupported_tools_remove_every_tool_choice_shape() {
+        for tool_choice in [
+            json!({"type": "any"}),
+            json!({"type": "auto"}),
+            json!({"type": "tool", "name": "web_fetch"}),
+        ] {
+            let (mapped, metadata) = transform_relay_request_for_contract(
+                json!({
+                    "messages": [],
+                    "tools": [
+                        {"type": "web_fetch_20260209", "name": "web_fetch"},
+                        {"type": "code_execution_20250825", "name": "code_execution"}
+                    ],
+                    "tool_choice": tool_choice
+                }),
+                "k3",
+                None,
+                "",
+                Some("kimi-anthropic-relay"),
+            )
+            .unwrap();
+            assert!(mapped.get("tools").is_none());
+            assert!(mapped.get("tool_choice").is_none());
+            assert_eq!(metadata.dropped_server_tools, 2);
+        }
     }
 
     #[test]
@@ -1260,7 +1627,9 @@ mod tests {
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":4}\n\n"
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":4}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
         let mut filter = KimiServerToolFilter::new();
         let midpoint = sse.len() / 2;
@@ -1275,6 +1644,66 @@ mod tests {
         assert!(text.contains("\"text\":\"OK\""));
         assert_eq!(filter.dropped(), 3);
         assert_eq!(filter.dropped_empty_thinking(), 1);
+    }
+
+    #[test]
+    fn kimi_stream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses() {
+        for (stop_reason, with_text) in [
+            ("end_turn", false),
+            ("pause_turn", true),
+            ("tool_use", true),
+        ] {
+            let text = if with_text {
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            } else {
+                ""
+            };
+            let sse = format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"server_tool_use\",\"name\":\"web_search\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n{text}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let mut filter = KimiServerToolFilter::new();
+            assert_eq!(
+                filter.feed(sse.as_bytes()).unwrap_err(),
+                "Kimi server-tool response has no safe terminal answer"
+            );
+        }
+
+        for (stop_reason, text) in [("end_turn", "   "), ("pause_turn", "answer")] {
+            let sse = format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"{text}\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let mut filter = KimiServerToolFilter::new();
+            assert_eq!(
+                filter.feed(sse.as_bytes()).unwrap_err(),
+                "Kimi server-tool response has no safe terminal answer"
+            );
+        }
+
+        let ordinary_tool = concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"python\",\"input\":{}}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut filter = KimiServerToolFilter::new();
+        assert!(!filter.feed(ordinary_tool.as_bytes()).unwrap().is_empty());
+        assert!(filter.finalize().unwrap().is_empty());
+
+        let mixed_terminal = concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"name\":\"web_search\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"python\",\"input\":{}}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"answer\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut filter = KimiServerToolFilter::new();
+        assert_eq!(
+            filter.feed(mixed_terminal.as_bytes()).unwrap_err(),
+            "Kimi server-tool response has no safe terminal answer"
+        );
     }
 
     #[test]
@@ -1424,14 +1853,18 @@ mod tests {
             "type": "message",
             "content": [
                 {"type": "thinking", "thinking": "", "signature": ""},
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search"},
+                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []},
                 {"type": "thinking", "thinking": "kept", "signature": "opaque"},
                 {"type": "text", "text": "answer"}
             ],
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 1, "output_tokens": 2}
         });
-        let filtered = filter_kimi_nonstream_response(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let (filtered, dropped) =
+            filter_kimi_nonstream_response_with_count(&serde_json::to_vec(&body).unwrap()).unwrap();
         let parsed: Value = serde_json::from_slice(&filtered).unwrap();
+        assert_eq!(dropped, 2);
         assert_eq!(parsed["content"].as_array().unwrap().len(), 2);
         assert_eq!(parsed["content"][0]["thinking"], "kept");
         assert_eq!(parsed["stop_reason"], "end_turn");
@@ -1443,6 +1876,62 @@ mod tests {
         assert_eq!(
             filter_kimi_nonstream_response(&serde_json::to_vec(&invalid).unwrap()).unwrap_err(),
             "Kimi nonempty thinking has no valid signature"
+        );
+    }
+
+    #[test]
+    fn kimi_nonstream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses() {
+        for (stop_reason, text) in [
+            ("end_turn", ""),
+            ("pause_turn", "answer"),
+            ("tool_use", "answer"),
+        ] {
+            let body = json!({
+                "content": [
+                    {"type": "server_tool_use", "id": "srv", "name": "web_search"},
+                    {"type": "web_search_tool_result", "tool_use_id": "srv", "content": []},
+                    {"type": "text", "text": text}
+                ],
+                "stop_reason": stop_reason
+            });
+            assert_eq!(
+                filter_kimi_nonstream_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
+                "Kimi server-tool response has no safe terminal answer"
+            );
+        }
+
+        for body in [
+            json!({"content": [], "stop_reason": "end_turn"}),
+            json!({"content": [{"type": "text", "text": "   "}], "stop_reason": "end_turn"}),
+            json!({"content": [{"type": "text", "text": "answer"}], "stop_reason": "pause_turn"}),
+        ] {
+            assert_eq!(
+                filter_kimi_nonstream_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
+                "Kimi server-tool response has no safe terminal answer"
+            );
+        }
+
+        let ordinary_tool = json!({
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "python", "input": {}}],
+            "stop_reason": "tool_use"
+        });
+        assert!(
+            filter_kimi_nonstream_response(&serde_json::to_vec(&ordinary_tool).unwrap()).is_ok()
+        );
+
+        let mixed_terminal = json!({
+            "content": [
+                {"type": "server_tool_use", "id": "srv", "name": "web_search"},
+                {"type": "web_search_tool_result", "tool_use_id": "srv", "content": []},
+                {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {}},
+                {"type": "text", "text": "answer"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        assert_eq!(
+            filter_kimi_nonstream_response(&serde_json::to_vec(&mixed_terminal).unwrap())
+                .unwrap_err(),
+            "Kimi server-tool response has no safe terminal answer"
         );
     }
 }

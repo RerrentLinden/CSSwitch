@@ -70,7 +70,7 @@
       "api_formats": ["anthropic"],
       "adapter": "relay",
       "auth_mode": "api_key",
-      "auth_scheme": "anthropic_dual",
+      "auth_scheme": "bearer",
       "credential_sources": ["api_key"],
       "default_credential_source": "api_key",
       "model_policies": ["saved_catalog"],

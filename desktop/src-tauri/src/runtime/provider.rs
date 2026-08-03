@@ -386,7 +386,8 @@ pub(crate) fn proxy_fingerprint_with_runtime(
 ) -> u64 {
     let shim_mode = normalize_shim_mode(&launch.adapter, Some(shim_mode));
     key_fingerprint(&format!(
-        "{}\n{}\n{}\n{}\n{}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "profile-id={}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}",
+        p.id,
         p.template_id,
         p.api_format,
         launch.contract_id,
@@ -1062,6 +1063,33 @@ mod tests {
             kimi_fp, custom_fp,
             "同 adapter/base/model/key 但模板语义不同，必须重启代理"
         );
+    }
+
+    #[test]
+    fn proxy_fingerprint_changes_with_saved_profile_identity() {
+        for (template_id, base_url, model) in [
+            ("kimi", "https://api.kimi.com/coding/", "k3"),
+            ("deepseek", "https://api.deepseek.com/anthropic", ""),
+        ] {
+            let first = complete_saved_profile(Profile {
+                id: format!("{template_id}-profile-a"),
+                template_id: template_id.into(),
+                api_format: "anthropic".into(),
+                base_url: base_url.into(),
+                api_key: "same-key".into(),
+                model: model.into(),
+                ..Default::default()
+            });
+            let mut second = first.clone();
+            second.id = format!("{template_id}-profile-b");
+            let launch = proxy_args_for(&first).unwrap().formal();
+
+            assert_ne!(
+                proxy_fingerprint(&first, &launch),
+                proxy_fingerprint(&second, &launch),
+                "不同保存 profile 必须重启 Gateway，避免复用旧 reasoning scope"
+            );
+        }
     }
 
     #[test]

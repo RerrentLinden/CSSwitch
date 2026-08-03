@@ -142,7 +142,23 @@ class ProviderMockScenarioTests(unittest.TestCase):
         self.assertEqual(deepseek.checks["headers"]["anthropic-version"]["equals"], "2023-06-01")
         deepseek_formal = scenarios["installed_deepseek_matrix"].steps[1]
         self.assertEqual(deepseek_formal.checks["body"]["equals"]["/max_tokens"], 65536)
-        self.assertEqual(deepseek_formal.checks["body"]["equals"]["/thinking/type"], "adaptive")
+        self.assertEqual(deepseek_formal.checks["body"]["equals"]["/thinking/type"], "auto")
+        for step_id in (
+            "deepseek-formal-detect",
+            "deepseek-formal-rewrite",
+            "deepseek-formal-rewrite-stream",
+        ):
+            deepseek_tools = next(
+                step
+                for step in scenarios["installed_deepseek_matrix"].steps
+                if step.step_id == step_id
+            )
+            self.assertEqual(
+                deepseek_tools.checks["body"]["equals"]["/tools/1/type"],
+                "web_search_20250305",
+            )
+            self.assertIn("/tools/6", deepseek_tools.checks["body"]["absent"])
+            self.assertIn("/mcp_servers", deepseek_tools.checks["body"]["absent"])
 
         qwen_tool = scenarios["installed_qwen_matrix"].steps[2]
         self.assertEqual(qwen_tool.checks["body"]["equals"]["/max_tokens"], 8192)
@@ -162,8 +178,14 @@ class ProviderMockScenarioTests(unittest.TestCase):
 
         relay = scenarios["installed_relay_matrix"]
         kimi = next(step for step in relay.steps if step.step_id == "relay-formal-kimi-thinking-filter")
+        self.assertEqual(kimi.checks["body"]["equals"]["/model"], "k3-256k")
         self.assertEqual(kimi.checks["body"]["equals"]["/thinking/budget_tokens"], 1024)
-        self.assertIn("/tools/2", kimi.checks["body"]["absent"])
+        self.assertEqual(
+            kimi.checks["body"]["equals"]["/tools/2/type"],
+            "web_search_20250305",
+        )
+        self.assertIn("/tools/7", kimi.checks["body"]["absent"])
+        self.assertIn("/mcp_servers", kimi.checks["body"]["absent"])
         self.assertIn("/tool_choice", kimi.checks["body"]["absent"])
 
         for prefix in ("deepseek", "qwen", "openai_chat", "openai_responses", "relay"):

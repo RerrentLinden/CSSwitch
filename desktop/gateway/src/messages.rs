@@ -1,9 +1,12 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::{Client, Response};
+use reqwest::header::HeaderValue;
 use serde_json::Value;
 
 use crate::config::{GatewayConfig, UPSTREAM_UA};
@@ -21,6 +24,13 @@ pub struct UpstreamError {
     pub status: u16,
     pub upstream_status: Option<u16>,
     pub detail: String,
+}
+
+pub(crate) fn upstream_failure_metadata(operation: &'static str, error: &UpstreamError) -> String {
+    format!(
+        "POST /v1/messages upstream_failure operation={operation} status={} upstream_status={:?}",
+        error.status, error.upstream_status
+    )
 }
 
 #[derive(Debug)]
@@ -51,6 +61,61 @@ const INFERENCE_TIMEOUTS: InferenceTimeouts = InferenceTimeouts {
 };
 
 const MAX_ERROR_BODY_BYTES: u64 = 16 * 1024;
+const KIMI_CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+const KIMI_CLAUDE_CODE_UA: &str = "claude-cli/2.1.220 (external, cli)";
+
+#[derive(Clone, Debug, Default)]
+pub struct AnthropicTransport {
+    anthropic_version: Option<String>,
+    anthropic_beta: Option<String>,
+    x_app: Option<String>,
+    user_agent: Option<String>,
+    beta_query: bool,
+}
+
+impl AnthropicTransport {
+    pub(crate) fn from_inbound(
+        target: &str,
+        headers: &HashMap<String, String>,
+    ) -> Result<Self, String> {
+        fn allowed_header(
+            headers: &HashMap<String, String>,
+            name: &str,
+        ) -> Result<Option<String>, String> {
+            if headers.get("connection").is_some_and(|connection| {
+                connection
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(name))
+            }) {
+                return Ok(None);
+            }
+            let Some(value) = headers.get(name) else {
+                return Ok(None);
+            };
+            let value = HeaderValue::from_bytes(value.as_bytes())
+                .map_err(|_| format!("invalid {name} header"))?;
+            let value = value
+                .to_str()
+                .map_err(|_| format!("invalid {name} header"))?;
+            Ok(Some(value.to_string()))
+        }
+
+        let beta_query = target
+            .split_once('?')
+            .map(|(_, query)| query.split_once('#').map_or(query, |(query, _)| query))
+            .is_some_and(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .any(|(name, value)| name == "beta" && value == "true")
+            });
+        Ok(Self {
+            anthropic_version: allowed_header(headers, "anthropic-version")?,
+            anthropic_beta: allowed_header(headers, "anthropic-beta")?,
+            x_app: allowed_header(headers, "x-app")?,
+            user_agent: allowed_header(headers, "user-agent")?,
+            beta_query,
+        })
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum BodyReadFailure {
@@ -128,6 +193,74 @@ fn auth_scheme(cfg: &GatewayConfig) -> AuthScheme {
         })
 }
 
+fn is_kimi_anthropic_relay(cfg: &GatewayConfig) -> bool {
+    cfg.provider_contract
+        .as_ref()
+        .is_some_and(|contract| contract.contract_id == "kimi-anthropic-relay")
+}
+
+fn messages_post_url<'a>(
+    cfg: &'a GatewayConfig,
+    transport: Option<&AnthropicTransport>,
+) -> Result<Cow<'a, str>, UpstreamError> {
+    if transport.is_none() && !is_kimi_anthropic_relay(cfg) {
+        return Ok(Cow::Borrowed(&cfg.upstream_url));
+    }
+    let mut url = reqwest::Url::parse(&cfg.upstream_url).map_err(|_| UpstreamError {
+        status: 502,
+        upstream_status: None,
+        detail: "Anthropic upstream URL is invalid".into(),
+    })?;
+    let mut beta_query =
+        is_kimi_anthropic_relay(cfg) || transport.is_some_and(|transport| transport.beta_query);
+    if !beta_query && !url.query_pairs().any(|(key, _)| key == "beta") {
+        return Ok(Cow::Borrowed(&cfg.upstream_url));
+    }
+    let existing = url
+        .query_pairs()
+        .filter_map(|(key, value)| {
+            if key == "beta" {
+                beta_query |= value == "true";
+                None
+            } else {
+                Some((key.into_owned(), value.into_owned()))
+            }
+        })
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    if !existing.is_empty() || beta_query {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in existing {
+            query.append_pair(&key, &value);
+        }
+        if beta_query {
+            query.append_pair("beta", "true");
+        }
+    }
+    Ok(Cow::Owned(url.into()))
+}
+
+fn merged_anthropic_beta(
+    cfg: &GatewayConfig,
+    transport: Option<&AnthropicTransport>,
+) -> Option<String> {
+    let incoming = transport.and_then(|transport| transport.anthropic_beta.as_deref());
+    if !is_kimi_anthropic_relay(cfg) {
+        return incoming.map(str::to_string);
+    }
+    match incoming {
+        Some(value)
+            if value
+                .split(',')
+                .any(|token| token.trim() == KIMI_CLAUDE_CODE_BETA) =>
+        {
+            Some(value.to_string())
+        }
+        Some(value) if !value.trim().is_empty() => Some(format!("{KIMI_CLAUDE_CODE_BETA},{value}")),
+        _ => Some(KIMI_CLAUDE_CODE_BETA.to_string()),
+    }
+}
+
 fn models_timeout_secs(provider: &str) -> u64 {
     if provider == "qwen" || provider == "openai-custom" || provider == "openai-responses" {
         300
@@ -196,21 +329,47 @@ fn post_with_timeouts(
     body: Vec<u8>,
     timeouts: InferenceTimeouts,
     enforce_total: bool,
+    transport: Option<&AnthropicTransport>,
 ) -> Result<Response, UpstreamError> {
     let api_key = cfg.api_key.as_deref().unwrap_or("");
-    let request = inference_client(timeouts, enforce_total)?
-        .post(&cfg.upstream_url)
+    let upstream_url = messages_post_url(cfg, transport)?;
+    let kimi = is_kimi_anthropic_relay(cfg);
+    let user_agent = transport
+        .and_then(|transport| transport.user_agent.as_deref())
+        .filter(|user_agent| !kimi || user_agent.starts_with("claude-cli/"))
+        .unwrap_or(if kimi {
+            KIMI_CLAUDE_CODE_UA
+        } else {
+            UPSTREAM_UA
+        });
+    let mut request = inference_client(timeouts, enforce_total)?
+        .post(upstream_url.as_ref())
         .header("content-type", "application/json")
-        .header("user-agent", UPSTREAM_UA);
-    let request = match auth_scheme(cfg) {
+        .header("user-agent", user_agent);
+    if let Some(version) = transport.and_then(|transport| transport.anthropic_version.as_deref()) {
+        request = request.header("anthropic-version", version);
+    } else if transport.is_some()
+        || matches!(
+            auth_scheme(cfg),
+            AuthScheme::AnthropicDual | AuthScheme::AnthropicXApiKey
+        )
+    {
+        request = request.header("anthropic-version", "2023-06-01");
+    }
+    if let Some(beta) = merged_anthropic_beta(cfg, transport) {
+        request = request.header("anthropic-beta", beta);
+    }
+    if kimi {
+        request = request.header("x-app", "cli");
+    } else if let Some(x_app) = transport.and_then(|transport| transport.x_app.as_deref()) {
+        request = request.header("x-app", x_app);
+    }
+    request = match auth_scheme(cfg) {
         AuthScheme::Bearer => request.header("authorization", format!("Bearer {api_key}")),
         AuthScheme::AnthropicDual => request
-            .header("anthropic-version", "2023-06-01")
             .header("x-api-key", api_key)
             .header("authorization", format!("Bearer {api_key}")),
-        AuthScheme::AnthropicXApiKey => request
-            .header("anthropic-version", "2023-06-01")
-            .header("x-api-key", api_key),
+        AuthScheme::AnthropicXApiKey => request.header("x-api-key", api_key),
         // Codex requests use codex_transport and never reach this generic API-key path.
         AuthScheme::CsswitchOauth => request,
     };
@@ -458,10 +617,14 @@ fn map_http_error(
     }
 }
 
-pub fn post_nonstream(cfg: &GatewayConfig, body: Vec<u8>) -> Result<UpstreamBody, UpstreamError> {
+pub fn post_nonstream(
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    transport: Option<&AnthropicTransport>,
+) -> Result<UpstreamBody, UpstreamError> {
     let timeouts = inference_timeouts(cfg);
     let started = Instant::now();
-    let resp = post_with_timeouts(cfg, body, timeouts, true)?;
+    let resp = post_with_timeouts(cfg, body, timeouts, true, transport)?;
     if !resp.status().is_success() {
         return Err(map_http_error(
             resp,
@@ -530,10 +693,14 @@ fn read_first_line(resp: &mut Response) -> Result<Vec<u8>, UpstreamError> {
     Ok(first)
 }
 
-pub fn open_stream(cfg: &GatewayConfig, body: Vec<u8>) -> Result<UpstreamStream, UpstreamError> {
+pub fn open_stream(
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    transport: Option<&AnthropicTransport>,
+) -> Result<UpstreamStream, UpstreamError> {
     let timeouts = inference_timeouts(cfg);
     let started = Instant::now();
-    let resp = post_with_timeouts(cfg, body, timeouts, false)?;
+    let resp = post_with_timeouts(cfg, body, timeouts, false, transport)?;
     if !resp.status().is_success() {
         return Err(map_http_error(
             resp,
@@ -564,6 +731,7 @@ pub fn open_stream(cfg: &GatewayConfig, body: Vec<u8>) -> Result<UpstreamStream,
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -572,11 +740,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        models_timeout_secs, models_timeouts, post_with_timeouts, read_body_with_deadline,
-        read_first_line, redact_error_body, BodyReadFailure, InferenceTimeouts, ModelsTimeouts,
+        messages_post_url, models_timeout_secs, models_timeouts, post_with_timeouts,
+        read_body_with_deadline, read_first_line, redact_error_body, upstream_failure_metadata,
+        AnthropicTransport, BodyReadFailure, InferenceTimeouts, ModelsTimeouts, UpstreamError,
         INFERENCE_TIMEOUTS,
     };
     use crate::config::GatewayConfig;
+    use crate::provider_contracts::AuthScheme;
 
     fn bind_loopback() -> TcpListener {
         loop {
@@ -587,7 +757,7 @@ mod tests {
         }
     }
 
-    fn read_request(stream: &mut TcpStream) {
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set mock read timeout");
@@ -613,7 +783,7 @@ mod tests {
                 }
             }
             if expected_len.is_some_and(|len| request.len() >= len) {
-                return;
+                return request;
             }
         }
     }
@@ -624,7 +794,7 @@ mod tests {
         let total_len = chunks.iter().map(|(_, chunk)| chunk.len()).sum::<usize>();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept gateway request");
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {total_len}\r\n\r\n"
@@ -654,7 +824,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let serve = |mut stream: TcpStream| {
                 count_for_thread.fetch_add(1, Ordering::SeqCst);
-                read_request(&mut stream);
+                let _ = read_request(&mut stream);
                 let _ = stream.write_all(&response);
                 let _ = stream.flush();
             };
@@ -675,6 +845,25 @@ mod tests {
         (format!("http://{address}/v1/messages"), count, handle)
     }
 
+    fn spawn_captured_response() -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+        let listener = bind_loopback();
+        let address = listener.local_addr().expect("mock address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept gateway request");
+            request_tx
+                .send(read_request(&mut stream))
+                .expect("capture gateway request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("write mock response");
+            stream.flush().expect("flush mock response");
+        });
+        (format!("http://{address}/v1/messages"), request_rx, handle)
+    }
+
     fn spawn_redirect_response() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
         let listener = bind_loopback();
         let address = listener.local_addr().expect("mock address");
@@ -683,7 +872,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let serve = |mut stream: TcpStream, redirect: bool| {
                 count_for_thread.fetch_add(1, Ordering::SeqCst);
-                read_request(&mut stream);
+                let _ = read_request(&mut stream);
                 let response = if redirect {
                     format!(
                         "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -742,7 +931,7 @@ mod tests {
         let (blocked_tx, blocked_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept gateway request");
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             let declared_len = first.map_or(1, |chunk| chunk.len() + 1);
             write!(
                 stream,
@@ -779,6 +968,7 @@ mod tests {
             shim_mode: "off".to_string(),
             codex_state_root: None,
             codex_contract: None,
+            reasoning_store: None,
             launch_id: "timeout-test".to_string(),
             skill_data_dir: None,
             skill_bridge_dir: None,
@@ -813,17 +1003,156 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_messages_url_keeps_only_one_safe_beta_query() {
+        let original = "http://127.0.0.1:9/v1/messages?opaque=%2Fvalue&beta=false&beta=true";
+        let transport = AnthropicTransport::from_inbound(
+            "/local-secret/v1/messages?beta=true&nonce=local-nonce",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mut kimi = test_config(original.into());
+        let mut contract =
+            crate::provider_contracts::load_runtime_contract("deepseek", None, None).unwrap();
+        contract.contract_id = "kimi-anthropic-relay".into();
+        kimi.provider_contract = Some(contract);
+        assert_eq!(
+            messages_post_url(&kimi, Some(&transport)).unwrap(),
+            "http://127.0.0.1:9/v1/messages?opaque=%2Fvalue&beta=true"
+        );
+
+        let custom = test_config("http://127.0.0.1:9/v1/messages?beta=false".into());
+        let no_beta = AnthropicTransport::from_inbound(
+            "/local-secret/v1/messages?beta=false&nonce=local-nonce",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            messages_post_url(&custom, Some(&no_beta)).unwrap(),
+            "http://127.0.0.1:9/v1/messages"
+        );
+    }
+
+    #[test]
+    fn generic_anthropic_loopback_forwards_allowlist_and_rebuilds_sensitive_transport() {
+        let (url, request_rx, upstream) = spawn_captured_response();
+        let mut headers = HashMap::from([
+            ("anthropic-version".into(), "2024-01-01".into()),
+            ("anthropic-beta".into(), "incoming-a,incoming-b".into()),
+            ("x-app".into(), "science".into()),
+            ("user-agent".into(), "Claude-Science/1.2".into()),
+            ("authorization".into(), "Bearer client-auth-secret".into()),
+            ("x-api-key".into(), "client-api-secret".into()),
+            ("cookie".into(), "client-cookie-secret".into()),
+            ("host".into(), "local-host-secret".into()),
+            ("content-length".into(), "999".into()),
+            ("connection".into(), "x-hop-secret".into()),
+            ("x-hop-secret".into(), "client-hop-secret".into()),
+            ("keep-alive".into(), "local-keepalive-secret".into()),
+            (
+                "proxy-authorization".into(),
+                "local-proxy-auth-secret".into(),
+            ),
+            ("transfer-encoding".into(), "chunked".into()),
+            ("x-local-nonce".into(), "local-header-nonce".into()),
+            ("x-path-secret".into(), "local-header-path-secret".into()),
+        ]);
+        let transport = AnthropicTransport::from_inbound(
+            "/local-path-secret/v1/messages?beta=true&beta=false&nonce=local-query-nonce",
+            &headers,
+        )
+        .unwrap();
+        headers.clear();
+        let mut cfg = test_config(format!("{url}?trusted=%2Fvalue&beta=false"));
+        cfg.provider = "deepseek".into();
+        super::post_nonstream(&cfg, b"{}".to_vec(), Some(&transport)).unwrap();
+
+        let request = String::from_utf8(request_rx.recv().unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(request.starts_with("post /v1/messages?trusted=%2fvalue&beta=true http/1.1\r\n"));
+        assert_eq!(request.matches("beta=true").count(), 1);
+        assert!(request.contains("anthropic-version: 2024-01-01\r\n"));
+        assert!(request.contains("anthropic-beta: incoming-a,incoming-b\r\n"));
+        assert!(request.contains("x-app: science\r\n"));
+        assert!(request.contains("user-agent: claude-science/1.2\r\n"));
+        assert!(request.contains("x-api-key: fake-key\r\n"));
+        assert!(request.contains("content-length: 2\r\n"));
+        for forbidden in [
+            "client-auth-secret",
+            "client-api-secret",
+            "client-cookie-secret",
+            "local-host-secret",
+            "client-hop-secret",
+            "local-keepalive-secret",
+            "local-proxy-auth-secret",
+            "local-header-nonce",
+            "local-header-path-secret",
+            "local-path-secret",
+            "local-query-nonce",
+        ] {
+            assert!(!request.contains(forbidden), "leaked {forbidden}");
+        }
+        upstream.join().unwrap();
+    }
+
+    #[test]
+    fn connection_nominated_anthropic_header_is_not_forwardable() {
+        let transport = AnthropicTransport::from_inbound(
+            "/v1/messages",
+            &HashMap::from([
+                ("connection".into(), "keep-alive, anthropic-beta".into()),
+                ("anthropic-beta".into(), "must-not-forward".into()),
+            ]),
+        )
+        .unwrap();
+        assert!(transport.anthropic_beta.is_none());
+    }
+
+    #[test]
+    fn kimi_anthropic_loopback_merges_beta_and_uses_claude_code_identity() {
+        let (url, request_rx, upstream) = spawn_captured_response();
+        let transport = AnthropicTransport::from_inbound(
+            "/v1/messages",
+            &HashMap::from([
+                ("anthropic-beta".into(), "incoming-a,incoming-b".into()),
+                ("x-app".into(), "science".into()),
+                ("user-agent".into(), "Claude-Science/1.2".into()),
+            ]),
+        )
+        .unwrap();
+        let mut cfg = test_config(url);
+        cfg.provider = "relay".into();
+        let mut contract =
+            crate::provider_contracts::load_runtime_contract("deepseek", None, None).unwrap();
+        contract.contract_id = "kimi-anthropic-relay".into();
+        contract.auth_scheme = AuthScheme::Bearer;
+        cfg.provider_contract = Some(contract);
+        super::post_nonstream(&cfg, b"{}".to_vec(), Some(&transport)).unwrap();
+
+        let request = String::from_utf8(request_rx.recv().unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(request.starts_with("post /v1/messages?beta=true http/1.1\r\n"));
+        assert!(request.contains("anthropic-beta: claude-code-20250219,incoming-a,incoming-b\r\n"));
+        assert!(request.contains("user-agent: claude-cli/2.1.220 (external, cli)\r\n"));
+        assert!(request.contains("x-app: cli\r\n"));
+        assert!(request.contains("authorization: bearer fake-key\r\n"));
+        assert!(!request.contains("x-api-key:"));
+        upstream.join().unwrap();
+    }
+
+    #[test]
     fn nonstream_body_failure_and_empty_stream_handshake_post_exactly_once() {
         let incomplete_json = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}".to_vec();
         let (url, count, upstream) = spawn_counted_response(incomplete_json);
-        let error = super::post_nonstream(&test_config(url), b"{}".to_vec()).unwrap_err();
+        let error = super::post_nonstream(&test_config(url), b"{}".to_vec(), None).unwrap_err();
         assert_eq!(error.status, 502);
         upstream.join().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         let empty_sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
         let (url, count, upstream) = spawn_counted_response(empty_sse);
-        let opened = super::open_stream(&test_config(url), b"{}".to_vec()).unwrap();
+        let opened = super::open_stream(&test_config(url), b"{}".to_vec(), None).unwrap();
         drop(opened);
         upstream.join().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -832,7 +1161,7 @@ mod tests {
     #[test]
     fn inference_redirect_is_not_followed_or_reposted() {
         let (url, count, upstream) = spawn_redirect_response();
-        let error = super::post_nonstream(&test_config(url), b"{}".to_vec()).unwrap_err();
+        let error = super::post_nonstream(&test_config(url), b"{}".to_vec(), None).unwrap_err();
         assert_eq!(error.status, 502);
         assert_eq!(error.upstream_status, Some(307));
         upstream.join().unwrap();
@@ -848,7 +1177,7 @@ mod tests {
             read_idle: Duration::from_millis(500),
         };
         let started = Instant::now();
-        let response = post_with_timeouts(&test_config(url), b"{}".to_vec(), timeouts, true)
+        let response = post_with_timeouts(&test_config(url), b"{}".to_vec(), timeouts, true, None)
             .expect("response headers");
         blocked
             .recv_timeout(Duration::from_secs(1))
@@ -880,7 +1209,7 @@ mod tests {
     fn stream_requires_sse_content_type_before_success() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 3\r\nConnection: close\r\n\r\n{}\n".to_vec();
         let (url, count, upstream) = spawn_counted_response(response);
-        let error = super::open_stream(&test_config(url), b"{}".to_vec()).unwrap_err();
+        let error = super::open_stream(&test_config(url), b"{}".to_vec(), None).unwrap_err();
         assert_eq!(error.status, 502);
         assert_eq!(error.upstream_status, Some(200));
         assert!(error.detail.contains("non-SSE"));
@@ -901,15 +1230,38 @@ mod tests {
         )
         .into_bytes();
         let (url, count, upstream) = spawn_counted_response(response);
-        let error = super::post_nonstream(&test_config(url), b"{}".to_vec()).unwrap_err();
+        let error = super::post_nonstream(&test_config(url), b"{}".to_vec(), None).unwrap_err();
         assert_eq!(error.status, 405);
         assert_eq!(error.upstream_status, Some(405));
         assert!(!error.detail.contains(key));
         assert!(!error.detail.contains("other-secret"));
         assert!(error.detail.len() < 17_000);
         assert!(error.detail.contains("truncated"));
+        let metadata = upstream_failure_metadata("post_nonstream", &error);
+        assert!(!metadata.contains(key));
+        assert!(!metadata.contains("other-secret"));
+        assert!(!metadata.contains("padding"));
+        assert!(!metadata.contains("detail"));
+        assert!(metadata.contains("upstream_status=Some(405)"));
         upstream.join().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn upstream_failure_metadata_omits_transport_detail_with_url() {
+        let metadata = upstream_failure_metadata(
+            "open_stream",
+            &UpstreamError {
+                status: 502,
+                upstream_status: None,
+                detail: "request failed for https://private.invalid/path?token=must-not-leak"
+                    .into(),
+            },
+        );
+        assert!(!metadata.contains("private.invalid"));
+        assert!(!metadata.contains("must-not-leak"));
+        assert!(!metadata.contains("detail"));
+        assert!(metadata.contains("upstream_status=None"));
     }
 
     #[test]
@@ -936,6 +1288,7 @@ mod tests {
                 read_idle,
             },
             false,
+            None,
         )
         .expect("open active stream");
         let first = read_first_line(&mut response).expect("read first stream line");
@@ -973,6 +1326,7 @@ mod tests {
                 read_idle,
             },
             false,
+            None,
         )
         .expect("open stalled stream");
         blocked
@@ -1011,6 +1365,7 @@ mod tests {
                 read_idle,
             },
             false,
+            None,
         )
         .expect("receive mock response headers");
         blocked

@@ -36,6 +36,7 @@ pub(crate) struct CapabilityCatalog {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CatalogContext {
     provider: String,
+    provider_contract: String,
     api_format: String,
     base_url: String,
     model: String,
@@ -141,6 +142,10 @@ fn profile_api_format(p: &config::Profile) -> String {
 pub(crate) fn context_for_profile(p: &config::Profile, shim_mode: &str) -> CatalogContext {
     let resolved = resolve_launch_plan(p).ok();
     let contract = crate::provider_contracts::contract_for(&p.template_id, &profile_api_format(p));
+    let provider_contract = contract
+        .as_ref()
+        .map(|contract| contract.id.clone())
+        .unwrap_or_default();
     let model = p
         .model_catalog
         .iter()
@@ -152,6 +157,7 @@ pub(crate) fn context_for_profile(p: &config::Profile, shim_mode: &str) -> Catal
             .as_ref()
             .map(|plan| plan.adapter.clone())
             .unwrap_or_else(|| crate::runtime::provider::adapter_for_profile(p)),
+        provider_contract,
         api_format: profile_api_format(p),
         base_url: p.base_url.clone(),
         model,
@@ -193,6 +199,7 @@ fn rule_is_profile_scoped(rule: &CatalogRule) -> bool {
         matches!(
             key.as_str(),
             "provider"
+                | "provider_contract"
                 | "api_format"
                 | "thinking_policy"
                 | "shim_mode"
@@ -209,6 +216,7 @@ fn rule_matches_context(rule: &CatalogRule, ctx: &CatalogContext) -> bool {
     }
     let fields = &rule.match_fields;
     text_match(fields, "provider", &ctx.provider)
+        && text_match(fields, "provider_contract", &ctx.provider_contract)
         && text_match(fields, "api_format", &ctx.api_format)
         && text_match(fields, "thinking_policy", &ctx.thinking_policy)
         && text_match(fields, "shim_mode", &ctx.shim_mode)
@@ -315,6 +323,7 @@ mod tests {
         };
         let ctx = context_for_profile(&p, "off");
         assert_eq!(ctx.provider, "relay");
+        assert_eq!(ctx.provider_contract, "kimi-anthropic-relay");
         assert_eq!(ctx.thinking_policy, "enabled");
     }
 
@@ -324,7 +333,7 @@ mod tests {
             template_id: "kimi".into(),
             api_format: "anthropic".into(),
             base_url: "https://api.moonshot.cn/anthropic".into(),
-            model: "kimi-k2.7-code".into(),
+            model: "k3-256k".into(),
             ..Default::default()
         };
         let v = diagnostics_for_profile(Some(&p), "off");
@@ -334,6 +343,19 @@ mod tests {
         assert!(!active.contains(&"tool.kimi.web_search.server-tool-filter".to_string()));
         assert!(!active.contains(&"tool.relay.input-schema-normalize".to_string()));
         assert!(!active.contains(&"tool.siliconflow.forced-named-to-any".to_string()));
+
+        let custom = Profile {
+            template_id: "custom".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://example.invalid".into(),
+            model: "kimi-lookalike".into(),
+            ..Default::default()
+        };
+        let custom_active = ids(
+            &diagnostics_for_profile(Some(&custom), "off"),
+            "active_rules",
+        );
+        assert!(!custom_active.contains(&"provider.kimi.relay-thinking-enabled".to_string()));
 
         let boundaries = ids(&v, "boundary_rules");
         assert!(boundaries.contains(&"transport.connect.anthropic-fastfail-401".to_string()));

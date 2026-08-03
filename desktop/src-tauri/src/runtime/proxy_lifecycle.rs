@@ -254,6 +254,47 @@ fn formal_proxy_env(launch: &FormalGatewayPlan) -> Result<Vec<(String, String)>,
     Ok(env)
 }
 
+fn reasoning_profile_scope(profile_id: &str) -> Result<String, String> {
+    if profile_id.is_empty()
+        || profile_id.len() > 256
+        || profile_id.chars().any(|ch| ch.is_control())
+    {
+        return Err("CSSwitch reasoning profile scope 非法".into());
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"csswitch/reasoning-profile-scope/v1\0");
+    hash.update(profile_id.as_bytes());
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn configure_reasoning_state_dir(
+    cmd: &mut Command,
+    state_dir: &Path,
+    profile_scope: &str,
+) -> Result<(), String> {
+    if !state_dir.is_absolute() {
+        return Err("CSSwitch reasoning 状态目录必须是绝对路径".into());
+    }
+    if profile_scope.len() != 64
+        || !profile_scope
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("CSSwitch reasoning profile scope 非法".into());
+    }
+    cmd.env("CSSWITCH_REASONING_STATE_DIR", state_dir)
+        .env("CSSWITCH_REASONING_PROFILE_SCOPE", profile_scope);
+    Ok(())
+}
+
+fn contract_requires_reasoning_state(contract_id: &str) -> bool {
+    matches!(contract_id, "kimi-anthropic-relay" | "deepseek-native")
+}
+
 pub(crate) fn configure_managed_proxy_command(
     cmd: &mut Command,
     provider: &str,
@@ -276,6 +317,8 @@ pub(crate) fn configure_managed_proxy_command(
     for inherited in [
         "CSSWITCH_STATIC_MODEL_CATALOG_V1",
         "CSSWITCH_GATEWAY_INTENT",
+        "CSSWITCH_REASONING_STATE_DIR",
+        "CSSWITCH_REASONING_PROFILE_SCOPE",
         "DEEPSEEK_API_KEY",
         "DASHSCOPE_API_KEY",
         "CSSWITCH_OPENAI_KEY",
@@ -789,6 +832,12 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             &secret,
             &launch_id,
         )?;
+        if contract_requires_reasoning_state(&launch.contract_id) {
+            let reasoning_state_dir = config::prepare_reasoning_state_dir()
+                .map_err(|error| format!("无法准备 CSSwitch reasoning 状态目录：{error}"))?;
+            let profile_scope = reasoning_profile_scope(&profile.id)?;
+            configure_reasoning_state_dir(&mut cmd, &reasoning_state_dir, &profile_scope)?;
+        }
         // The external-Skill bridge is optional. Unsafe or unwritable bridge
         // state disables only that bridge; it must never prevent the proxy (and
         // therefore Science) from starting.
@@ -933,9 +982,10 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_managed_proxy_command, find_gateway_in, formal_proxy_env, gateway_bin_path_from,
-        interrupted_health_matches, recover_interrupted_gateway_from_dir,
-        skill_install_bridge_token,
+        configure_managed_proxy_command, configure_reasoning_state_dir,
+        contract_requires_reasoning_state, find_gateway_in, formal_proxy_env,
+        gateway_bin_path_from, interrupted_health_matches, reasoning_profile_scope,
+        recover_interrupted_gateway_from_dir, skill_install_bridge_token,
     };
     use crate::provider_contracts::{
         CachePolicy, EndpointPolicy, ModelPolicy, TimeoutPolicy, Transport,
@@ -1216,6 +1266,8 @@ mod tests {
             ("codex", "off", "off", true),
         ] {
             let mut cmd = Command::new("csswitch-gateway");
+            cmd.env("CSSWITCH_REASONING_STATE_DIR", "/attacker-controlled");
+            cmd.env("CSSWITCH_REASONING_PROFILE_SCOPE", "f".repeat(64));
             configure_managed_proxy_command(
                 &mut cmd,
                 provider,
@@ -1277,6 +1329,70 @@ mod tests {
                 .map(|value| value.to_string_lossy().into_owned());
             assert_eq!(contract_id, None);
             assert_eq!(contract_digest, None);
+            assert_eq!(
+                cmd.get_envs()
+                    .find(|(key, _)| *key == "CSSWITCH_REASONING_STATE_DIR")
+                    .map(|(_, value)| value),
+                Some(None),
+                "managed launch must remove an inherited reasoning state override"
+            );
+            assert_eq!(
+                cmd.get_envs()
+                    .find(|(key, _)| *key == "CSSWITCH_REASONING_PROFILE_SCOPE")
+                    .map(|(_, value)| value),
+                Some(None),
+                "managed launch must remove an inherited reasoning scope override"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_proxy_injects_reasoning_state_only_via_environment() {
+        let mut cmd = Command::new("csswitch-gateway");
+        let state_dir = std::path::Path::new("/tmp/csswitch/reasoning-state");
+        let profile_scope = reasoning_profile_scope("profile-a").unwrap();
+        configure_reasoning_state_dir(&mut cmd, state_dir, &profile_scope).unwrap();
+        assert!(cmd.get_args().all(|arg| arg != state_dir.as_os_str()));
+        assert!(cmd.get_envs().any(|(key, value)| {
+            key == "CSSWITCH_REASONING_STATE_DIR"
+                && value.is_some_and(|value| value == state_dir.as_os_str())
+        }));
+        assert!(cmd.get_envs().any(|(key, value)| {
+            key == "CSSWITCH_REASONING_PROFILE_SCOPE"
+                && value.is_some_and(|value| value == std::ffi::OsStr::new(&profile_scope))
+        }));
+
+        let mut relative = Command::new("csswitch-gateway");
+        assert!(configure_reasoning_state_dir(
+            &mut relative,
+            std::path::Path::new("relative/reasoning-state"),
+            &profile_scope,
+        )
+        .is_err());
+        assert!(configure_reasoning_state_dir(
+            &mut Command::new("csswitch-gateway"),
+            state_dir,
+            "not-a-scope",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn reasoning_state_is_scoped_to_exact_anthropic_provider_contracts() {
+        assert!(contract_requires_reasoning_state("kimi-anthropic-relay"));
+        assert!(contract_requires_reasoning_state("deepseek-native"));
+        for contract in [
+            "anthropic-relay",
+            "custom-anthropic",
+            "qwen-native",
+            "codex-responses",
+            "kimi-openai-relay",
+            "",
+        ] {
+            assert!(
+                !contract_requires_reasoning_state(contract),
+                "unexpected reasoning state contract: {contract}"
+            );
         }
     }
 
