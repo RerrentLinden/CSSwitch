@@ -27,14 +27,9 @@ pub struct UpstreamError {
 }
 
 pub(crate) fn upstream_failure_metadata(operation: &'static str, error: &UpstreamError) -> String {
-    let error_class = if error.detail.contains("rate_limit_error") {
-        "rate_limit_error"
-    } else {
-        "none"
-    };
     format!(
-        "POST /v1/messages upstream_failure operation={operation} status={} upstream_status={:?} error_class={error_class}",
-        error.status, error.upstream_status,
+        "POST /v1/messages upstream_failure operation={operation} status={} upstream_status={:?}",
+        error.status, error.upstream_status
     )
 }
 
@@ -1267,19 +1262,6 @@ mod tests {
         assert!(!metadata.contains("must-not-leak"));
         assert!(!metadata.contains("detail"));
         assert!(metadata.contains("upstream_status=None"));
-        assert!(metadata.contains("error_class=none"));
-
-        let metadata = upstream_failure_metadata(
-            "open_stream",
-            &UpstreamError {
-                status: 429,
-                upstream_status: Some(429),
-                detail: "upstream 429: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"private message\"}}".into(),
-            },
-        );
-        assert!(metadata.contains("upstream_status=Some(429)"));
-        assert!(metadata.contains("error_class=rate_limit_error"));
-        assert!(!metadata.contains("private message"));
     }
 
     #[test]

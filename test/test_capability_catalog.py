@@ -45,7 +45,6 @@ ALLOWED_STATUS = {
 ALLOWED_ACTIONS = {
     "none",
     "normalize",
-    "preserve",
     "drop",
     "disable",
     "degrade",
@@ -57,7 +56,7 @@ REQUIRED_RULE_IDS = {
     "provider.relay.force-model-shell",
     "provider.kimi.relay-thinking-enabled",
     "provider.dashscope.responses-tools-cap",
-    "tool.kimi.web_search.server-tool-preserve",
+    "tool.kimi.web_search.server-tool-filter",
     "tool.kimi.unsupported-server-tool-filter",
     "tool.deepseek.web_search.server-tool-preserve",
     "tool.deepseek.unsupported-server-tool-filter",
@@ -74,7 +73,7 @@ RUNTIME_OBSERVABILITY_RULE_IDS = {
     "provider.relay.force-model-shell",
     "provider.kimi.relay-thinking-enabled",
     "provider.dashscope.responses-tools-cap",
-    "tool.kimi.web_search.server-tool-preserve",
+    "tool.kimi.web_search.server-tool-filter",
     "tool.kimi.unsupported-server-tool-filter",
     "tool.deepseek.web_search.server-tool-preserve",
     "tool.deepseek.unsupported-server-tool-filter",
@@ -164,7 +163,7 @@ class CapabilityCatalogSchema(unittest.TestCase):
         }
         expected = {
             "provider.kimi.relay-thinking-enabled": "kimi-anthropic-relay",
-            "tool.kimi.web_search.server-tool-preserve": "kimi-anthropic-relay",
+            "tool.kimi.web_search.server-tool-filter": "kimi-anthropic-relay",
             "tool.kimi.unsupported-server-tool-filter": "kimi-anthropic-relay",
             "provider.deepseek.anthropic-native": "deepseek-native",
             "tool.deepseek.web_search.server-tool-preserve": "deepseek-native",
@@ -188,7 +187,7 @@ class CapabilityCatalogSchema(unittest.TestCase):
             "provider.relay.force-model-shell",
             "provider.kimi.relay-thinking-enabled",
             "provider.dashscope.responses-tools-cap",
-            "tool.kimi.web_search.server-tool-preserve",
+            "tool.kimi.web_search.server-tool-filter",
             "tool.kimi.unsupported-server-tool-filter",
             "tool.deepseek.web_search.server-tool-preserve",
             "tool.deepseek.unsupported-server-tool-filter",

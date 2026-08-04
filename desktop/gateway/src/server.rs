@@ -127,19 +127,11 @@ impl StreamFilter {
 
     fn log_stats(&self) {
         match self {
-            StreamFilter::Kimi(filter) => {
-                if filter.dropped_server_tools() > 0 {
-                    eprintln!(
-                        "relay stream rules=tool.kimi.unsupported-server-tool-filter dropped={}",
-                        filter.dropped_server_tools()
-                    );
-                }
-                if filter.dropped_empty_thinking() > 0 {
-                    eprintln!(
-                        "relay stream rules=provider.kimi.relay-thinking-enabled dropped_empty_thinking={}",
-                        filter.dropped_empty_thinking()
-                    );
-                }
+            StreamFilter::Kimi(filter) if filter.dropped() > 0 => {
+                eprintln!(
+                    "relay stream rules=tool.kimi.web_search.server-tool-filter dropped={}",
+                    filter.dropped()
+                );
             }
             StreamFilter::DsmlDetect(detector) if detector.found => {
                 eprintln!("deepseek stream DSML detect found=true");
@@ -306,23 +298,6 @@ fn not_found_json(stream: &mut TcpStream, path: &str) {
 }
 
 fn api_error_json(stream: &mut TcpStream, status: u16, detail: &str) {
-    if status == 429 {
-        let body = json_bytes(json!({
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": detail,
-            },
-        }));
-        let _ = write!(
-            stream,
-            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nretry-after: 30\r\nconnection: close\r\n\r\n",
-            body.len(),
-        )
-        .and_then(|_| stream.write_all(&body))
-        .and_then(|_| stream.flush());
-        return;
-    }
     typed_error_json(stream, status, status_reason(status), "api_error", detail);
 }
 
@@ -906,8 +881,7 @@ where
 {
     let mut validator = crate::anthropic_sse::Validator::default();
 
-    let filter_error = |emit: &mut F, detail: &str| {
-        eprintln!("POST /v1/messages stream_failure stage=kimi_filter detail={detail}");
+    let filter_error = |emit: &mut F| {
         if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
             StreamTermination::DownstreamWriteError
         } else {
@@ -921,8 +895,7 @@ where
                    emit: &mut F| {
         let validated = match validator.feed(chunk) {
             Ok(validated) => validated,
-            Err(error) => {
-                eprintln!("POST /v1/messages stream_failure stage=anthropic_sse detail={error}");
+            Err(_) => {
                 if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
                     return Some(StreamTermination::DownstreamWriteError);
                 }
@@ -950,7 +923,7 @@ where
     let first = match filter.as_mut() {
         Some(filter) => match filter.feed(first) {
             Ok(chunk) => chunk,
-            Err(error) => return filter_error(&mut emit, &error),
+            Err(_) => return filter_error(&mut emit),
         },
         None => first.to_vec(),
     };
@@ -965,7 +938,7 @@ where
                 if let Some(filter) = filter.as_mut() {
                     let tail = match filter.finalize() {
                         Ok(tail) => tail,
-                        Err(error) => return filter_error(&mut emit, &error),
+                        Err(_) => return filter_error(&mut emit),
                     };
                     if let Some(termination) =
                         process(&tail, &mut validator, &mut collector, &mut emit)
@@ -1016,10 +989,7 @@ where
                             }
                         }
                     }
-                    Err(error) => {
-                        eprintln!(
-                            "POST /v1/messages stream_failure stage=anthropic_sse detail={error}"
-                        );
+                    Err(_) => {
                         if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
                             StreamTermination::DownstreamWriteError
                         } else {
@@ -1032,7 +1002,7 @@ where
                 let chunk = if let Some(filter) = filter.as_mut() {
                     match filter.feed(&buf[..n]) {
                         Ok(chunk) => chunk,
-                        Err(error) => return filter_error(&mut emit, &error),
+                        Err(_) => return filter_error(&mut emit),
                     }
                 } else {
                     buf[..n].to_vec()
@@ -2989,8 +2959,7 @@ mod tests {
         forward_stream_body_with_capture, forward_stream_body_with_completion,
         handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_post,
         map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream,
-        relay_server_tool_types, relay_thinking_type, report_upstream_failure,
-        restore_continuity_or_reject,
+        relay_server_tool_types, relay_thinking_type, restore_continuity_or_reject,
         stream_error_event, write_anthropic_response_with_continuity, write_codex_models_response,
         AnthropicStreamMessageCollector, CodexComponents, CodexNonstreamError, CodexPumpError,
         RequestHead, RequestNonceGenerator, StreamFilter, StreamTermination,
@@ -3948,22 +3917,6 @@ mod tests {
                 assert_eq!(text.matches("event: error").count(), 1);
             }
         }
-
-        let response = capture_tcp_response(|stream| {
-            report_upstream_failure(
-                stream,
-                "open_stream",
-                &crate::messages::UpstreamError {
-                    status: 429,
-                    upstream_status: Some(429),
-                    detail: "upstream 429: rate_limit_error".into(),
-                },
-            )
-        });
-        let text = String::from_utf8(response).unwrap();
-        assert!(text.starts_with("HTTP/1.1 429 Too Many Requests"));
-        assert!(text.contains("\r\nretry-after: 30\r\n"));
-        assert!(text.contains("rate_limit_error"));
     }
 
     struct OneReadThenPanic {
@@ -4508,7 +4461,7 @@ mod tests {
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{\"query\":\"weather\"}}}\n\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
             "event: content_block_start\n",
@@ -4735,28 +4688,12 @@ mod tests {
     fn kimi_native_anthropic_sse_preserves_server_tool_lifecycle_verbatim() {
         let first = complete_kimi_envelope();
         let mut upstream = Cursor::new(Vec::<u8>::new());
-        let mut filter = Some(StreamFilter::Kimi(
-            crate::anthropic_compat::KimiServerToolFilter::new(),
-        ));
-        let mut collector = AnthropicStreamMessageCollector::default();
-        let mut captured = None;
-        let mut success_rollback = None;
+        let mut filter = None;
         let mut output = Vec::new();
-        let termination = forward_stream_body_with_capture(
-            &mut upstream,
-            &first,
-            &mut filter,
-            Some(&mut collector),
-            &mut success_rollback,
-            |chunk| {
-                output.extend_from_slice(chunk);
-                Ok(())
-            },
-            |message| {
-                captured = message;
-                Ok(None)
-            },
-        );
+        let termination = forward_stream_body(&mut upstream, &first, &mut filter, |chunk| {
+            output.extend_from_slice(chunk);
+            Ok(())
+        });
         let text = String::from_utf8(output).unwrap();
         assert_eq!(termination, StreamTermination::NormalEof);
         assert!(text.contains("\"thinking\":\"plan\""));
@@ -4769,9 +4706,6 @@ mod tests {
         assert!(text.contains("\"output_tokens\":9"));
         assert_eq!(text.matches("event: message_stop").count(), 1);
         assert!(!text.contains("event: error"));
-        let captured = captured.expect("complete Kimi message");
-        assert_eq!(captured["content"][1]["id"], "srv_1");
-        assert_eq!(captured["content"][2]["tool_use_id"], "srv_1");
     }
 
     #[test]

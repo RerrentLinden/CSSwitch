@@ -242,13 +242,13 @@ impl ReasoningStore {
                 continue;
             }
 
-            let fingerprint = self.history_fingerprint(&messages, index, model, policy)?;
+            let fingerprint = self.history_fingerprint(&messages, index, model)?;
             let target = self.entry_name(&fingerprint);
             let encrypted = read_private_file(&self.directory, &self.root, &target)?
                 .ok_or_else(|| "thinking continuity state is missing".to_string())?;
             let stored = self.decrypt(&encrypted)?;
             validate_stored_entry(&stored, &fingerprint, model, policy)?;
-            let tools = tool_bindings(&messages[index], policy)?;
+            let tools = tool_bindings(&messages[index])?;
             if stored.tools != tools {
                 return Err("thinking continuity tool binding changed".into());
             }
@@ -297,11 +297,8 @@ impl ReasoningStore {
         assistant.insert("role".into(), Value::String("assistant".into()));
         assistant.insert("content".into(), Value::Array(visible_content));
         history.push(Value::Object(assistant));
-        let tools = tool_bindings(
-            history.last().expect("assistant history was appended"),
-            policy,
-        )?;
-        let fingerprint = self.history_fingerprint(&history, history.len() - 1, model, policy)?;
+        let tools = tool_bindings(history.last().expect("assistant history was appended"))?;
+        let fingerprint = self.history_fingerprint(&history, history.len() - 1, model)?;
         let stored = StoredEntry {
             version: 1,
             created_at: now_seconds(),
@@ -388,9 +385,8 @@ impl ReasoningStore {
         messages: &[Value],
         end: usize,
         model: &str,
-        policy: RestorePolicy,
     ) -> Result<String, String> {
-        let bytes = visible_history_bytes(messages, end, model, policy)?;
+        let bytes = visible_history_bytes(messages, end, model)?;
         let mut mac = HmacSha256::new_from_slice(&self.lookup_key)
             .map_err(|_| "thinking continuity fingerprint key is unavailable".to_string())?;
         mac.update(b"csswitch/anthropic-reasoning-sidecar/fingerprint/v1\0");
@@ -803,7 +799,7 @@ fn is_tool_binding_block(block: &Value) -> bool {
     )
 }
 
-fn tool_bindings(message: &Value, policy: RestorePolicy) -> Result<Vec<ToolBinding>, String> {
+fn tool_bindings(message: &Value) -> Result<Vec<ToolBinding>, String> {
     let Some(content) = message.get("content") else {
         return Err("thinking continuity assistant content is missing".into());
     };
@@ -811,11 +807,7 @@ fn tool_bindings(message: &Value, policy: RestorePolicy) -> Result<Vec<ToolBindi
         return Ok(Vec::new());
     };
     let mut tools = Vec::new();
-    for block in blocks.iter().filter(|block| {
-        is_tool_binding_block(block)
-            && !(policy == RestorePolicy::KimiAll
-                && block.get("type").and_then(Value::as_str) == Some("server_tool_use"))
-    }) {
+    for block in blocks.iter().filter(|block| is_tool_binding_block(block)) {
         if tools.len() >= MAX_REASONING_BLOCKS {
             return Err("thinking continuity response has too many tool bindings".into());
         }
@@ -855,12 +847,7 @@ fn tool_bindings(message: &Value, policy: RestorePolicy) -> Result<Vec<ToolBindi
     Ok(tools)
 }
 
-fn visible_history_bytes(
-    messages: &[Value],
-    end: usize,
-    model: &str,
-    policy: RestorePolicy,
-) -> Result<Vec<u8>, String> {
+fn visible_history_bytes(messages: &[Value], end: usize, model: &str) -> Result<Vec<u8>, String> {
     if end >= messages.len() {
         return Err("thinking continuity history prefix is invalid".into());
     }
@@ -880,11 +867,7 @@ fn visible_history_bytes(
                 let blocks = content.as_array_mut().ok_or_else(|| {
                     "thinking continuity assistant content is invalid".to_string()
                 })?;
-                blocks.retain(|block| {
-                    !is_reasoning_block(block)
-                        && !(policy == RestorePolicy::KimiAll
-                            && block.get("type").and_then(Value::as_str) == Some("server_tool_use"))
-                });
+                blocks.retain(|block| !is_reasoning_block(block));
             }
         } else if is_assistant {
             return Err("thinking continuity assistant content is missing".into());
@@ -1556,74 +1539,6 @@ mod tests {
         changed_text["messages"][1]["content"][0]["text"] = json!("changed");
         assert!(store
             .restore_request(&mut changed_text, "k3", RestorePolicy::KimiAll)
-            .is_err());
-    }
-
-    #[test]
-    fn kimi_web_search_result_only_history_restores_and_binds_visible_results() {
-        let root = TestRoot::new();
-        let store = store(&root, "profile-search-history");
-        let request = first_request();
-        let response = complete_response(
-            json!([
-                {"type": "thinking", "thinking": "search-plan", "signature": "search-sig"},
-                {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "x"}},
-                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": [
-                    {"type": "web_search_result", "url": "https://example.invalid/one"}
-                ]},
-                {"type": "text", "text": "answer"}
-            ]),
-            "end_turn",
-        );
-        let pending = store
-            .capture_message(&request, &response, "k3", RestorePolicy::KimiAll)
-            .unwrap()
-            .unwrap();
-        store.commit(pending).unwrap();
-
-        let mut next = json!({"messages": [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": [
-                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": [
-                    {"type": "web_search_result", "url": "https://example.invalid/one"}
-                ]},
-                {"type": "text", "text": "answer"}
-            ]},
-            {"role": "user", "content": "follow up"}
-        ]});
-        store
-            .restore_request(&mut next, "k3", RestorePolicy::KimiAll)
-            .unwrap();
-        assert_eq!(next["messages"][1]["content"][0]["thinking"], "search-plan");
-
-        let mut complete = json!({"messages": [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": [
-                {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "x"}},
-                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": [
-                    {"type": "web_search_result", "url": "https://example.invalid/one"}
-                ]},
-                {"type": "text", "text": "answer"}
-            ]},
-            {"role": "user", "content": "follow up"}
-        ]});
-        store
-            .restore_request(&mut complete, "k3", RestorePolicy::KimiAll)
-            .unwrap();
-        assert_eq!(
-            complete["messages"][1]["content"][0]["thinking"],
-            "search-plan"
-        );
-
-        let mut changed_result = next;
-        changed_result["messages"][1]["content"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|block| block.get("type").and_then(Value::as_str) != Some("thinking"));
-        changed_result["messages"][1]["content"][0]["content"][0]["url"] =
-            json!("https://example.invalid/two");
-        assert!(store
-            .restore_request(&mut changed_result, "k3", RestorePolicy::KimiAll)
             .is_err());
     }
 

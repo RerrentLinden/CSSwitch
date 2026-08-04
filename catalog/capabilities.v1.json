@@ -58,7 +58,7 @@
       },
       "status": "limited",
       "action": "degrade",
-      "reason": "Kimi relay models require enabled thinking. Supported typed WebSearch declarations and their matching forced tool_choice remain intact; only unsupported server tools are removed and may require tool_choice recomputation.",
+      "reason": "Kimi relay models require enabled thinking, but forced Anthropic tool_choice is removed so the model can choose tools itself.",
       "evidence": [
         "desktop/src-tauri/src/templates.rs",
         "desktop/gateway/src/policy.rs",
@@ -66,9 +66,9 @@
         "test/golden/relay_anthropic.json"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_preserves_typed_web_search_and_forced_choice",
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_drops_typed_web_search_and_invalid_forced_choice",
         "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
-        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_preserves_valid_web_search_blocks"
+        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
       ]
     },
     {
@@ -100,30 +100,28 @@
   ],
   "tool_rules": [
     {
-      "id": "tool.kimi.web_search.server-tool-preserve",
+      "id": "tool.kimi.web_search.server-tool-filter",
       "scope": "tool",
       "match": {
         "provider": "relay",
         "provider_contract": "kimi-anthropic-relay",
         "tool_type_family": "web_search_*"
       },
-      "status": "supported",
-      "action": "preserve",
-      "reason": "Kimi accepts the exact Anthropic pair type=web_search_20250305 and name=web_search in Claude Science main-agent requests. CSSwitch preserves that declaration, the matching server_tool_use/web_search_tool_result lifecycle, and valid result-only follow-up history. Same-named ordinary client tools remain client tools; malformed, orphaned, duplicate, unclosed, or oversized provider envelopes fail explicitly, while unrelated server-tool policy remains unchanged.",
+      "status": "limited",
+      "action": "drop",
+      "reason": "Live A/B on the current Science request shape showed that the Science-supplied web_search_20250305 declaration triggers an upstream 429 while the same request succeeds when that typed declaration is removed. CSSwitch temporarily drops only Kimi typed web_search_* declarations and recomputes forced tool_choice; same-named ordinary client tools, Science-local Python/Bash/R/Compute, and host.mcp remain untouched. The same Coding Plan can execute the versioned tool through Claude Code plus an upstream cc-switch passthrough, so this is a request-shape workaround rather than a permanent provider capability verdict. web_search_20250305 is an Anthropic GA versioned schema: CSSwitch neither strips its suffix nor adds guessed beta routing. /coding/v1/search is a separate host-service endpoint and is not evidence for Messages server-tool compatibility.",
       "evidence": [
         "desktop/gateway/src/anthropic_compat.rs",
-        "desktop/gateway/src/reasoning_state.rs",
-        "test/test_gateway_rust.py"
+        ".trellis/tasks/08-03-kimi-protocol-compatibility/research/kimi-first-turn-429-regression-audit.md",
+        "test/golden/relay_anthropic.json"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_preserves_typed_web_search_client_and_unknown_typed_tools",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_preserves_valid_web_search_and_compacts_empty_thinking",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_drops_server_tool_blocks_and_compacts_indexes",
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses",
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_nonstream_filter_preserves_signed_thinking_and_rejects_unsigned_content",
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_nonstream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses",
-        "desktop/gateway/src/reasoning_state.rs::tests::kimi_web_search_result_only_history_restores_and_binds_visible_results",
-        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_preserves_valid_web_search_blocks",
-        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_raw_k3_nonstream_preserves_web_search_and_result_only_history"
+        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
       ]
     },
     {
