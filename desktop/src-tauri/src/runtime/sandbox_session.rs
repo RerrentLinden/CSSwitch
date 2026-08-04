@@ -4027,7 +4027,7 @@ fn validate_running_system_ssh_bridge<R: Runtime>(
 ) -> Result<(), String> {
     let _validated_wrapper =
         crate::runtime::sandbox_session::validate_system_ssh_wrapper_path(app)?;
-    let expected_hosts = crate::runtime::ssh_bridge::validate_science_ssh_bridge(sandbox_home)?;
+    let expected_hosts = crate::runtime::ssh_bridge::system_ssh_hosts()?;
     crate::runtime::settings::validate_managed_sandbox_ssh_stub(sandbox_home, &expected_hosts)?;
     Ok(())
 }
@@ -4037,7 +4037,7 @@ fn prevalidate_one_click_system_ssh<R: Runtime>(
     cfg: &config::Config,
     sandbox_home: &Path,
 ) -> Result<Vec<String>, String> {
-    let expected_hosts = crate::runtime::ssh_bridge::prevalidate_science_ssh_bridge(
+    let expected_hosts = crate::runtime::ssh_bridge::prevalidate_system_ssh_discovery(
         sandbox_home,
         cfg.reuse_system_ssh,
     )?;
@@ -4851,7 +4851,7 @@ fn restart_managed_science_with_budget<R: Runtime>(
         }
     };
     let ssh_hosts = if cfg.reuse_system_ssh {
-        crate::runtime::ssh_bridge::validate_science_ssh_bridge(&sandbox_home())?
+        crate::runtime::ssh_bridge::system_ssh_hosts()?
     } else {
         Vec::new()
     };
@@ -5790,12 +5790,12 @@ fn one_click_login_with_options<R: Runtime>(
         }
         let ssh_hosts = if cfg.reuse_system_ssh {
             one_click_step(
-                crate::runtime::ssh_bridge::prepare_science_ssh_bridge(&sbx_home),
+                crate::runtime::ssh_bridge::prepare_system_ssh_discovery(&sbx_home),
                 &rollback_context,
             )?
         } else {
             one_click_step(
-                crate::runtime::ssh_bridge::revoke_science_ssh_bridge(&sbx_home),
+                crate::runtime::ssh_bridge::cleanup_legacy_science_ssh_bridge(&sbx_home),
                 &rollback_context,
             )?;
             Vec::new()
@@ -8009,9 +8009,23 @@ mod transaction_tests {
         fs::write(home.join(".ssh/config"), b"Host isolated-test-host\n").unwrap();
         fs::set_permissions(home.join(".ssh/config"), fs::Permissions::from_mode(0o600)).unwrap();
         fs::create_dir_all(&science_data).unwrap();
-        fs::write(science_data.join("config.toml"), b"quiet_logs = true\n").unwrap();
+        fs::write(
+            science_data.join("config.toml"),
+            b"quiet_logs = true\nssh_hosts = [\"prior-managed\"]\n",
+        )
+        .unwrap();
         fs::set_permissions(
             science_data.join("config.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(
+            science_data.join("csswitch-ssh-bridge.v1.json"),
+            br#"{"schema_version":1,"original_ssh_hosts":null,"effective_ssh_hosts":["prior-managed"],"managed_hosts":["prior-managed"]}"#,
+        )
+        .unwrap();
+        fs::set_permissions(
+            science_data.join("csswitch-ssh-bridge.v1.json"),
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
@@ -8552,8 +8566,8 @@ mod transaction_tests {
         );
         for required in [
             "ensure_virtual_login",
-            "prepare_science_ssh_bridge",
-            "revoke_science_ssh_bridge",
+            "prepare_system_ssh_discovery",
+            "cleanup_legacy_science_ssh_bridge",
             "ensure_proxy",
             "record_managed_science_launch",
         ] {
@@ -9372,7 +9386,7 @@ mod transaction_tests {
             "enabled pre-OAuth validation must use the same shared wrapper validator exactly once"
         );
         for required in [
-            "prevalidate_science_ssh_bridge",
+            "prevalidate_system_ssh_discovery",
             "prevalidate_sandbox_ssh_stub",
         ] {
             assert!(
@@ -9383,6 +9397,13 @@ mod transaction_tests {
 
         {
             let (name, function) = ("running SSH validator", running);
+            let facts = function_facts(function);
+            for required in ["system_ssh_hosts", "validate_managed_sandbox_ssh_stub"] {
+                assert!(
+                    facts.calls.iter().any(|call| call == required),
+                    "{name} must validate current aliases and the managed discovery stub via {required}"
+                );
+            }
             let shared_call_positions = function
                 .block
                 .stmts

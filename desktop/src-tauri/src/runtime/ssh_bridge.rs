@@ -27,6 +27,7 @@ struct ParseState {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct BridgeState {
     schema_version: u32,
     original_ssh_hosts: Option<Vec<String>>,
@@ -227,7 +228,7 @@ pub(crate) fn system_ssh_hosts() -> Result<Vec<String>, String> {
 
 pub(crate) fn system_ssh_bridge_fingerprint(enabled: bool) -> Result<String, String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"csswitch-system-ssh-bridge-v2\0");
+    hasher.update(b"csswitch-system-ssh-bridge-v3\0");
     if enabled {
         for alias in system_ssh_hosts()? {
             hasher.update(alias.as_bytes());
@@ -311,12 +312,69 @@ fn read_ssh_hosts(document: &DocumentMut) -> Result<Option<Vec<String>>, String>
         let host = item
             .as_str()
             .ok_or("隔离 Science config.toml 的 ssh_hosts 不是字符串数组")?;
-        if host.is_empty() || host.len() > 255 || host.bytes().any(|byte| byte.is_ascii_control()) {
+        if !is_safe_science_host(host) {
             return Err("隔离 Science config.toml 的 ssh_hosts 包含非法值".into());
         }
         hosts.push(host.to_string());
     }
     Ok(Some(hosts))
+}
+
+fn is_safe_science_host(host: &str) -> bool {
+    !host.is_empty() && host.len() <= 255 && !host.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn merge_unique(original: Option<&[String]>, managed: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut merged = Vec::new();
+    for host in original.into_iter().flatten().chain(managed.iter()) {
+        if seen.insert(host.clone()) {
+            merged.push(host.clone());
+        }
+    }
+    merged
+}
+
+fn legacy_previous_is_owned(state: &BridgeState) -> bool {
+    let Some(previous) = state.previous_effective_ssh_hosts.as_deref() else {
+        return true;
+    };
+    if state.original_ssh_hosts.as_deref() == Some(previous) {
+        return true;
+    }
+    let original_unique = merge_unique(state.original_ssh_hosts.as_deref(), &[]);
+    !previous.is_empty()
+        && previous.starts_with(&original_unique)
+        && previous.iter().all(|host| is_safe_science_host(host))
+        && previous.iter().collect::<BTreeSet<_>>().len() == previous.len()
+        && previous[original_unique.len()..]
+            .iter()
+            .all(|host| is_concrete_alias(host))
+}
+
+fn validate_legacy_state(state: &BridgeState) -> Result<(), String> {
+    let original_is_safe = state
+        .original_ssh_hosts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .all(|host| is_safe_science_host(host));
+    let previous_is_owned = legacy_previous_is_owned(state);
+    let managed_is_owned = !state.managed_hosts.is_empty()
+        && state.managed_hosts.len() <= MAX_ALIAS_COUNT
+        && state
+            .managed_hosts
+            .iter()
+            .all(|host| is_concrete_alias(host))
+        && state.managed_hosts.iter().collect::<BTreeSet<_>>().len() == state.managed_hosts.len();
+    let effective_is_owned = state.effective_ssh_hosts
+        == merge_unique(state.original_ssh_hosts.as_deref(), &state.managed_hosts);
+    if !original_is_safe || !previous_is_owned || !managed_is_owned || !effective_is_owned {
+        return Err(
+            "CSSwitch SSH bridge sidecar 内容不符合旧版所有权合同，拒绝猜测修改 ssh_hosts".into(),
+        );
+    }
+    Ok(())
 }
 
 fn set_ssh_hosts(document: &mut DocumentMut, hosts: Option<&[String]>) {
@@ -390,18 +448,8 @@ fn read_state(path: &Path) -> Result<Option<BridgeState>, String> {
     if state.schema_version != 1 {
         return Err("CSSwitch SSH bridge sidecar 版本不受支持".into());
     }
+    validate_legacy_state(&state)?;
     Ok(Some(state))
-}
-
-fn merge_unique(original: Option<&[String]>, managed: &[String]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut merged = Vec::new();
-    for host in original.into_iter().flatten().chain(managed.iter()) {
-        if seen.insert(host.clone()) {
-            merged.push(host.clone());
-        }
-    }
-    merged
 }
 
 fn current_matches_owned_state(current: Option<&[String]>, state: &BridgeState) -> bool {
@@ -413,109 +461,55 @@ fn current_matches_owned_state(current: Option<&[String]>, state: &BridgeState) 
             .is_some_and(|previous| current == Some(previous))
 }
 
-pub(crate) fn prepare_science_ssh_bridge_for(
-    sandbox_home: &Path,
-    system_home: &Path,
-) -> Result<Vec<String>, String> {
-    reject_symlink_components(sandbox_home)?;
-    let managed_hosts = system_ssh_hosts_for_home(system_home)?;
-    let data_dir = sandbox_home.join(".claude-science");
-    let config_path = data_dir.join("config.toml");
-    let state_path = data_dir.join(STATE_FILE);
-    reject_symlink_components(&config_path)?;
-    reject_symlink_components(&state_path)?;
-    let mut document = read_document(&config_path)?;
-    let current = read_ssh_hosts(&document)?;
-    let prior = read_state(&state_path)?;
-    let original = match &prior {
-        Some(state) if current_matches_owned_state(current.as_deref(), state) => {
-            state.original_ssh_hosts.clone()
-        }
-        Some(_) => {
-            return Err(
-                "隔离 Science ssh_hosts 在授权期间被外部修改；已保持原样，请先人工确认冲突".into(),
-            )
-        }
-        None => current.clone(),
-    };
-    let effective = merge_unique(original.as_deref(), &managed_hosts);
-    let transitional = BridgeState {
-        schema_version: 1,
-        original_ssh_hosts: original.clone(),
-        effective_ssh_hosts: effective.clone(),
-        previous_effective_ssh_hosts: current.clone(),
-        managed_hosts: managed_hosts.clone(),
-    };
-    atomic_write(
-        &state_path,
-        &serde_json::to_vec_pretty(&transitional).map_err(|_| "无法序列化 SSH bridge sidecar")?,
-    )?;
-    set_ssh_hosts(&mut document, Some(&effective));
-    atomic_write(&config_path, document.to_string().as_bytes())?;
-    let committed = BridgeState {
-        previous_effective_ssh_hosts: None,
-        ..transitional
-    };
-    atomic_write(
-        &state_path,
-        &serde_json::to_vec_pretty(&committed).map_err(|_| "无法序列化 SSH bridge sidecar")?,
-    )?;
-    Ok(managed_hosts)
-}
-
-pub(crate) fn prepare_science_ssh_bridge(sandbox_home: &Path) -> Result<Vec<String>, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("无法确认系统 HOME，不能启用系统 SSH 配置。")?;
-    prepare_science_ssh_bridge_for(sandbox_home, &home)
-}
-
-pub(crate) fn prevalidate_science_ssh_bridge(
-    sandbox_home: &Path,
-    enabled: bool,
-) -> Result<Vec<String>, String> {
+fn prevalidate_legacy_science_ssh_cleanup(sandbox_home: &Path) -> Result<(), String> {
     reject_symlink_components(sandbox_home)?;
     let data_dir = sandbox_home.join(".claude-science");
-    let config_path = data_dir.join("config.toml");
     let state_path = data_dir.join(STATE_FILE);
-    reject_symlink_components(&config_path)?;
     reject_symlink_components(&state_path)?;
-    if enabled {
-        // This is deliberately a metadata-only check. The one-click transaction
-        // must reject an authority that is statically non-writable before OAuth
-        // or journal mutation without leaving a write-probe artifact behind.
-        let uid = unsafe { libc::geteuid() };
-        if let Ok(metadata) = fs::symlink_metadata(&data_dir) {
-            if !metadata.file_type().is_dir()
+    let Some(state) = read_state(&state_path)? else {
+        return Ok(());
+    };
+    let config_path = data_dir.join("config.toml");
+    reject_symlink_components(&config_path)?;
+    // This is deliberately a metadata-only writeability check. The one-click
+    // transaction must prove that a legacy restore is reversible before OAuth
+    // or journal mutation without leaving a write-probe artifact behind.
+    let uid = unsafe { libc::geteuid() };
+    let metadata = fs::symlink_metadata(&data_dir)
+        .map_err(|_| "无法检查隔离 Science SSH authority".to_string())?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o200 == 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err("隔离 Science SSH authority 不可写".into());
+    }
+    for path in [&config_path, &state_path] {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if !metadata.file_type().is_file()
                 || metadata.uid() != uid
                 || metadata.permissions().mode() & 0o200 == 0
-                || metadata.permissions().mode() & 0o022 != 0
+                || metadata.permissions().mode() & 0o077 != 0
             {
                 return Err("隔离 Science SSH authority 不可写".into());
-            }
-        }
-        for path in [&config_path, &state_path] {
-            if let Ok(metadata) = fs::symlink_metadata(path) {
-                if !metadata.file_type().is_file()
-                    || metadata.uid() != uid
-                    || metadata.permissions().mode() & 0o200 == 0
-                    || metadata.permissions().mode() & 0o077 != 0
-                {
-                    return Err("隔离 Science SSH authority 不可写".into());
-                }
             }
         }
     }
     let document = read_document(&config_path)?;
     let current = read_ssh_hosts(&document)?;
-    let prior = read_state(&state_path)?;
-    if let Some(state) = &prior {
-        if !current_matches_owned_state(current.as_deref(), state) {
-            return Err(
-                "隔离 Science ssh_hosts 在授权期间被外部修改；已保持原样，请先人工确认冲突".into(),
-            );
-        }
+    if !current_matches_owned_state(current.as_deref(), &state) {
+        return Err(
+            "隔离 Science ssh_hosts 在授权期间被外部修改；已保持原样，请先人工确认冲突".into(),
+        );
     }
+    Ok(())
+}
+
+pub(crate) fn prevalidate_system_ssh_discovery(
+    sandbox_home: &Path,
+    enabled: bool,
+) -> Result<Vec<String>, String> {
+    prevalidate_legacy_science_ssh_cleanup(sandbox_home)?;
     if !enabled {
         return Ok(Vec::new());
     }
@@ -525,23 +519,26 @@ pub(crate) fn prevalidate_science_ssh_bridge(
     system_ssh_hosts_for_home(&home)
 }
 
-pub(crate) fn revoke_science_ssh_bridge(sandbox_home: &Path) -> Result<(), String> {
+pub(crate) fn cleanup_legacy_science_ssh_bridge(sandbox_home: &Path) -> Result<(), String> {
     reject_symlink_components(sandbox_home)?;
     let data_dir = sandbox_home.join(".claude-science");
     let state_path = data_dir.join(STATE_FILE);
-    let config_path = data_dir.join("config.toml");
-    reject_symlink_components(&config_path)?;
     reject_symlink_components(&state_path)?;
     let Some(state) = read_state(&state_path)? else {
         return Ok(());
     };
+    prevalidate_legacy_science_ssh_cleanup(sandbox_home)?;
+    let config_path = data_dir.join("config.toml");
+    reject_symlink_components(&config_path)?;
     let mut document = read_document(&config_path)?;
     let current = read_ssh_hosts(&document)?;
     if !current_matches_owned_state(current.as_deref(), &state) {
         return Err("隔离 Science ssh_hosts 在授权期间被外部修改；已保持原样，拒绝猜测撤销".into());
     }
-    set_ssh_hosts(&mut document, state.original_ssh_hosts.as_deref());
-    atomic_write(&config_path, document.to_string().as_bytes())?;
+    if current.as_deref() != state.original_ssh_hosts.as_deref() {
+        set_ssh_hosts(&mut document, state.original_ssh_hosts.as_deref());
+        atomic_write(&config_path, document.to_string().as_bytes())?;
+    }
     let metadata = fs::symlink_metadata(&state_path).map_err(|_| "无法检查 SSH bridge sidecar")?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err("SSH bridge sidecar 不是安全普通文件".into());
@@ -550,34 +547,19 @@ pub(crate) fn revoke_science_ssh_bridge(sandbox_home: &Path) -> Result<(), Strin
     Ok(())
 }
 
-fn validate_science_ssh_bridge_for(
+pub(crate) fn prepare_system_ssh_discovery_for(
     sandbox_home: &Path,
     system_home: &Path,
 ) -> Result<Vec<String>, String> {
-    reject_symlink_components(sandbox_home)?;
-    let data_dir = sandbox_home.join(".claude-science");
-    let config_path = data_dir.join("config.toml");
-    let state_path = data_dir.join(STATE_FILE);
-    reject_symlink_components(&config_path)?;
-    reject_symlink_components(&state_path)?;
-    let state = read_state(&state_path)?
-        .ok_or("CSSwitch SSH bridge sidecar 缺失，拒绝复用运行中的 Science")?;
-    let current = read_ssh_hosts(&read_document(&config_path)?)?;
-    if current.as_deref() != Some(state.effective_ssh_hosts.as_slice()) {
-        return Err("隔离 Science ssh_hosts 与 CSSwitch SSH bridge 状态不一致".into());
-    }
-    let expected = system_ssh_hosts_for_home(system_home)?;
-    if state.managed_hosts != expected {
-        return Err("系统 SSH Host alias 已变化，拒绝复用运行中的 Science".into());
-    }
-    Ok(expected)
+    cleanup_legacy_science_ssh_bridge(sandbox_home)?;
+    system_ssh_hosts_for_home(system_home)
 }
 
-pub(crate) fn validate_science_ssh_bridge(sandbox_home: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn prepare_system_ssh_discovery(sandbox_home: &Path) -> Result<Vec<String>, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or("无法确认系统 HOME，不能验证系统 SSH 配置。")?;
-    validate_science_ssh_bridge_for(sandbox_home, &home)
+        .ok_or("无法确认系统 HOME，不能启用系统 SSH 配置。")?;
+    prepare_system_ssh_discovery_for(sandbox_home, &home)
 }
 
 #[cfg(test)]
@@ -596,6 +578,13 @@ mod tests {
     fn write_private(path: &Path, value: impl AsRef<[u8]>) {
         fs::write(path, value).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn write_legacy_state(data_dir: &Path, state: &BridgeState) {
+        write_private(
+            &data_dir.join(STATE_FILE),
+            serde_json::to_vec(state).unwrap(),
+        );
     }
 
     #[test]
@@ -634,8 +623,8 @@ mod tests {
     }
 
     #[test]
-    fn toml_merge_is_idempotent_and_revoke_restores_only_ssh_hosts() {
-        let root = tmpdir("toml");
+    fn fresh_discovery_leaves_science_config_unchanged_and_creates_no_sidecar() {
+        let root = tmpdir("fresh-discovery");
         let home = root.join("outer");
         let sandbox = root.join("sandbox");
         fs::create_dir_all(home.join(".ssh")).unwrap();
@@ -645,117 +634,134 @@ mod tests {
         let config = sandbox.join(".claude-science/config.toml");
         write_private(&config, original);
 
-        let hosts = prepare_science_ssh_bridge_for(&sandbox, &home).unwrap();
+        let hosts = prepare_system_ssh_discovery_for(&sandbox, &home).unwrap();
         assert_eq!(hosts, ["managed-a", "managed-b"]);
-        let once = fs::read_to_string(&config).unwrap();
-        assert!(once.contains("# keep this comment"));
-        assert!(once.contains("[conda]"));
-        assert!(once.contains("user-host"));
-        assert!(once.contains("managed-a"));
-        prepare_science_ssh_bridge_for(&sandbox, &home).unwrap();
-        assert_eq!(fs::read_to_string(&config).unwrap(), once);
-
-        revoke_science_ssh_bridge(&sandbox).unwrap();
-        let restored = fs::read_to_string(&config).unwrap();
-        let document: DocumentMut = restored.parse().unwrap();
-        assert_eq!(
-            read_ssh_hosts(&document).unwrap(),
-            Some(vec!["user-host".into()])
-        );
-        assert!(restored.contains("# keep this comment"));
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
         assert!(!sandbox.join(".claude-science").join(STATE_FILE).exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn revoke_removes_field_that_was_absent_and_conflicts_fail_closed() {
-        let root = tmpdir("conflict");
+    fn legacy_cleanup_restores_original_hosts_and_removes_sidecar() {
+        let root = tmpdir("legacy-restore");
+        let home = root.join("outer");
+        let sandbox = root.join("sandbox");
+        let data_dir = sandbox.join(".claude-science");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(home.join(".ssh/config"), "Host current-alias\n").unwrap();
+        let config = data_dir.join("config.toml");
+        write_private(
+            &config,
+            "# preserve\nquiet_logs = true\nssh_hosts = [\"user-host\", \"old-managed\"]\n",
+        );
+        write_legacy_state(
+            &data_dir,
+            &BridgeState {
+                schema_version: 1,
+                original_ssh_hosts: Some(vec!["user-host".into()]),
+                effective_ssh_hosts: vec!["user-host".into(), "old-managed".into()],
+                previous_effective_ssh_hosts: None,
+                managed_hosts: vec!["old-managed".into()],
+            },
+        );
+
+        assert_eq!(
+            prepare_system_ssh_discovery_for(&sandbox, &home).unwrap(),
+            ["current-alias"]
+        );
+        let document: DocumentMut = fs::read_to_string(&config).unwrap().parse().unwrap();
+        assert_eq!(
+            read_ssh_hosts(&document).unwrap(),
+            Some(vec!["user-host".into()])
+        );
+        assert!(fs::read_to_string(&config).unwrap().contains("# preserve"));
+        assert!(!data_dir.join(STATE_FILE).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_sidecar_does_not_read_science_config() {
+        let root = tmpdir("no-sidecar");
         let home = root.join("outer");
         let sandbox = root.join("sandbox");
         fs::create_dir_all(home.join(".ssh")).unwrap();
         fs::create_dir_all(sandbox.join(".claude-science")).unwrap();
         fs::write(home.join(".ssh/config"), "Host managed\n").unwrap();
         let config = sandbox.join(".claude-science/config.toml");
-        write_private(&config, "quiet_logs = true\n");
-        prepare_science_ssh_bridge_for(&sandbox, &home).unwrap();
-        write_private(
-            &config,
-            "quiet_logs = true\nssh_hosts = [\"foreign-edit\"]\n",
-        );
+        write_private(&config, "not valid TOML = [\n");
         let before = fs::read(&config).unwrap();
-        assert!(revoke_science_ssh_bridge(&sandbox).is_err());
-        assert_eq!(fs::read(&config).unwrap(), before);
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
 
-        fs::remove_file(sandbox.join(".claude-science").join(STATE_FILE)).unwrap();
-        write_private(&config, "quiet_logs = true\n");
-        prepare_science_ssh_bridge_for(&sandbox, &home).unwrap();
-        revoke_science_ssh_bridge(&sandbox).unwrap();
-        let document: DocumentMut = fs::read_to_string(&config).unwrap().parse().unwrap();
-        assert!(document.get("ssh_hosts").is_none());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn prepare_and_revoke_reject_symlinked_science_data_before_reading() {
-        let root = tmpdir("data-link");
-        let home = root.join("outer");
-        let sandbox = root.join("sandbox");
-        let foreign = root.join("foreign");
-        fs::create_dir_all(home.join(".ssh")).unwrap();
-        fs::create_dir_all(&sandbox).unwrap();
-        fs::create_dir_all(&foreign).unwrap();
-        fs::write(home.join(".ssh/config"), "Host managed\n").unwrap();
-        write_private(
-            &foreign.join("config.toml"),
-            "ssh_hosts = [\"must-not-read\"]\n",
-        );
-        fs::set_permissions(
-            foreign.join("config.toml"),
-            fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(&foreign, sandbox.join(".claude-science")).unwrap();
-
-        assert!(prepare_science_ssh_bridge_for(&sandbox, &home)
-            .unwrap_err()
-            .contains("包含符号链接"));
-        assert!(revoke_science_ssh_bridge(&sandbox)
-            .unwrap_err()
-            .contains("包含符号链接"));
-        fs::set_permissions(
-            foreign.join("config.toml"),
-            fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
         assert_eq!(
-            fs::read_to_string(foreign.join("config.toml")).unwrap(),
-            "ssh_hosts = [\"must-not-read\"]\n"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn running_validation_requires_owned_current_state() {
-        let root = tmpdir("validate");
-        let home = root.join("outer");
-        let sandbox = root.join("sandbox");
-        fs::create_dir_all(home.join(".ssh")).unwrap();
-        fs::create_dir_all(sandbox.join(".claude-science")).unwrap();
-        fs::write(home.join(".ssh/config"), "Host managed\n").unwrap();
-        write_private(
-            &sandbox.join(".claude-science/config.toml"),
-            "quiet_logs = true\n",
-        );
-        prepare_science_ssh_bridge_for(&sandbox, &home).unwrap();
-        assert_eq!(
-            validate_science_ssh_bridge_for(&sandbox, &home).unwrap(),
+            prepare_system_ssh_discovery_for(&sandbox, &home).unwrap(),
             ["managed"]
         );
-        write_private(
-            &sandbox.join(".claude-science/config.toml"),
-            "ssh_hosts = [\"foreign\"]\n",
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert!(!sandbox.join(".claude-science").join(STATE_FILE).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_conflict_and_unsafe_state_fail_closed() {
+        let root = tmpdir("legacy-conflict");
+        let sandbox = root.join("sandbox");
+        let data_dir = sandbox.join(".claude-science");
+        fs::create_dir_all(&data_dir).unwrap();
+        let config = data_dir.join("config.toml");
+        let state_path = data_dir.join(STATE_FILE);
+        write_private(&config, "ssh_hosts = [\"foreign-edit\"]\n");
+        write_legacy_state(
+            &data_dir,
+            &BridgeState {
+                schema_version: 1,
+                original_ssh_hosts: None,
+                effective_ssh_hosts: vec!["old-managed".into()],
+                previous_effective_ssh_hosts: None,
+                managed_hosts: vec!["old-managed".into()],
+            },
         );
-        assert!(validate_science_ssh_bridge_for(&sandbox, &home).is_err());
+        let config_before = fs::read(&config).unwrap();
+        let state_before = fs::read(&state_path).unwrap();
+        assert!(cleanup_legacy_science_ssh_bridge(&sandbox).is_err());
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+        fs::remove_file(&state_path).unwrap();
+        let foreign_state = root.join("foreign-state");
+        write_private(
+            &foreign_state,
+            br#"{"schema_version":1,"original_ssh_hosts":null,"effective_ssh_hosts":["foreign-edit"],"managed_hosts":["foreign-edit"]}"#,
+        );
+        std::os::unix::fs::symlink(&foreign_state, &state_path).unwrap();
+        let foreign_before = fs::read(&foreign_state).unwrap();
+        assert!(cleanup_legacy_science_ssh_bridge(&sandbox).is_err());
+        assert_eq!(fs::read(&foreign_state).unwrap(), foreign_before);
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+
+        fs::remove_file(&state_path).unwrap();
+        write_private(&config, "ssh_hosts = [\"foreign edit\"]\n");
+        write_private(
+            &state_path,
+            br#"{"schema_version":1,"original_ssh_hosts":null,"effective_ssh_hosts":["foreign edit"],"managed_hosts":["foreign edit"]}"#,
+        );
+        let unsafe_config_before = fs::read(&config).unwrap();
+        let unsafe_state_before = fs::read(&state_path).unwrap();
+        assert!(cleanup_legacy_science_ssh_bridge(&sandbox).is_err());
+        assert_eq!(fs::read(&config).unwrap(), unsafe_config_before);
+        assert_eq!(fs::read(&state_path).unwrap(), unsafe_state_before);
+
+        write_private(&config, "ssh_hosts = [\"foreign-current\"]\n");
+        write_private(
+            &state_path,
+            br#"{"schema_version":1,"original_ssh_hosts":["original"],"effective_ssh_hosts":["original","managed"],"previous_effective_ssh_hosts":["foreign-current"],"managed_hosts":["managed"]}"#,
+        );
+        let incoherent_config_before = fs::read(&config).unwrap();
+        let incoherent_state_before = fs::read(&state_path).unwrap();
+        assert!(cleanup_legacy_science_ssh_bridge(&sandbox).is_err());
+        assert_eq!(fs::read(&config).unwrap(), incoherent_config_before);
+        assert_eq!(fs::read(&state_path).unwrap(), incoherent_state_before);
         let _ = fs::remove_dir_all(root);
     }
 }

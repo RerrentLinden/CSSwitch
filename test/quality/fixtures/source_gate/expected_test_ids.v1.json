@@ -508,9 +508,9 @@
         "desktop/src-tauri/Cargo.toml::lib::runtime::science::tests::real_installed_app_seed_is_selected_without_mutating_data_dir",
         "desktop/src-tauri/Cargo.toml::lib::runtime::science::tests::real_updated_runtime_candidate_is_eligible_without_reading_real_science_data",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart",
+        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_discovers_ssh_alias_without_auto_registration_and_preserves_remove",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_installs_attaches_and_persists_external_skill",
-        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_memory_classifier_writes_a_real_row",
-        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_toml"
+        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_memory_classifier_writes_a_real_row"
       ],
       "approved_ignored_tests": {
         "desktop/src-tauri/Cargo.toml::lib::commands::runtime::tests::isolated_cleanup_manifest_pre_rename_fault_is_crash_consistent": {
@@ -617,6 +617,10 @@
           "boundary": "installed",
           "reason": "explicit installed Science multi-model alias E2E; temp HOME/data-dir, local mock/browser only"
         },
+        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_discovers_ssh_alias_without_auto_registration_and_preserves_remove": {
+          "boundary": "installed",
+          "reason": "explicit installed Science SSH discovery/registration E2E; temp outer HOME/data-dir and fixture aliases only"
+        },
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_installs_attaches_and_persists_external_skill": {
           "boundary": "installed",
           "reason": "explicit installed Science local-MCP dialogue E2E; temp HOME/data-dir, public GitHub, local mock/browser only"
@@ -624,10 +628,6 @@
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_memory_classifier_writes_a_real_row": {
           "boundary": "installed",
           "reason": "explicit installed Science memory-write E2E; temp HOME/data-dir and local mock/browser only"
-        },
-        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_toml": {
-          "boundary": "installed",
-          "reason": "explicit installed Science SSH preflight E2E; temp outer HOME/data-dir and fixture aliases only"
         }
       },
       "approved_skipped_test_ids": [],
@@ -1017,9 +1017,9 @@
         "desktop/src-tauri/Cargo.toml::lib::runtime::settings::tests::validate_runtime_ports_rejects_zero_and_same_port",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::finds_tool_result_before_science_third_party_safety_notice",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart",
+        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_discovers_ssh_alias_without_auto_registration_and_preserves_remove",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_installs_attaches_and_persists_external_skill",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_memory_classifier_writes_a_real_row",
-        "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_toml",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::keeps_signed_host_access_payload_across_pruned_model_rounds",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::matches_only_tools_declared_by_the_request",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::real_science_e2e::recognizes_attached_skill_metadata_without_human_description",
@@ -1032,12 +1032,12 @@
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::tests::route_state_is_persistent_versioned_and_secret_free",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::tests::runtime_registration_migrates_scoped_pair_to_combined_connector",
         "desktop/src-tauri/Cargo.toml::lib::runtime::skill_install_bridge::tests::runtime_registration_preserves_unmanaged_legacy_name",
+        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::fresh_discovery_leaves_science_config_unchanged_and_creates_no_sidecar",
+        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::legacy_cleanup_restores_original_hosts_and_removes_sidecar",
+        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::legacy_conflict_and_unsafe_state_fail_closed",
+        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::no_sidecar_does_not_read_science_config",
         "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::parses_concrete_hosts_from_includes_without_copying_host_options",
-        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::prepare_and_revoke_reject_symlinked_science_data_before_reading",
         "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::rejects_wildcard_only_and_oversized_config",
-        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::revoke_removes_field_that_was_absent_and_conflicts_fail_closed",
-        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::running_validation_requires_owned_current_state",
-        "desktop/src-tauri/Cargo.toml::lib::runtime::ssh_bridge::tests::toml_merge_is_idempotent_and_revoke_restores_only_ssh_hosts",
         "desktop/src-tauri/Cargo.toml::lib::runtime::system::tests::browser_open_defaults_to_system_binary_and_rejects_relative_override",
         "desktop/src-tauri/Cargo.toml::lib::runtime::system::tests::operation_log_archive_is_single_sibling_file",
         "desktop/src-tauri/Cargo.toml::lib::runtime::system::tests::operation_log_rotation_threshold_counts_incoming_line",

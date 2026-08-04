@@ -1740,6 +1740,13 @@ fn open_model_catalog(guard: &ScienceGuard, current: &str) -> Result<String, Str
     Ok(catalog)
 }
 
+fn open_compute_settings(guard: &ScienceGuard, current: &str) -> Result<String, String> {
+    click(guard, current, "button \"Customize\"")?;
+    let customize = wait_control(guard, "button \"Compute\"", 40)?;
+    click(guard, &customize, "button \"Compute\"")?;
+    wait_control(guard, "Add SSH host", 40)
+}
+
 fn assert_science_role_settings_are_available(
     guard: &ScienceGuard,
     current: &str,
@@ -1961,25 +1968,6 @@ fn wait_log_contains(path: &Path, needle: &str) {
         thread::sleep(Duration::from_millis(100));
     }
     panic!("Science 日志未在有界等待内出现：{needle}");
-}
-
-fn wait_data_logs_contain(data_dir: &Path, needle: &str) {
-    for _ in 0..900 {
-        let found = fs::read_dir(data_dir.join("logs"))
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .any(|entry| {
-                fs::read_to_string(entry.path()).is_ok_and(|content| content.contains(needle))
-            });
-        if found {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    panic!("Science 日志未出现预期安全事件：{needle}");
 }
 
 #[test]
@@ -2518,10 +2506,8 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
 }
 
 #[test]
-#[ignore = "explicit installed Science SSH preflight E2E; temp outer HOME/data-dir and fixture aliases only"]
-fn isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_toml() {
-    use std::os::unix::fs::PermissionsExt;
-
+#[ignore = "explicit installed Science SSH discovery/registration E2E; temp outer HOME/data-dir and fixture aliases only"]
+fn isolated_science_discovers_ssh_alias_without_auto_registration_and_preserves_remove() {
     assert_eq!(
         std::env::var("CSSWITCH_REAL_SCIENCE_SSH_E2E").as_deref(),
         Ok("1"),
@@ -2540,27 +2526,16 @@ fn isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_tom
         "Host science-ssh-fixture\n  HostName 127.0.0.1\n  Port 9\n",
     )
     .unwrap();
-    fs::write(
-        data_dir.join("config.toml"),
-        "# preserve this setting\ndebug = true\nquiet_logs = false\nssh_hosts = [\"preexisting-host\"]\n\n[conda]\nauto_install = false\n",
-    )
-    .unwrap();
-    fs::set_permissions(
-        data_dir.join("config.toml"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
     crate::oauth_forge::ensure_virtual_login(&data_dir, "virtual@localhost.invalid", &sandbox_home)
         .unwrap();
 
-    let managed =
-        crate::runtime::ssh_bridge::prepare_science_ssh_bridge_for(&sandbox_home, &outer_home)
+    let config_before = fs::read(data_dir.join("config.toml")).ok();
+    let aliases =
+        crate::runtime::ssh_bridge::prepare_system_ssh_discovery_for(&sandbox_home, &outer_home)
             .unwrap();
-    assert_eq!(managed, ["science-ssh-fixture"]);
-    let prepared = fs::read_to_string(data_dir.join("config.toml")).unwrap();
-    assert!(prepared.contains("preexisting-host"));
-    assert!(prepared.contains("science-ssh-fixture"));
-    assert!(prepared.contains("# preserve this setting"));
+    assert_eq!(aliases, ["science-ssh-fixture"]);
+    assert_eq!(fs::read(data_dir.join("config.toml")).ok(), config_before);
+    assert!(!data_dir.join("csswitch-ssh-bridge.v1.json").exists());
 
     let science_bin =
         PathBuf::from("/Applications/Claude Science.app/Contents/Resources/bin/claude-science")
@@ -2574,6 +2549,7 @@ fn isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_tom
     )]);
     let launch =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/launch-virtual-sandbox.sh");
+    let launch_science_bin = science_bin.clone();
     let (port, preview_port) = loop {
         let candidate = free_port();
         let Some(preview) = candidate.checked_add(1) else {
@@ -2584,20 +2560,23 @@ fn isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_tom
             break (candidate, preview);
         }
     };
-    let output = Command::new("zsh")
-        .arg(&launch)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--skip-oauth-forge")
-        .env("HOME", &outer_home)
-        .env("SANDBOX_HOME", &sandbox_home)
-        .env("SCIENCE_BIN", &science_bin)
-        .env("CSSWITCH_RUNTIME_VERSION_PRECHECKED", "1")
-        .env("CSSWITCH_PROXY_URL", provider.base_url())
-        .env("CSSWITCH_REUSE_SYSTEM_SSH", "1")
-        .env("CSSWITCH_SYSTEM_SSH_HOSTS", managed.join(" "))
-        .output()
-        .unwrap();
+    let launch_science = || {
+        Command::new("zsh")
+            .arg(&launch)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--skip-oauth-forge")
+            .env("HOME", &outer_home)
+            .env("SANDBOX_HOME", &sandbox_home)
+            .env("SCIENCE_BIN", &launch_science_bin)
+            .env("CSSWITCH_RUNTIME_VERSION_PRECHECKED", "1")
+            .env("CSSWITCH_PROXY_URL", provider.base_url())
+            .env("CSSWITCH_REUSE_SYSTEM_SSH", "1")
+            .env("CSSWITCH_SYSTEM_SSH_HOSTS", aliases.join(" "))
+            .output()
+            .unwrap()
+    };
+    let output = launch_science();
     assert!(
         output.status.success(),
         "{}",
@@ -2623,22 +2602,44 @@ fn isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_tom
     assert!(stub.contains("Host science-ssh-fixture"));
     assert!(!stub.contains("HostName"));
     assert!(!stub.contains("IdentityFile"));
-    wait_data_logs_contain(&data_dir, "registered SSH compute provider (env)");
-    wait_data_logs_contain(&data_dir, "science-ssh-fixture");
     fs::create_dir_all(&guard.workdir).unwrap();
     let chat = open_chat(&mut guard).unwrap();
-    click(&guard, &chat, "button \"Customize\"").unwrap();
-    let customize = wait_control(&guard, "button \"Compute\"", 40).unwrap();
-    click(&guard, &customize, "button \"Compute\"").unwrap();
-    let compute = wait_control(&guard, "science-ssh-fixture", 40).unwrap();
-    assert!(compute.contains("science-ssh-fixture"), "{compute}");
+    let compute = open_compute_settings(&guard, &chat).unwrap();
+    assert!(!compute.contains("science-ssh-fixture"), "{compute}");
+    click(&guard, &compute, "Add SSH host").unwrap();
+    let picker = wait_control(&guard, "science-ssh-fixture", 40).unwrap();
+    click(&guard, &picker, "science-ssh-fixture").unwrap();
 
     guard.stop_science();
-    crate::runtime::ssh_bridge::revoke_science_ssh_bridge(&sandbox_home).unwrap();
-    let revoked = fs::read_to_string(data_dir.join("config.toml")).unwrap();
-    assert!(revoked.contains("# preserve this setting"));
-    assert!(revoked.contains("preexisting-host"));
-    assert!(!revoked.contains("science-ssh-fixture"));
+    let output = launch_science();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_port(port);
+    let chat = open_chat(&mut guard).unwrap();
+    let compute = open_compute_settings(&guard, &chat).unwrap();
+    assert!(compute.contains("science-ssh-fixture"), "{compute}");
+    click(&guard, &compute, "science-ssh-fixture").unwrap();
+    let remove = wait_control(&guard, "button \"Remove", 40).unwrap();
+    click(&guard, &remove, "button \"Remove").unwrap();
+
+    guard.stop_science();
+    let output = launch_science();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_port(port);
+    let chat = open_chat(&mut guard).unwrap();
+    let compute = open_compute_settings(&guard, &chat).unwrap();
+    assert!(!compute.contains("science-ssh-fixture"), "{compute}");
+    click(&guard, &compute, "Add SSH host").unwrap();
+    let picker = wait_control(&guard, "science-ssh-fixture", 40).unwrap();
+    assert!(picker.contains("science-ssh-fixture"), "{picker}");
+    assert!(!data_dir.join("csswitch-ssh-bridge.v1.json").exists());
     guard.stop();
     drop(provider);
     let _ = fs::remove_dir_all(root);

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Stopped automatically registering every discovered system SSH alias as a Science Compute host. CSSwitch now supplies aliases only to the Add SSH host picker, leaves Science-owned registration to the UI, and safely restores owned legacy sidecar state when present.
+
 ## [0.8.4] — 2026-07-29
 
 ### Fixed

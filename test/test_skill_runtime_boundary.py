@@ -312,6 +312,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
         launch = (ROOT / "scripts/launch-virtual-sandbox.sh").read_text()
         wrapper = (ROOT / "scripts/ssh-bridge/ssh").read_text()
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
+        bridge = (ROOT / "desktop/src-tauri/src/runtime/ssh_bridge.rs").read_text()
         runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
 
         self.assertNotIn("ssh_tunnel_info", js + runtime)
@@ -321,6 +322,16 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn('CSSWITCH_REUSE_SYSTEM_SSH', launch + session)
         self.assertIn('CSSWITCH_SYSTEM_SSH_CONFIG', launch + wrapper)
         self.assertIn('exec /usr/bin/ssh -F "$config" "$@"', wrapper)
+        self.assertIn("csswitch-system-ssh-bridge-v3", bridge)
+        product_bridge = bridge.split("\n#[cfg(test)]", 1)[0]
+        discovery = product_bridge.split(
+            "pub(crate) fn prepare_system_ssh_discovery_for", 1
+        )[1].split("pub(crate) fn prepare_system_ssh_discovery(", 1)[0]
+        self.assertIn("cleanup_legacy_science_ssh_bridge", discovery)
+        self.assertIn("system_ssh_hosts_for_home", discovery)
+        self.assertNotIn("atomic_write", discovery)
+        self.assertNotIn("serde_json::to_vec", product_bridge)
+        self.assertNotIn("prepare_science_ssh_bridge", product_bridge)
         self.assertNotIn("ln -s", launch)
         self.assertNotIn("cp -R", launch)
 

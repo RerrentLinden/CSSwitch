@@ -24,7 +24,7 @@ use crate::runtime::science::{
 use crate::runtime::settings::{
     remove_managed_sandbox_ssh_stub, system_ssh_config_path, validate_runtime_ports,
 };
-use crate::runtime::ssh_bridge::{revoke_science_ssh_bridge, system_ssh_hosts};
+use crate::runtime::ssh_bridge::{cleanup_legacy_science_ssh_bridge, system_ssh_hosts};
 use crate::runtime::system::open_in_browser;
 use crate::{
     config, lock, proc, run_blocking, run_blocking_typed, AppState, SharedAppState, SharedLifecycle,
@@ -218,7 +218,7 @@ fn set_settings_inner(
             st.stop_proxy();
         }
         if !cfg.reuse_system_ssh {
-            revoke_science_ssh_bridge(&crate::runtime::science::sandbox_home())?;
+            cleanup_legacy_science_ssh_bridge(&crate::runtime::science::sandbox_home())?;
             remove_managed_sandbox_ssh_stub(&crate::runtime::science::sandbox_home())?;
         }
         // 拆链路成功（或无需拆）→ 才落盘新端口，保证 config 与运行态一致。
@@ -2039,9 +2039,23 @@ esac
                 "group-writable-science-authority" | "other-writable-science-authority"
             ) {
                 fs::create_dir_all(&science_data).unwrap();
-                fs::write(science_data.join("config.toml"), b"quiet_logs = true\n").unwrap();
+                fs::write(
+                    science_data.join("config.toml"),
+                    b"quiet_logs = true\nssh_hosts = [\"prior-managed\"]\n",
+                )
+                .unwrap();
                 fs::set_permissions(
                     science_data.join("config.toml"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                fs::write(
+                    science_data.join("csswitch-ssh-bridge.v1.json"),
+                    br#"{"schema_version":1,"original_ssh_hosts":null,"effective_ssh_hosts":["prior-managed"],"managed_hosts":["prior-managed"]}"#,
+                )
+                .unwrap();
+                fs::set_permissions(
+                    science_data.join("csswitch-ssh-bridge.v1.json"),
                     fs::Permissions::from_mode(0o600),
                 )
                 .unwrap();
