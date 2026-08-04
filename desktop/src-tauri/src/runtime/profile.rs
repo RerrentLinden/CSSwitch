@@ -1545,7 +1545,7 @@ mod tests {
     #[test]
     fn capabilities_are_derived_from_template_contract() {
         let ds = template_capabilities(crate::templates::by_id("deepseek").unwrap());
-        assert_eq!(ds["base_url_required"], false);
+        assert_eq!(ds["base_url_required"], true);
         assert_eq!(ds["model_required"], false);
         assert_eq!(ds["model_discovery"], "builtin_static");
 

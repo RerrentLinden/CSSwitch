@@ -124,8 +124,8 @@ impl ScratchGuard {
 }
 
 /// 临时代理的环境注入清单（纯函数，便于测试）：候选 key 注入指定 `key_env`；`base_url` 非空
-/// 才注入对应 adapter 的 base env（native=deepseek/qwen 传空 → 不注入，走各自硬编码官方端点）；
-/// `model` 非空注入对应 adapter 的 model env。修真机 P1：让 native 也能被临时代理探测。
+/// 才注入对应 adapter 的 base env（DeepSeek native 可带 profile base；Qwen native 传空时
+/// 仍走 gateway 管理的官方端点）；`model` 非空注入对应 adapter 的 model env。
 pub fn scratch_env(
     provider: &str,
     key_env: &str,
@@ -167,8 +167,8 @@ pub fn scratch_env(
 
 /// 临时代理探测目标：`provider` 直接作 `--provider`（native=deepseek/qwen；中转站=relay）；
 /// `key_env` 决定候选 key 注入哪个环境变量（native 用各自 `*_API_KEY`，relay 用 `CSSWITCH_RELAY_KEY`）；
-/// `base_url` 非空才注入 `CSSWITCH_RELAY_BASE_URL`（native 传空 → 走硬编码官方端点）；
-/// `model` 非空注入 `CSSWITCH_RELAY_MODEL`（仅 relay 生效）。
+/// `base_url` 非空才注入 `CSSWITCH_RELAY_BASE_URL`（DeepSeek native 也通过 contract 消费）；
+/// `model` 非空注入 `CSSWITCH_RELAY_MODEL`。
 pub struct ScratchTarget<'a> {
     pub provider: &'a str,
     pub contract_id: &'a str,
@@ -754,11 +754,23 @@ mod tests {
 
     #[test]
     fn scratch_env_native_uses_native_key_env_and_no_relay_base() {
-        // native：key 进 DEEPSEEK_API_KEY，绝不设 CSSWITCH_RELAY_BASE_URL（否则会被当中转站）。
-        let env = scratch_env("deepseek", "DEEPSEEK_API_KEY", "sk-x", "", None, "");
+        let env = scratch_env(
+            "deepseek",
+            "DEEPSEEK_API_KEY",
+            "sk-x",
+            "http://cpa.ga17.com",
+            None,
+            "",
+        );
         assert_eq!(
             env,
-            vec![("DEEPSEEK_API_KEY".to_string(), "sk-x".to_string())]
+            vec![
+                ("DEEPSEEK_API_KEY".to_string(), "sk-x".to_string()),
+                (
+                    "CSSWITCH_RELAY_BASE_URL".to_string(),
+                    "http://cpa.ga17.com".to_string()
+                ),
+            ]
         );
     }
 

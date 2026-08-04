@@ -548,7 +548,8 @@ pub(crate) fn reject_openai_custom_anthropic_base(
     }
 }
 
-/// deepseek/qwen 走各自固定官方端点；其余 = relay 家族，需带 base_url。
+/// DeepSeek/Qwen 保留各自 native adapter 语义；是否需要 profile base_url 由
+/// provider contract 决定，不能再用 native 身份推断端点策略。
 pub(crate) fn is_native_adapter(adapter: &str) -> bool {
     adapter == "deepseek" || adapter == "qwen"
 }
@@ -595,10 +596,6 @@ pub(crate) struct UpstreamEndpoint {
 /// 上游 authority（host + port），供 status 灯按真实 scheme/端口探测。
 pub(crate) fn upstream_endpoint(adapter: &str, base_url: &str) -> Option<UpstreamEndpoint> {
     match adapter {
-        "deepseek" => Some(UpstreamEndpoint {
-            host: "api.deepseek.com".to_string(),
-            port: 443,
-        }),
         "qwen" => Some(UpstreamEndpoint {
             host: "dashscope.aliyuncs.com".to_string(),
             port: 443,
@@ -684,6 +681,7 @@ mod tests {
         science_restart_required, status_upstream_endpoint, upstream_endpoint,
     };
     use crate::config::Profile;
+    use crate::provider_contracts::{EndpointJoin, EndpointPolicy};
 
     fn complete_saved_profile(mut profile: Profile) -> Profile {
         let requested = (!profile.model.trim().is_empty()).then_some(profile.model.as_str());
@@ -823,6 +821,9 @@ mod tests {
         });
         let a = proxy_args_for(&ds).unwrap().formal();
         assert_eq!(a.adapter, "deepseek");
+        assert_eq!(a.endpoint, "https://api.deepseek.com/anthropic");
+        assert_eq!(a.endpoint_policy, EndpointPolicy::ProfileRequired);
+        assert_eq!(a.endpoint_join, EndpointJoin::AnthropicV1);
         assert!(
             matches!(a.credential, super::FormalCredential::ApiKey { ref env, .. } if env == "DEEPSEEK_API_KEY")
         );
@@ -1260,11 +1261,12 @@ mod tests {
     #[test]
     fn status_without_override_uses_normal_production_or_profile_endpoints() {
         assert_eq!(
-            status_upstream_endpoint("deepseek", "https://ignored.example", None,),
+            status_upstream_endpoint("deepseek", "http://cpa.ga17.com", None,),
             Some(super::UpstreamEndpoint {
-                host: "api.deepseek.com".to_string(),
-                port: 443,
-            })
+                host: "cpa.ga17.com".to_string(),
+                port: 80,
+            }),
+            "DeepSeek status must follow the configured profile base URL"
         );
         assert_eq!(
             status_upstream_endpoint("relay", "http://127.0.0.1:32125/anthropic", None,),

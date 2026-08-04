@@ -636,6 +636,18 @@ mod tests {
     #[test]
     fn endpoint_join_policies_cover_full_urls_xai_gemini_and_opencode() {
         assert_eq!(
+            joined_endpoints(
+                EndpointJoin::AnthropicV1,
+                "anthropic_messages",
+                "http://cpa.ga17.com"
+            )
+            .unwrap(),
+            (
+                "http://cpa.ga17.com/v1/messages".into(),
+                Some("http://cpa.ga17.com/v1/models".into())
+            )
+        );
+        assert_eq!(
             joined_endpoints(EndpointJoin::OpenaiV1, "openai_chat", "https://api.x.ai/v1").unwrap(),
             (
                 "https://api.x.ai/v1/chat/completions".into(),

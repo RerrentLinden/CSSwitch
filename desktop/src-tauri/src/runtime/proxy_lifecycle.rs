@@ -14,9 +14,8 @@ use crate::runtime::legacy_proxy::{
 };
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
-    assert_format_supported, current_shim_mode_for_adapter, is_native_adapter, is_openai_adapter,
-    normalize_shim_mode, proxy_args_for, proxy_fingerprint_with_runtime, FormalCredential,
-    FormalGatewayPlan,
+    assert_format_supported, current_shim_mode_for_adapter, is_openai_adapter, normalize_shim_mode,
+    proxy_args_for, proxy_fingerprint_with_runtime, FormalCredential, FormalGatewayPlan,
 };
 use crate::runtime::proxy::{health_timeout_reason, should_write_back, ProxyAction};
 use crate::runtime::system::{asset_root, log_path, open_log, redact, repo_root, tail_file};
@@ -331,11 +330,11 @@ pub(crate) fn configure_managed_proxy_command(
     ] {
         cmd.env_remove(inherited);
     }
-    // CSSWITCH_UPSTREAM_URL is a native-provider test/diagnostic override. A stale
-    // value inherited from the desktop process must never replace a candidate relay
-    // or custom OpenAI base URL (or receive that candidate's key). Apply this at the
-    // Shared command boundary keeps formal and scratch Rust launches aligned.
-    if !is_native_adapter(provider) {
+    // CSSWITCH_UPSTREAM_URL is a native-provider test/diagnostic override. DeepSeek
+    // now owns a profile endpoint, so a stale inherited value must not replace it
+    // or receive that profile's key. Qwen remains the only managed-official native
+    // route that preserves the explicit override contract.
+    if provider != "qwen" {
         cmd.env_remove("CSSWITCH_UPSTREAM_URL");
     }
     Ok(())
@@ -1252,8 +1251,8 @@ mod tests {
     fn managed_proxy_command_keeps_secret_out_of_argv_and_injects_canonical_shim() {
         let fake_secret = "fake-managed-secret";
         for (provider, raw_shim, expected_shim, removes_upstream) in [
-            ("deepseek", " Rewrite ", "rewrite", false),
-            ("deepseek", "DETECT", "detect", false),
+            ("deepseek", " Rewrite ", "rewrite", true),
+            ("deepseek", "DETECT", "detect", true),
             ("qwen", " Rewrite ", "off", false),
             ("qwen", "off", "off", false),
             ("openai-custom", "DETECT", "off", true),
@@ -1314,7 +1313,7 @@ mod tests {
             } else {
                 assert_eq!(
                     upstream_override, None,
-                    "native provider {provider} must preserve the explicit override contract"
+                    "managed-official provider {provider} must preserve the explicit override contract"
                 );
             }
             let contract_id = cmd
@@ -1422,10 +1421,13 @@ mod tests {
             env: "DEEPSEEK_API_KEY".into(),
             value: "test-key".into(),
         };
-        native.endpoint_policy = EndpointPolicy::GatewayManagedOfficial;
         native.model_policy = ModelPolicy::SavedCatalog;
         let env = formal_proxy_env(&native).unwrap();
         assert!(env.contains(&("DEEPSEEK_API_KEY".to_string(), "test-key".to_string())));
+        assert!(env.contains(&(
+            "CSSWITCH_RELAY_BASE_URL".to_string(),
+            "https://upstream.example/api".to_string()
+        )));
         assert!(env
             .iter()
             .any(|(key, _)| key == "CSSWITCH_STATIC_MODEL_CATALOG_V1"));

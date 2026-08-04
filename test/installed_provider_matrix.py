@@ -101,20 +101,20 @@ class CaseDefinition:
 CASE_DEFINITIONS: Dict[str, CaseDefinition] = {
     "deepseek-off": CaseDefinition(
         "deepseek-off", "deepseek", "Installed DeepSeek off", "cn_official",
-        "anthropic", "deepseek", "off", "", "native",
-        "", "/deepseek/v1/messages", None,
+        "anthropic", "deepseek", "off", "", "loopback",
+        "/deepseek", "/deepseek/v1/messages", None,
         "installed_deepseek_matrix", "deepseek-formal-off", "basic",
     ),
     "deepseek-detect": CaseDefinition(
         "deepseek-detect", "deepseek", "Installed DeepSeek detect", "cn_official",
-        "anthropic", "deepseek", "detect", "", "native",
-        "", "/deepseek/v1/messages", None,
+        "anthropic", "deepseek", "detect", "", "loopback",
+        "/deepseek", "/deepseek/v1/messages", None,
         "installed_deepseek_matrix", "deepseek-formal-detect", "tools",
     ),
     "deepseek-rewrite": CaseDefinition(
         "deepseek-rewrite", "deepseek", "Installed DeepSeek rewrite", "cn_official",
-        "anthropic", "deepseek", "rewrite", "", "native",
-        "", "/deepseek/v1/messages", None,
+        "anthropic", "deepseek", "rewrite", "", "loopback",
+        "/deepseek", "/deepseek/v1/messages", None,
         "installed_deepseek_matrix", "deepseek-formal-rewrite-stream", "stream-tools",
     ),
     "qwen-chat": CaseDefinition(

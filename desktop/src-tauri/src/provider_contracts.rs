@@ -334,14 +334,15 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     return Err(format!("非 Codex contract adapter 非法：{}", contract.id));
                 }
             };
-            let expected_endpoint = match contract.adapter.as_str() {
-                "deepseek" | "qwen" => EndpointPolicy::GatewayManagedOfficial,
+            let expected_endpoint = match contract.id.as_str() {
+                "qwen-native" => EndpointPolicy::GatewayManagedOfficial,
                 _ => EndpointPolicy::ProfileRequired,
             };
             let expected_join = match contract.id.as_str() {
+                "deepseek-native" => EndpointJoin::AnthropicV1,
                 "gemini-openai-chat" => EndpointJoin::OpenaiPath,
                 _ => match contract.adapter.as_str() {
-                    "deepseek" | "qwen" => EndpointJoin::ManagedOfficial,
+                    "qwen" => EndpointJoin::ManagedOfficial,
                     "relay" => EndpointJoin::AnthropicV1,
                     "openai-custom" | "openai-responses" => EndpointJoin::OpenaiV1,
                     _ => {
@@ -386,8 +387,8 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelPolicy::SavedCatalog,
                     ModelDiscovery::BuiltinStatic,
                     Transport::AnthropicMessages,
-                    EndpointPolicy::GatewayManagedOfficial,
-                    EndpointJoin::ManagedOfficial,
+                    EndpointPolicy::ProfileRequired,
+                    EndpointJoin::AnthropicV1,
                     AuthScheme::AnthropicXApiKey,
                     "",
                 ),

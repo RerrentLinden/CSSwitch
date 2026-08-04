@@ -49,7 +49,7 @@ static TEMPLATES: &[Template] = &[
         category: "cn_official",
         api_format: "anthropic",
         base_url: "https://api.deepseek.com/anthropic",
-        base_url_editable: false,
+        base_url_editable: true,
         preset_catalog_id: Some("deepseek"),
         model_catalog_source: "preset",
         website_url: "https://platform.deepseek.com",
@@ -503,6 +503,7 @@ mod tests {
         // 源自用户反馈：小米 MiMo token plan 走 token-plan-cn.xiaomimimo.com/anthropic，
         // 与内置 api.xiaomimimo.com 不同 host，锁死地址 → 上游 401。
         for id in [
+            "deepseek",
             "glm",
             "xiaomi",
             "siliconflow",
@@ -518,9 +519,9 @@ mod tests {
                 "{id} 的 base_url 应可编辑"
             );
         }
-        // native adapter（deepseek/qwen）上游 URL 在 gateway 中固定，运行时不吃自定义
+        // Qwen native adapter 的上游 URL 仍由 gateway 管理，运行时不吃自定义
         // base_url，故保持只读，避免「能填但不生效」的假象。
-        for id in ["deepseek", "qwen"] {
+        for id in ["qwen"] {
             assert!(
                 !by_id(id).unwrap().base_url_editable,
                 "{id} 是原生 adapter，base_url 应只读"

@@ -366,6 +366,12 @@ mod tests {
     #[test]
     fn managed_identity_selects_exact_non_codex_contract_and_rejects_cross_adapter_ids() {
         let digest = catalog_digest();
+        let deepseek =
+            load_runtime_contract("deepseek", Some("deepseek-native"), Some(&digest)).unwrap();
+        assert_eq!(deepseek.auth_scheme, AuthScheme::AnthropicXApiKey);
+        assert_eq!(deepseek.endpoint_policy, "profile_required");
+        assert_eq!(deepseek.endpoint_join, EndpointJoin::AnthropicV1);
+
         let kimi =
             load_runtime_contract("relay", Some("kimi-anthropic-relay"), Some(&digest)).unwrap();
         assert_eq!(kimi.contract_id, "kimi-anthropic-relay");

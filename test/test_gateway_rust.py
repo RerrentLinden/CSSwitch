@@ -496,10 +496,12 @@ class RustGatewayLoopback(unittest.TestCase):
             env.pop("CSSWITCH_OPENAI_KEY", None)
         else:
             env["DEEPSEEK_API_KEY"] = "fake-deepseek-key"
+            env["CSSWITCH_RELAY_BASE_URL"] = (
+                upstream_url or "https://api.deepseek.com/anthropic"
+            )
             env.pop("DASHSCOPE_API_KEY", None)
             env.pop("CSSWITCH_OPENAI_KEY", None)
             env.pop("CSSWITCH_RELAY_KEY", None)
-            env.pop("CSSWITCH_RELAY_BASE_URL", None)
             env.pop("CSSWITCH_RELAY_MODEL", None)
             env.pop("CSSWITCH_RELAY_THINKING", None)
         if upstream_url:
