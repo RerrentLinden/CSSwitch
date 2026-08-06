@@ -1379,7 +1379,7 @@ mod tests {
             .any(|t| t["id"] == "codex"));
 
         let v = build_list_templates(false);
-        assert_eq!(v.len(), 15);
+        assert_eq!(v.len(), 16);
         assert!(!v.iter().any(|t| t["id"] == "codex"));
         assert!(v.iter().any(|t| t["id"] == "custom"));
         assert!(v.iter().any(|t| t["id"] == "custom-openai"));
@@ -1409,7 +1409,7 @@ mod tests {
         }
 
         let enabled = build_list_templates(true);
-        assert_eq!(enabled.len(), 16);
+        assert_eq!(enabled.len(), 17);
         let codex = enabled.iter().find(|t| t["id"] == "codex").unwrap();
         assert_eq!(codex["capabilities"]["auth_mode"], "csswitch_oauth");
         assert_eq!(
@@ -1497,7 +1497,7 @@ mod tests {
             assert!(
                 matches!(
                     capabilities["thinking_policy"].as_str(),
-                    Some("" | "adaptive" | "enabled")
+                    Some("" | "adaptive" | "enabled" | "upstream_default")
                 ),
                 "template {id} thinking_policy"
             );

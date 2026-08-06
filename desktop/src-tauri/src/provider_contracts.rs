@@ -279,7 +279,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
         }
         if !matches!(
             contract.thinking_policy.as_str(),
-            "" | "adaptive" | "enabled"
+            "" | "adaptive" | "enabled" | "upstream_default"
         ) {
             return Err(format!(
                 "provider contract thinking_policy 非法：{}",
@@ -351,7 +351,9 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 },
             };
             let expected_auth_scheme = match contract.id.as_str() {
-                "kimi-anthropic-relay" | "opencode-go-anthropic" => AuthScheme::Bearer,
+                "kimi-anthropic-relay" | "kimi-coding-anthropic" | "opencode-go-anthropic" => {
+                    AuthScheme::Bearer
+                }
                 _ => match contract.adapter.as_str() {
                     "deepseek" => AuthScheme::AnthropicXApiKey,
                     "relay" => AuthScheme::AnthropicDual,
@@ -433,6 +435,20 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     EndpointJoin::AnthropicV1,
                     AuthScheme::Bearer,
                     "enabled",
+                ),
+                "kimi-coding-anthropic" => (
+                    &["kimi-coding"][..],
+                    &["anthropic"][..],
+                    "relay",
+                    "CSSWITCH_RELAY_KEY",
+                    &[ModelPolicy::SavedCatalog][..],
+                    ModelPolicy::SavedCatalog,
+                    ModelDiscovery::AnthropicModelsOrManual,
+                    Transport::AnthropicMessages,
+                    EndpointPolicy::ProfileRequired,
+                    EndpointJoin::AnthropicV1,
+                    AuthScheme::Bearer,
+                    "upstream_default",
                 ),
                 "custom-anthropic" => (
                     &["custom"][..],
@@ -577,6 +593,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
         "qwen-native",
         "anthropic-relay",
         "kimi-anthropic-relay",
+        "kimi-coding-anthropic",
         "custom-anthropic",
         "custom-openai-chat",
         "custom-openai-responses",
@@ -627,7 +644,7 @@ mod tests {
     fn static_provider_contracts_load_and_are_unambiguous() {
         let catalog = load_provider_contracts().unwrap();
         assert_eq!(catalog.schema_version, 1);
-        assert_eq!(catalog.contracts.len(), 12);
+        assert_eq!(catalog.contracts.len(), 13);
         assert_eq!(static_catalog_digest().len(), 64);
         assert_eq!(
             contract_for("codex", "openai_responses")
@@ -691,7 +708,15 @@ mod tests {
             ("upstream_client_version", serde_json::json!("0.0.0")),
         ] {
             let mut mutated = parsed_catalog_value();
-            mutated["contracts"][11][field] = value;
+            // Address the contract by id: positional indexes silently retarget
+            // another provider whenever a contract is inserted above this one.
+            let codex = mutated["contracts"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|contract| contract["id"] == "codex-oauth")
+                .expect("codex-oauth contract");
+            codex[field] = value;
             assert!(
                 validate_value(mutated).is_err(),
                 "Codex mutation {field} must fail closed"

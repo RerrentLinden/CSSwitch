@@ -328,6 +328,30 @@ mod tests {
     }
 
     #[test]
+    fn kimi_coding_profile_is_bound_to_its_own_contract_and_rules() {
+        let p = Profile {
+            template_id: "kimi-coding".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://api.kimi.com/coding".into(),
+            model: "kimi-for-coding".into(),
+            ..Default::default()
+        };
+        let ctx = context_for_profile(&p, "off");
+        assert_eq!(ctx.provider, "relay");
+        assert_eq!(ctx.provider_contract, "kimi-coding-anthropic");
+        assert_eq!(ctx.thinking_policy, "upstream_default");
+
+        let active = ids(&diagnostics_for_profile(Some(&p), "off"), "active_rules");
+        assert!(active.contains(&"provider.kimi-coding.thinking-upstream-default".to_string()));
+        // The open-platform Kimi rules must never leak into this channel.
+        assert!(!active.contains(&"provider.kimi.relay-thinking-enabled".to_string()));
+        // Request-shape rules stay out of the profile-level active set.
+        assert!(!active.contains(&"tool.kimi-coding.web_search.server-tool-filter".to_string()));
+        assert!(!active
+            .contains(&"provider.kimi-coding.specified-tool-choice-disables-thinking".to_string()));
+    }
+
+    #[test]
     fn diagnostics_surface_profile_rules_and_boundaries() {
         let p = Profile {
             template_id: "kimi".into(),

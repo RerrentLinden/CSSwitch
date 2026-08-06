@@ -12,6 +12,16 @@ const RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER: &str =
     "tool.deepseek.unsupported-server-tool-filter";
 const RULE_TOOL_UNKNOWN_SERVER_TOOL_PRESERVE: &str = "tool.anthropic.unknown-server-tool-preserve";
 const RULE_HISTORY_KIMI_FAILED_TAIL_NORMALIZE: &str = "history.kimi.failed-tail-normalize";
+const RULE_PROVIDER_KIMI_CODING_THINKING_UPSTREAM_DEFAULT: &str =
+    "provider.kimi-coding.thinking-upstream-default";
+const RULE_PROVIDER_KIMI_CODING_SPECIFIED_TOOL_CHOICE_DISABLES_THINKING: &str =
+    "provider.kimi-coding.specified-tool-choice-disables-thinking";
+const RULE_TOOL_KIMI_CODING_WEB_SEARCH_CLIENT_TOOL_BRIDGE: &str =
+    "tool.kimi-coding.web_search.client-tool-bridge";
+const RULE_TOOL_KIMI_CODING_UNSUPPORTED_SERVER_TOOL_FILTER: &str =
+    "tool.kimi-coding.unsupported-server-tool-filter";
+const RULE_PROVIDER_KIMI_CODING_DOCUMENT_PLACEHOLDER: &str =
+    "provider.kimi-coding.document-block-placeholder";
 const RULE_TOOL_SILICONFLOW_FORCED_NAMED_TO_ANY: &str = "tool.siliconflow.forced-named-to-any";
 const SILICONFLOW_API_HOSTS: [&str; 2] = ["api.siliconflow.cn", "api.siliconflow.com"];
 const MAX_KIMI_FRAME_BYTES: usize = 1024 * 1024;
@@ -25,13 +35,51 @@ const MAX_RELAY_HISTORY_BLOCKS: usize = 1024;
 pub struct AnthropicMetadata {
     pub target_model: String,
     pub rule_ids: Vec<String>,
+    /// True only for the open-platform Kimi contract. It gates the thinking
+    /// continuity store, which Kimi for Coding deliberately does not use.
     pub kimi_compatibility: bool,
+    pub flavor: RelayFlavor,
     pub dropped_server_tools: usize,
+    /// The request carries the client-tool web_search bridge, so the response
+    /// side must fulfil any resulting tool call before Science sees it.
+    pub web_search_bridged: bool,
+}
+
+/// Anthropic relay contracts that need provider-specific compensation.
+/// Kimi's open platform and its coding subscription are separate upstreams with
+/// different auth, model catalogs and defect sets, so they never share a branch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RelayFlavor {
+    #[default]
+    Generic,
+    KimiOpenPlatform,
+    KimiCoding,
+}
+
+impl RelayFlavor {
+    pub fn detect(provider_contract_id: Option<&str>, target_model: &str) -> Self {
+        match provider_contract_id {
+            Some("kimi-anthropic-relay") => Self::KimiOpenPlatform,
+            Some("kimi-coding-anthropic") => Self::KimiCoding,
+            Some(_) => Self::Generic,
+            // Standalone gateways have no bound contract and fall back to the
+            // historical model-name heuristic.
+            None if target_model.to_ascii_lowercase().contains("kimi") => Self::KimiOpenPlatform,
+            None => Self::Generic,
+        }
+    }
+
+    /// Server-tool blocks must be stripped from responses on both Kimi
+    /// upstreams: neither can receive them back without breaking a later turn.
+    pub fn filters_server_tool_blocks(self) -> bool {
+        matches!(self, Self::KimiOpenPlatform | Self::KimiCoding)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnthropicServerToolPolicy {
     Kimi,
+    KimiCoding,
     DeepSeek,
 }
 
@@ -43,10 +91,7 @@ enum AnthropicServerToolKind {
 }
 
 pub fn is_kimi_relay(provider_contract_id: Option<&str>, target_model: &str) -> bool {
-    match provider_contract_id {
-        Some(contract_id) => contract_id == "kimi-anthropic-relay",
-        None => target_model.to_ascii_lowercase().contains("kimi"),
-    }
+    RelayFlavor::detect(provider_contract_id, target_model) == RelayFlavor::KimiOpenPlatform
 }
 
 #[derive(Debug, Default)]
@@ -582,7 +627,7 @@ pub fn filter_kimi_nonstream_response_with_count(body: &[u8]) -> Result<(Vec<u8>
     Ok((body, dropped_server_tools))
 }
 
-fn split_frame(buf: &[u8]) -> Option<(Vec<u8>, usize, Vec<u8>)> {
+pub(crate) fn split_frame(buf: &[u8]) -> Option<(Vec<u8>, usize, Vec<u8>)> {
     let lf = buf.windows(2).position(|window| window == b"\n\n");
     let crlf = buf.windows(4).position(|window| window == b"\r\n\r\n");
     match (lf, crlf) {
@@ -596,7 +641,7 @@ fn split_frame(buf: &[u8]) -> Option<(Vec<u8>, usize, Vec<u8>)> {
     }
 }
 
-fn event_and_data(frame: &[u8]) -> (Option<String>, Vec<u8>) {
+pub(crate) fn event_and_data(frame: &[u8]) -> (Option<String>, Vec<u8>) {
     let normalized = String::from_utf8_lossy(frame).replace("\r\n", "\n");
     let mut event = None;
     let mut data = Vec::new();
@@ -610,7 +655,7 @@ fn event_and_data(frame: &[u8]) -> (Option<String>, Vec<u8>) {
     (event, data.join(b"\n".as_slice()))
 }
 
-fn render_sse(event: Option<&str>, obj: &Value) -> Vec<u8> {
+pub(crate) fn render_sse(event: Option<&str>, obj: &Value) -> Vec<u8> {
     let data = serde_json::to_vec(obj).unwrap_or_else(|_| b"{}".to_vec());
     let mut out = Vec::new();
     if let Some(event) = event {
@@ -624,7 +669,7 @@ fn render_sse(event: Option<&str>, obj: &Value) -> Vec<u8> {
     out
 }
 
-fn passthrough(frame: &[u8], sep: &[u8]) -> Vec<u8> {
+pub(crate) fn passthrough(frame: &[u8], sep: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(frame.len() + sep.len());
     out.extend_from_slice(frame);
     out.extend_from_slice(sep);
@@ -685,6 +730,51 @@ fn is_forced_tool_choice(body: &Value) -> bool {
         .and_then(Value::as_str)
         .map(|kind| kind == "any" || kind == "tool")
         .unwrap_or(false)
+}
+
+/// `tool_choice: {"type": "tool", ...}` — Anthropic's "specified" form.
+/// Kimi for Coding rejects it whenever thinking is on, and its thinking is on by
+/// default, so a request that merely omits `thinking` still fails.
+fn is_specified_tool_choice(body: &Value) -> bool {
+    body.get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        == Some("tool")
+}
+
+/// Hand thinking control back to the upstream default.
+///
+/// Claude Science sends a non-standard `{"type": "auto"}`. Kimi's k3 family does
+/// not recognise it and silently stops thinking, while omitting the field
+/// entirely leaves thinking on. Rewriting to `enabled` would work too, but it
+/// drags in the thinking-continuity store that this upstream does not need —
+/// history with stripped thinking blocks is accepted here even alongside
+/// `tool_use`.
+fn normalize_upstream_default_thinking(body: &mut Value, rule_ids: &mut Vec<String>) {
+    let declared = body
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str);
+    if matches!(declared, Some("auto") | Some("adaptive")) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("thinking");
+        }
+        append_rule_id(
+            rule_ids,
+            RULE_PROVIDER_KIMI_CODING_THINKING_UPSTREAM_DEFAULT,
+        );
+    }
+    if is_specified_tool_choice(body) {
+        // Keep the forced tool — Science's internal classifier calls depend on
+        // it — and give up thinking for that one request instead.
+        body["thinking"] = json!({"type": "disabled"});
+        append_rule_id(
+            rule_ids,
+            RULE_PROVIDER_KIMI_CODING_SPECIFIED_TOOL_CHOICE_DISABLES_THINKING,
+        );
+    }
 }
 
 fn normalize_relay_thinking(body: &mut Value, relay_thinking: Option<&str>) {
@@ -819,44 +909,57 @@ fn classify_anthropic_server_tool(tool: &Value) -> Option<AnthropicServerToolKin
     Some(kind)
 }
 
+fn unsupported_server_tool_rule(policy: AnthropicServerToolPolicy) -> &'static str {
+    match policy {
+        AnthropicServerToolPolicy::Kimi => RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER,
+        AnthropicServerToolPolicy::KimiCoding => {
+            RULE_TOOL_KIMI_CODING_UNSUPPORTED_SERVER_TOOL_FILTER
+        }
+        AnthropicServerToolPolicy::DeepSeek => RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER,
+    }
+}
+
+/// Outcome of the server-tool policy pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerToolOutcome {
+    pub dropped: usize,
+    /// A server web_search declaration was replaced by the client-tool bridge,
+    /// so the response side must fulfil any resulting tool call.
+    pub web_search_bridged: bool,
+}
+
 pub fn apply_anthropic_server_tool_policy(
     body: &mut Value,
     policy: AnthropicServerToolPolicy,
     rule_ids: &mut Vec<String>,
 ) -> usize {
+    apply_anthropic_server_tool_policy_with_outcome(body, policy, rule_ids).dropped
+}
+
+pub fn apply_anthropic_server_tool_policy_with_outcome(
+    body: &mut Value,
+    policy: AnthropicServerToolPolicy,
+    rule_ids: &mut Vec<String>,
+) -> ServerToolOutcome {
     let mut dropped = 0;
+    let mut bridged = false;
     if body
         .as_object_mut()
         .is_some_and(|object| object.remove("mcp_servers").is_some())
     {
         dropped += 1;
-        append_rule_id(
-            rule_ids,
-            match policy {
-                AnthropicServerToolPolicy::Kimi => RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER,
-                AnthropicServerToolPolicy::DeepSeek => {
-                    RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER
-                }
-            },
-        );
+        append_rule_id(rule_ids, unsupported_server_tool_rule(policy));
     }
 
     let Some(tools) = body.get("tools").and_then(Value::as_array) else {
         if dropped > 0 {
-            append_rule_id(
-                rule_ids,
-                match policy {
-                    AnthropicServerToolPolicy::Kimi => {
-                        RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER
-                    }
-                    AnthropicServerToolPolicy::DeepSeek => {
-                        RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER
-                    }
-                },
-            );
+            append_rule_id(rule_ids, unsupported_server_tool_rule(policy));
         }
         degrade_missing_tool_choice(body);
-        return dropped;
+        return ServerToolOutcome {
+            dropped,
+            web_search_bridged: bridged,
+        };
     };
     let mut filtered = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -867,6 +970,18 @@ pub fn apply_anthropic_server_tool_policy(
                     dropped += 1;
                     append_rule_id(rule_ids, RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER);
                 }
+                AnthropicServerToolPolicy::KimiCoding => {
+                    // Kimi for Coding answers 429 whenever this tool is declared
+                    // and the model then decides not to search, which is most
+                    // turns. Hand the model a client tool instead: asking for a
+                    // search becomes an explicit tool call the gateway fulfils.
+                    dropped += 1;
+                    bridged = true;
+                    append_rule_id(
+                        rule_ids,
+                        RULE_TOOL_KIMI_CODING_WEB_SEARCH_CLIENT_TOOL_BRIDGE,
+                    );
+                }
                 AnthropicServerToolPolicy::DeepSeek => {
                     append_rule_id(rule_ids, RULE_TOOL_DEEPSEEK_WEB_SEARCH_SERVER_TOOL_PRESERVE);
                     filtered.push(tool.clone());
@@ -874,23 +989,22 @@ pub fn apply_anthropic_server_tool_policy(
             },
             Some(AnthropicServerToolKind::Unsupported) => {
                 dropped += 1;
-                append_rule_id(
-                    rule_ids,
-                    match policy {
-                        AnthropicServerToolPolicy::Kimi => {
-                            RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER
-                        }
-                        AnthropicServerToolPolicy::DeepSeek => {
-                            RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER
-                        }
-                    },
-                );
+                append_rule_id(rule_ids, unsupported_server_tool_rule(policy));
             }
             Some(AnthropicServerToolKind::Unknown) => {
                 append_rule_id(rule_ids, RULE_TOOL_UNKNOWN_SERVER_TOOL_PRESERVE);
                 filtered.push(tool.clone());
             }
         }
+    }
+    if bridged
+        && !filtered.iter().any(|tool| {
+            is_anthropic_client_tool(tool)
+                && tool.get("name").and_then(Value::as_str)
+                    == Some(crate::kimi_coding_search::BRIDGE_TOOL_NAME)
+        })
+    {
+        filtered.push(crate::kimi_coding_search::bridge_tool_declaration());
     }
     if filtered.is_empty() {
         if let Some(object) = body.as_object_mut() {
@@ -900,7 +1014,10 @@ pub fn apply_anthropic_server_tool_policy(
         body["tools"] = Value::Array(filtered);
     }
     degrade_missing_tool_choice(body);
-    dropped
+    ServerToolOutcome {
+        dropped,
+        web_search_bridged: bridged,
+    }
 }
 
 fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
@@ -954,16 +1071,77 @@ fn normalize_relay_tools(body: &mut Value, rule_ids: &mut Vec<String>) {
     degrade_missing_tool_choice(body);
 }
 
-fn filter_kimi_server_tools(
-    body: &mut Value,
-    kimi_compatibility: bool,
-    rule_ids: &mut Vec<String>,
-) -> usize {
-    normalize_relay_tools(body, rule_ids);
-    if !kimi_compatibility {
+/// Replace Anthropic `document` content blocks with a visible note.
+///
+/// Kimi for Coding's Anthropic surface does not implement the block at all: a
+/// bare `{"type":"document"}` and an entirely made-up block type both fail with
+/// the same opaque `Invalid request Error`, and every source form (base64, text,
+/// url) fails alike. Because the block stays in the conversation history, one
+/// attachment otherwise breaks every later turn of that session.
+///
+/// Dropping it costs nothing that was working: DeepSeek's endpoint accepts the
+/// same block but answers `CANNOT_READ` with or without it, so the PDF was never
+/// reaching a model this way. Science delivers real document content through its
+/// file tools instead. The note keeps that degradation visible to both the model
+/// and the reader rather than silently discarding an attachment.
+fn replace_kimi_coding_document_blocks(body: &mut Value, rule_ids: &mut Vec<String>) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return 0;
+    };
+    let mut replaced = 0;
+    for message in messages.iter_mut() {
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if block.get("type").and_then(Value::as_str) != Some("document") {
+                continue;
+            }
+            let media_type = block
+                .pointer("/source/media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown media type")
+                .to_string();
+            // Name CSSwitch as the source. Unattributed, the model reads this as
+            // an assertion from nowhere: one observed session quoted it, was
+            // challenged on where it came from, and retracted a true statement
+            // as its own invention. Then point at the path that does work —
+            // image blocks are accepted upstream, so rendering the pages locally
+            // still puts the contents in front of the model.
+            *block = json!({
+                "type": "text",
+                "text": format!(
+                    concat!(
+                        "[CSSwitch] Attachment omitted ({}). This channel's upstream does not ",
+                        "implement Anthropic document content blocks, so the file itself was not ",
+                        "forwarded; this note is inserted by the CSSwitch gateway and is not a ",
+                        "tool result. Image blocks are accepted — to see the contents, read the ",
+                        "file from disk and render its pages to images."
+                    ),
+                    media_type
+                )
+            });
+            replaced += 1;
+        }
     }
-    apply_anthropic_server_tool_policy(body, AnthropicServerToolPolicy::Kimi, rule_ids)
+    if replaced > 0 {
+        append_rule_id(rule_ids, RULE_PROVIDER_KIMI_CODING_DOCUMENT_PLACEHOLDER);
+    }
+    replaced
+}
+
+fn filter_relay_server_tools(
+    body: &mut Value,
+    flavor: RelayFlavor,
+    rule_ids: &mut Vec<String>,
+) -> ServerToolOutcome {
+    normalize_relay_tools(body, rule_ids);
+    let policy = match flavor {
+        RelayFlavor::KimiOpenPlatform => AnthropicServerToolPolicy::Kimi,
+        RelayFlavor::KimiCoding => AnthropicServerToolPolicy::KimiCoding,
+        RelayFlavor::Generic => return ServerToolOutcome::default(),
+    };
+    apply_anthropic_server_tool_policy_with_outcome(body, policy, rule_ids)
 }
 
 pub(crate) fn zero_information_kimi_block(block: &Value) -> bool {
@@ -1203,17 +1381,24 @@ pub fn transform_relay_request_for_contract(
         return Err("resolved upstream model is required".into());
     }
     let target_model = target_model.to_string();
-    let kimi_compatibility = is_kimi_relay(provider_contract_id, &target_model);
+    let flavor = RelayFlavor::detect(provider_contract_id, &target_model);
+    let kimi_compatibility = flavor == RelayFlavor::KimiOpenPlatform;
     let mut rule_ids = Vec::new();
     if relay_thinking == Some("enabled") && kimi_compatibility {
         append_rule_id(&mut rule_ids, RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED);
     }
     obj.insert("model".to_string(), Value::String(target_model.clone()));
     normalize_kimi_failed_history_tail(&mut body, kimi_compatibility, &mut rule_ids)?;
+    if flavor == RelayFlavor::KimiCoding {
+        replace_kimi_coding_document_blocks(&mut body, &mut rule_ids);
+    }
     validate_relay_tool_history(&body)?;
-    normalize_relay_thinking(&mut body, relay_thinking);
-    let dropped_server_tools =
-        filter_kimi_server_tools(&mut body, kimi_compatibility, &mut rule_ids);
+    if relay_thinking == Some("upstream_default") {
+        normalize_upstream_default_thinking(&mut body, &mut rule_ids);
+    } else {
+        normalize_relay_thinking(&mut body, relay_thinking);
+    }
+    let server_tools = filter_relay_server_tools(&mut body, flavor, &mut rule_ids);
     apply_siliconflow_tool_choice_compat(&mut body, upstream_url, &mut rule_ids);
     Ok((
         body,
@@ -1221,7 +1406,9 @@ pub fn transform_relay_request_for_contract(
             target_model,
             rule_ids,
             kimi_compatibility,
-            dropped_server_tools,
+            flavor,
+            dropped_server_tools: server_tools.dropped,
+            web_search_bridged: server_tools.web_search_bridged,
         },
     ))
 }
@@ -1231,7 +1418,8 @@ mod tests {
     use super::{
         filter_kimi_nonstream_response, filter_kimi_nonstream_response_with_count,
         is_siliconflow_anthropic_endpoint, transform_relay_request,
-        transform_relay_request_for_contract, KimiServerToolFilter, MAX_KIMI_FRAME_BYTES,
+        transform_relay_request_for_contract, AnthropicMetadata, KimiServerToolFilter, RelayFlavor,
+        MAX_KIMI_FRAME_BYTES,
     };
     use serde_json::{json, Value};
 
@@ -1423,6 +1611,273 @@ mod tests {
         assert_eq!(
             metadata.rule_ids,
             vec!["tool.kimi.web_search.server-tool-filter".to_string()]
+        );
+    }
+
+    fn kimi_coding(body: Value) -> (Value, AnthropicMetadata) {
+        transform_relay_request_for_contract(
+            body,
+            "kimi-for-coding",
+            Some("upstream_default"),
+            "https://api.kimi.com/coding/v1/messages",
+            Some("kimi-coding-anthropic"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn kimi_coding_drops_science_auto_thinking_so_the_upstream_default_applies() {
+        // Upstream silently stops thinking on the non-standard `auto`, but keeps
+        // thinking on when the field is absent.
+        for declared in [json!({"type": "auto"}), json!({"type": "adaptive"})] {
+            let (mapped, metadata) = kimi_coding(json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": declared,
+            }));
+            assert!(mapped.get("thinking").is_none());
+            assert!(metadata
+                .rule_ids
+                .contains(&"provider.kimi-coding.thinking-upstream-default".to_string()));
+        }
+    }
+
+    #[test]
+    fn kimi_coding_passes_standard_thinking_values_through_untouched() {
+        for declared in [
+            json!({"type": "enabled", "budget_tokens": 2048}),
+            json!({"type": "disabled"}),
+        ] {
+            let (mapped, metadata) = kimi_coding(json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": declared.clone(),
+            }));
+            assert_eq!(mapped["thinking"], declared);
+            assert!(!metadata
+                .rule_ids
+                .contains(&"provider.kimi-coding.thinking-upstream-default".to_string()));
+        }
+    }
+
+    #[test]
+    fn kimi_coding_specified_tool_choice_disables_thinking_but_keeps_the_forced_tool() {
+        // Science's work-item classifier forces one named tool and omits
+        // `thinking`; upstream thinking defaults to on and rejects the pair.
+        let (mapped, metadata) = kimi_coding(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "classify"}],
+            "tool_choice": {"type": "tool", "name": "create_work_item"},
+            "tools": [{"name": "create_work_item", "input_schema": {"type": "object"}}],
+        }));
+        assert_eq!(mapped["thinking"], json!({"type": "disabled"}));
+        assert_eq!(
+            mapped["tool_choice"],
+            json!({"type": "tool", "name": "create_work_item"})
+        );
+        assert!(metadata
+            .rule_ids
+            .contains(&"provider.kimi-coding.specified-tool-choice-disables-thinking".to_string()));
+    }
+
+    #[test]
+    fn kimi_coding_leaves_any_and_auto_tool_choice_thinking_alone() {
+        // Only the "specified" form conflicts upstream; blanket-disabling
+        // thinking for `any`/`auto` would give up thinking for no reason.
+        for choice in [json!({"type": "any"}), json!({"type": "auto"})] {
+            let (mapped, metadata) = kimi_coding(json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": choice,
+                "tools": [{"name": "python", "input_schema": {"type": "object"}}],
+            }));
+            assert!(mapped.get("thinking").is_none());
+            assert!(!metadata.rule_ids.contains(
+                &"provider.kimi-coding.specified-tool-choice-disables-thinking".to_string()
+            ));
+        }
+    }
+
+    #[test]
+    fn kimi_coding_swaps_server_web_search_for_the_client_tool_bridge() {
+        let (mapped, metadata) = kimi_coding(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "bash", "input_schema": {"type": "object"}},
+            ],
+        }));
+        let tools = mapped["tools"].as_array().unwrap();
+        // The typed server declaration is gone — it is what trips the upstream 429.
+        assert!(!tools.iter().any(|tool| tool.get("type").is_some()));
+        // A same-named client tool takes its place so the model can still ask.
+        let bridge = tools
+            .iter()
+            .find(|tool| tool["name"] == "web_search")
+            .expect("client-tool bridge");
+        assert_eq!(
+            bridge["input_schema"]["properties"]["query"]["type"],
+            "string"
+        );
+        assert!(tools.iter().any(|tool| tool["name"] == "bash"));
+        assert!(metadata.web_search_bridged);
+        assert!(metadata
+            .rule_ids
+            .contains(&"tool.kimi-coding.web_search.client-tool-bridge".to_string()));
+        // Never borrow the open-platform Kimi rule ids.
+        assert!(!metadata
+            .rule_ids
+            .iter()
+            .any(|rule| rule.starts_with("tool.kimi.")));
+    }
+
+    #[test]
+    fn kimi_coding_arms_no_bridge_when_science_declares_no_web_search() {
+        let (mapped, metadata) = kimi_coding(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "bash", "input_schema": {"type": "object"}}],
+        }));
+        assert!(!metadata.web_search_bridged);
+        assert_eq!(mapped["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn kimi_coding_bridge_does_not_duplicate_an_existing_client_web_search() {
+        let (mapped, metadata) = kimi_coding(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "web_search", "input_schema": {"type": "object"}},
+            ],
+        }));
+        let named: Vec<_> = mapped["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool["name"] == "web_search")
+            .collect();
+        assert_eq!(named.len(), 1);
+        assert!(metadata.web_search_bridged);
+    }
+
+    #[test]
+    fn kimi_coding_replaces_document_blocks_with_a_visible_note() {
+        // A single attachment anywhere in history otherwise fails every later
+        // turn: upstream rejects the block type outright.
+        let (mapped, metadata) = kimi_coding(json!({
+            "model": "claude-opus-4-8",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "document", "source": {
+                        "type": "base64", "media_type": "application/pdf", "data": "JVBER"
+                    }},
+                    {"type": "text", "text": "what is this"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "a file"},
+                    {"type": "tool_use", "id": "t1", "name": "read_file", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain"}}
+                ]}
+            ]
+        }));
+        let blocks: Vec<&str> = mapped["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .map(|block| block["type"].as_str().unwrap())
+            .collect();
+        assert!(!blocks.contains(&"document"));
+        assert_eq!(blocks.iter().filter(|kind| **kind == "text").count(), 4);
+        // The note names what was lost instead of silently dropping it.
+        let note = mapped["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(note.contains("Attachment omitted"));
+        assert!(note.contains("application/pdf"));
+        // Attribution matters: an unattributed note gets read as an assertion
+        // from nowhere and disbelieved, and the model needs the route that works.
+        assert!(note.contains("CSSwitch"));
+        assert!(note.contains("not a tool result"));
+        assert!(note.contains("render its pages to images"));
+        assert!(mapped["messages"][2]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("text/plain"));
+        assert!(metadata
+            .rule_ids
+            .contains(&"provider.kimi-coding.document-block-placeholder".to_string()));
+    }
+
+    #[test]
+    fn kimi_coding_leaves_images_and_other_content_untouched() {
+        // Images are accepted upstream; only the document block is unsupported.
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}
+        });
+        let (mapped, metadata) = kimi_coding(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": [image.clone(), {"type": "text", "text": "hi"}]}]
+        }));
+        assert_eq!(mapped["messages"][0]["content"][0], image);
+        assert!(!metadata
+            .rule_ids
+            .contains(&"provider.kimi-coding.document-block-placeholder".to_string()));
+    }
+
+    #[test]
+    fn other_relay_contracts_keep_their_document_blocks() {
+        let document = json!({
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBER"}
+        });
+        let (mapped, metadata) = transform_relay_request_for_contract(
+            json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": [document.clone()]}]
+            }),
+            "glm-5.2",
+            Some("adaptive"),
+            "https://open.bigmodel.cn/api/anthropic/v1/messages",
+            Some("anthropic-relay"),
+        )
+        .unwrap();
+        assert_eq!(mapped["messages"][0]["content"][0], document);
+        assert!(metadata.rule_ids.is_empty());
+    }
+
+    #[test]
+    fn kimi_coding_never_enables_the_open_platform_thinking_continuity_path() {
+        let (_, metadata) = kimi_coding(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(metadata.flavor, RelayFlavor::KimiCoding);
+        // `kimi_compatibility` gates the reasoning store; this upstream tolerates
+        // stripped thinking blocks and must not pay for continuity.
+        assert!(!metadata.kimi_compatibility);
+    }
+
+    #[test]
+    fn relay_flavor_separates_the_two_kimi_upstreams() {
+        assert_eq!(
+            RelayFlavor::detect(Some("kimi-anthropic-relay"), "kimi-k3"),
+            RelayFlavor::KimiOpenPlatform
+        );
+        assert_eq!(
+            RelayFlavor::detect(Some("kimi-coding-anthropic"), "kimi-for-coding"),
+            RelayFlavor::KimiCoding
+        );
+        assert_eq!(
+            RelayFlavor::detect(Some("custom-anthropic"), "kimi-for-coding"),
+            RelayFlavor::Generic
         );
     }
 

@@ -166,7 +166,7 @@ fn parse_catalog() -> Result<ProviderContractCatalog, String> {
             || contract.scratch_policy.is_empty()
             || !matches!(
                 contract.thinking_policy.as_str(),
-                "" | "adaptive" | "enabled"
+                "" | "adaptive" | "enabled" | "upstream_default"
             )
         {
             return Err("provider contract catalog contains an invalid capability shape".into());

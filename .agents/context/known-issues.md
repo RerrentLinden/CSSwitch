@@ -32,6 +32,22 @@
 - `BUG-083-SSH-LATE` 已完成源码级修复：SSH 可预检项先于 OAuth，生命周期串行区会重检精确候选与既有受管 Gateway 上下文，真正晚失败会精确补偿 OAuth、active profile、Gateway、Science、managed stub、journal 与耐久清理状态。当前证据仅来自临时 HOME、假凭证、假 Science、本地 Gateway 和 loopback；production artifact/runtime、已安装 App、真实 provider、真实 SSH server、签名和公开发布仍未验证，产品 gate 保持 open。
 - fresh xhigh 复审接受一个与本 bug 分离的 P3 威胁模型边界：最终校验后，若同 UID 对 CSSwitch 私有根实施恶意 pathname 替换，当前实现并非全程 fd-relative。该边界沿用[既有 runtime / 安全记录](../../docs/evidence/investigations/2026-07-18-v070-ui-redesign-runtime-security-review.md)，在当前私有根威胁模型内不阻断 `BUG-083-SSH-LATE`，本窗口不另建 bug。
 
+## Kimi for Coding 渠道
+
+- 上游对"声明了 `web_search_20250305` 但本轮模型未实际搜索"的请求返回 429 `rate_limit_error`，DeepSeek 同条件无此缺陷。补偿为客户端工具桥接：换成同名客户端工具，模型主动调用时 gateway 用真 server 工具补发一次并把搜索块拼回同一条消息。已在真实 Science 验证原生 web_search 渲染。详见[渠道文档](../../docs/features/kimi-for-coding-channel.md)。
+- 该端点还存在与 web_search 无关的偶发 429（一次无工具基础请求也曾 429）。任何把 429 解释为"本轮没搜索"的策略都不可靠。
+- 上游搜索轮的块序为 `text, server_tool_use, web_search_tool_result, thinking, text`，thinking 不在首块，与 Anthropic 规范和 DeepSeek 的表现都不同。经桥接改写后已在真实 Science 中验证渲染正常（原生 Web Search 组件、结果列表与来源链接齐全）。
+- 已验证 `kimi-for-coding`、`kimi-for-coding-highspeed`、`k3`、`k3-256k` 四个模型的 thinking 与 `tool_choice` 行为；图片、视频输入、原生流式结构化输出未验证。
+- gateway 链路已用真实 Science（隔离实例）+ 真实订阅 key 端到端验证：纯文本轮、多轮 Python 工具调用循环、Reviewer 与 Notebook 均正常，Science 内部的 `create_work_item` 与 `verdict` 两类强制工具调用也都通过。桌面端 UI 入口已交付并在浏览器 mock 模式可视化验收（服务商网格、默认值预填、创建入列、编辑回读、深色主题）；**安装版 artifact 的端到端验收未执行**，UI 与真实后端合并后的链路未在打包版本中走过一遍。
+- `400 relay history ends with unresolved tool calls`：当客户端工具调用在等待用户授权（如 `request_network_access`）时，Science 仍会继续发起推理，历史以未解决的 `tool_use` 结尾，被 relay 通路的 `validate_relay_tool_history` 拒绝。该校验对所有 relay contract 无差别生效，非本渠道特有（实测中由安装版应用的 custom-anthropic 通路产生）。桥接落地后模型不再被迫改用 `request_network_access`，触达概率下降，但该通用问题本身仍未修复。
+- 上游不实现 Anthropic `document` 内容块：四种 source 形态与一个不存在的块类型返回完全相同的 `Invalid request Error`，属解析器未知块分支而非格式问题。该块留在历史里会让此后每轮都失败（真实会话 27 条消息成功、29 条失败）。**该块是 Science 平台 PDF 视觉通道的载荷**（`read_file(pages=[…])` → `queued_for_vision` + `[System] Attached file` + `document`），因此**该平台路径在本渠道确实不可用**。CSSwitch 替换为署名占位文本以保住该轮。读 PDF 仍可行：Agent 自行渲染页面为 `image` 块传入，上游接受，已在真实会话验证。DeepSeek 接受该块但带与不带附件都回 `CANNOT_READ`，故这不是相对同类渠道的倒退；`image` 块不受影响。
+- 占位文本必须署名来源：实测中模型引用未署名占位文本后被追问出处，把一个正确结论当作自己编造的撤回了。
+- 桥接的搜索轮会多一次上游往返；模型在 Science 全量工具集下有时会绕开 web_search 改用 `bash`，此时桥接保持空闲。搜索结果块的顺序为 `server_tool_use, web_search_tool_result` 紧随首轮已流出的前言之后，与上游原生顺序不同但 Science 渲染正常。
+
 ## 测试
 
 - 真机验收矩阵描述应执行的场景，不表示最终 v0.8.2 DMG 已逐项全部执行。每次验收必须绑定 exact artifact，并把通过、失败、环境阻塞与未执行分开记录。
+- source gate（`test/run_all.sh`）要求 `git status --porcelain --untracked-files=all` 完全为空，未提交或未跟踪文件都会让它在 preflight 以 `worktree is not clean` 退出（对外表现为静默 exit 12）。这是刻意设计——证据要绑定到确切的干净 commit——不是缺陷；开发中途跑不通属预期，提交后即可执行。其唯一第三方依赖 `jsonschema` 在门禁实际使用的 `/usr/bin/python3` 中已具备。
+- `desktop/gateway/src/reasoning_state.rs` 有 4 处既有 clippy 错误（`needless_return` ×3、`manual_c_str_literals` ×1），会让 `test/run-rust.sh` 的 `-D warnings` 判红。
+- `test/run-rust.sh` 只在 PATH 与 `~/.cargo/bin` 找 cargo，rustup 工具链不在这两处时会**静默输出 env-blocked 并以 0 退出**，导致该层看似通过实则未执行。
+- `test/quality/fixtures/source_gate/expected_test_ids.v1.json` 的 RUST-GATEWAY 套件存在既有漂移：11 个已存在的测试未注册、5 个已注册项在代码中不存在。因门禁跑不起来而长期未被发现。

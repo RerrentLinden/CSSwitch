@@ -58,6 +58,7 @@ const MOCK_TEMPLATES = [
   { id: "xiaomi", name: "小米 MiMo", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.xiaomimimo.com/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["mimo-v2.5-pro"], icon: "xiaomi", icon_color: "#FF6900", website_url: "https://xiaomimimo.com" },
   { id: "siliconflow", name: "硅基流动", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.siliconflow.cn", base_url_editable: true, requires_model_override: true, builtin_models: ["deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V3.2", "zai-org/GLM-5.2"], icon: "siliconflow", icon_color: "#7C3AED", website_url: "https://siliconflow.cn" },
   { id: "kimi", name: "Kimi（Moonshot）", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.moonshot.cn/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"], icon: "kimi", icon_color: "#16182F", website_url: "https://platform.moonshot.cn" },
+  { id: "kimi-coding", name: "Kimi for Coding", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.kimi.com/coding", base_url_editable: true, requires_model_override: true, builtin_models: ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k"], icon: "kimi", icon_color: "#16182F", website_url: "https://www.kimi.com", compatibility_notice: "上游的服务端 web_search 有已知缺陷：声明该工具但本轮未实际搜索时会返回 429。CSSwitch 已自动桥接，联网搜索可正常使用，搜索轮会多一次上游往返。另：上游不接受 PDF 等文档附件，会被替换为占位说明，文档内容请让 Agent 用文件工具读取。" },
   { id: "minimax", name: "MiniMax", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.minimaxi.com/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"], icon: "minimax", icon_color: "#E1341E", website_url: "https://platform.minimaxi.com" },
   { id: "openrouter", name: "OpenRouter", category: "custom", api_format: "anthropic", adapter: "relay", base_url: "https://openrouter.ai/api", base_url_editable: true, requires_model_override: true, builtin_models: ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.8-fast"], icon: "openrouter", icon_color: "#6467F2", website_url: "https://openrouter.ai" },
   { id: "qwen", name: "通义千问", category: "cn_official", api_format: "openai_chat", adapter: "qwen", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", base_url_editable: false, requires_model_override: false, builtin_models: ["qwen3.7-max", "qwen-plus-latest", "qwen-turbo"], icon: "qwen", icon_color: "#615CED", website_url: "https://dashscope.aliyun.com" },
@@ -70,6 +71,16 @@ const MOCK_TEMPLATES = [
   { id: "custom-openai-responses", name: "自定义 OpenAI Responses", category: "custom", api_format: "openai_responses", adapter: "openai-responses", base_url: "", base_url_editable: true, requires_model_override: true, builtin_models: [], icon: "custom", icon_color: "#0F766E", website_url: "" },
   { id: "custom", name: "自定义 Anthropic", category: "custom", api_format: "anthropic", adapter: "relay", base_url: "", base_url_editable: true, requires_model_override: true, builtin_models: [], icon: "custom", icon_color: "#6B7280", website_url: "" },
 ];
+// Keep the preview's role bindings in step with catalog/model-presets.v1.json
+// where the generic "first model everywhere" default would misrepresent them.
+const MOCK_ROLE_BINDING_OVERRIDES = {
+  "kimi-coding": {
+    sonnet: "kimi-for-coding",
+    opus: "kimi-for-coding",
+    haiku: "kimi-for-coding-highspeed",
+    fable: "k3",
+  },
+};
 for (const template of MOCK_TEMPLATES) {
   if (!template.recommended_catalog && template.builtin_models?.length) {
     template.preset_catalog_id = template.id;
@@ -78,7 +89,7 @@ for (const template of MOCK_TEMPLATES) {
       selector_id: "", display_name: id, upstream_model: id, supports_tools: null,
     }));
     template.recommended_default_model_route_id = template.builtin_models[0];
-    template.recommended_role_bindings = {
+    template.recommended_role_bindings = MOCK_ROLE_BINDING_OVERRIDES[template.id] || {
       sonnet: template.builtin_models[0], opus: template.builtin_models[0],
       haiku: template.builtin_models.at(-1), fable: template.builtin_models[0],
     };
@@ -444,6 +455,8 @@ function modelFamilyKey(profile = {}) {
   const icon = String(profile.icon || "").toLowerCase();
   const direct = templateId || icon;
   if (direct === "codex") return "openai";
+  // The coding subscription is a separate contract but the same brand.
+  if (direct === "kimi-coding") return "kimi";
   if (direct === "custom-openai" || direct === "custom-openai-responses") return "openai";
   if (direct === "custom") {
     if (String(profile.api_format || "").startsWith("openai")) return "openai";

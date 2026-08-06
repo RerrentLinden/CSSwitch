@@ -9,6 +9,7 @@ pub(crate) mod codex_transport;
 pub mod config;
 pub mod connect;
 pub mod dsml_shim;
+pub(crate) mod kimi_coding_search;
 pub mod messages;
 pub mod models;
 pub mod openai_chat;

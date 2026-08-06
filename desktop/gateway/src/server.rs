@@ -14,7 +14,7 @@ use crate::{
     anthropic_compat::{self, AnthropicMetadata},
     codex_auth, codex_models, codex_protocol, codex_transport, connect,
     dsml_shim::{DsmlDetector, DsmlStreamRewriter},
-    messages, models, openai_chat, openai_responses, policy,
+    kimi_coding_search, messages, models, openai_chat, openai_responses, policy,
     reasoning_state::{ReasoningStore, RestorePolicy},
 };
 
@@ -85,6 +85,7 @@ impl RequestNonceGenerator {
 
 enum StreamFilter {
     Kimi(anthropic_compat::KimiServerToolFilter),
+    KimiCodingSearch(kimi_coding_search::WebSearchBridge),
     DsmlDetect(DsmlDetector),
     DsmlRewrite(DsmlStreamRewriter),
 }
@@ -109,6 +110,7 @@ impl StreamFilter {
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
         match self {
             StreamFilter::Kimi(filter) => filter.feed(chunk),
+            StreamFilter::KimiCodingSearch(bridge) => bridge.feed(chunk),
             StreamFilter::DsmlDetect(detector) => {
                 detector.feed(chunk);
                 Ok(chunk.to_vec())
@@ -120,6 +122,7 @@ impl StreamFilter {
     fn finalize(&mut self) -> Result<Vec<u8>, String> {
         match self {
             StreamFilter::Kimi(filter) => filter.finalize(),
+            StreamFilter::KimiCodingSearch(bridge) => bridge.finalize(),
             StreamFilter::DsmlDetect(_) => Ok(Vec::new()),
             StreamFilter::DsmlRewrite(rewriter) => Ok(rewriter.finalize()),
         }
@@ -131,6 +134,13 @@ impl StreamFilter {
                 eprintln!(
                     "relay stream rules=tool.kimi.web_search.server-tool-filter dropped={}",
                     filter.dropped()
+                );
+            }
+            StreamFilter::KimiCodingSearch(bridge) if bridge.swallowed_blocks() > 0 => {
+                eprintln!(
+                    "relay stream rules=tool.kimi-coding.web_search.client-tool-bridge bridged={} queries={}",
+                    bridge.swallowed_blocks(),
+                    bridge.queries().len()
                 );
             }
             StreamFilter::DsmlDetect(detector) if detector.found => {
@@ -1118,6 +1128,26 @@ fn write_anthropic_response_with_continuity(
             }
         }
     }
+}
+
+/// Non-streaming counterpart: returns the rewritten body when a search ran.
+fn resolve_bridged_web_search_nonstream(
+    cfg: &GatewayConfig,
+    transport: Option<&messages::AnthropicTransport>,
+    original: &Value,
+    body: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    let first = serde_json::from_slice::<Value>(body)
+        .map_err(|_| "relay response is not valid JSON".to_string())?;
+    let queries = kimi_coding_search::nonstream_queries(&first);
+    if queries.is_empty() {
+        return Ok(None);
+    }
+    let follow_up = kimi_coding_search::run_follow_up(cfg, transport, original, &queries)?;
+    let merged = kimi_coding_search::merge_nonstream(&first, &follow_up)?;
+    serde_json::to_vec(&merged)
+        .map(Some)
+        .map_err(|error| format!("web search bridge response is invalid: {error}"))
 }
 
 fn handle_stream(
@@ -2150,6 +2180,9 @@ fn handle_messages(
             .map(Vec::len)
             .unwrap_or(0);
         log_relay_metadata(&metadata, &transformed, is_stream, message_count);
+        // The bridge follow-up replays this exact request with the real server
+        // tool, so keep it before the body is serialised away.
+        let bridge_request = metadata.web_search_bridged.then(|| transformed.clone());
         let transformed = match serde_json::to_vec(&transformed) {
             Ok(body) => body,
             Err(e) => {
@@ -2158,9 +2191,26 @@ fn handle_messages(
             }
         };
         if is_stream {
-            let filter = metadata.kimi_compatibility.then(|| {
-                StreamFilter::Kimi(anthropic_compat::KimiServerToolFilter::new())
-            });
+            let filter = if let Some(original) = bridge_request.clone() {
+                // The filter owns everything it needs so the follow-up can run
+                // inline, keeping the splice inside the validated SSE stream.
+                let search_cfg = cfg.clone();
+                let search_transport = anthropic_transport.cloned();
+                Some(StreamFilter::KimiCodingSearch(
+                    kimi_coding_search::WebSearchBridge::new(Box::new(move |queries| {
+                        kimi_coding_search::run_follow_up(
+                            &search_cfg,
+                            search_transport.as_ref(),
+                            &original,
+                            queries,
+                        )
+                    })),
+                ))
+            } else {
+                metadata
+                    .kimi_compatibility
+                    .then(|| StreamFilter::Kimi(anthropic_compat::KimiServerToolFilter::new()))
+            };
             handle_stream(
                 stream,
                 cfg,
@@ -2181,6 +2231,21 @@ fn handle_messages(
                             return;
                         }
                     };
+                }
+                if let Some(original) = bridge_request.as_ref() {
+                    match resolve_bridged_web_search_nonstream(
+                        cfg,
+                        anthropic_transport,
+                        original,
+                        &resp.body,
+                    ) {
+                        Ok(Some(body)) => resp.body = body,
+                        Ok(None) => {}
+                        Err(error) => {
+                            api_error_json(stream, 502, &error);
+                            return;
+                        }
+                    }
                 }
                 write_anthropic_response_with_continuity(
                     stream,

@@ -57,6 +57,17 @@
       ]
     },
     {
+      "id": "kimi-coding",
+      "default_upstream_model": "kimi-for-coding",
+      "role_bindings": {"sonnet": "kimi-for-coding", "opus": "kimi-for-coding", "haiku": "kimi-for-coding-highspeed", "fable": "k3"},
+      "models": [
+        {"upstream_model": "kimi-for-coding", "display_name": "K2.7 Coding", "supports_tools": true},
+        {"upstream_model": "kimi-for-coding-highspeed", "display_name": "K2.7 Coding Highspeed", "supports_tools": true},
+        {"upstream_model": "k3", "display_name": "K3", "supports_tools": true},
+        {"upstream_model": "k3-256k", "display_name": "K3-256k", "supports_tools": true}
+      ]
+    },
+    {
       "id": "minimax",
       "default_upstream_model": "MiniMax-M3",
       "role_bindings": {"sonnet": "MiniMax-M3", "opus": "MiniMax-M3", "haiku": "MiniMax-M2.7-highspeed", "fable": "MiniMax-M3"},

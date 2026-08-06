@@ -114,6 +114,23 @@ static TEMPLATES: &[Template] = &[
         compatibility_notice: None,
     },
     Template {
+        id: "kimi-coding",
+        name: "Kimi for Coding",
+        category: "cn_official",
+        api_format: "anthropic",
+        // 订阅制编码端点，与开放平台 Kimi 的鉴权、模型清单和服务端搜索行为都不同。
+        base_url: "https://api.kimi.com/coding",
+        base_url_editable: true,
+        preset_catalog_id: Some("kimi-coding"),
+        model_catalog_source: "preset",
+        website_url: "https://www.kimi.com",
+        icon: "kimi",
+        icon_color: "#16182F",
+        compatibility_notice: Some(
+            "上游的服务端 web_search 有已知缺陷：声明该工具但本轮未实际搜索时会返回 429。CSSwitch 已自动桥接，联网搜索可正常使用，搜索轮会多一次上游往返。另：上游不接受 PDF 等文档附件，会被替换为占位说明，文档内容请让 Agent 用文件工具读取。",
+        ),
+    },
+    Template {
         id: "minimax",
         name: "MiniMax",
         category: "cn_official",
@@ -315,7 +332,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn table_has_sixteen_templates_including_v081_providers_and_experimental_codex() {
+    fn table_has_seventeen_templates_including_kimi_coding_and_experimental_codex() {
         let ids: Vec<&str> = all().iter().map(|t| t.id).collect();
         assert_eq!(
             ids,
@@ -325,6 +342,7 @@ mod tests {
                 "xiaomi",
                 "siliconflow",
                 "kimi",
+                "kimi-coding",
                 "minimax",
                 "openrouter",
                 "qwen",
@@ -366,7 +384,7 @@ mod tests {
                 other => panic!("template {} catalog strategy 非法：{other:?}", template.id),
             }
         }
-        assert_eq!(preset_ids.len(), 8);
+        assert_eq!(preset_ids.len(), 9);
         assert_ne!(
             by_id("glm").unwrap().preset_catalog_id,
             by_id("kimi").unwrap().preset_catalog_id
