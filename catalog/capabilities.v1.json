@@ -49,29 +49,6 @@
       ]
     },
     {
-      "id": "provider.kimi.relay-thinking-enabled",
-      "scope": "provider",
-      "match": {
-        "provider": "relay",
-        "provider_contract": "kimi-anthropic-relay",
-        "thinking_policy": "enabled"
-      },
-      "status": "limited",
-      "action": "degrade",
-      "reason": "Kimi relay models require enabled thinking, but forced Anthropic tool_choice is removed so the model can choose tools itself.",
-      "evidence": [
-        "desktop/src-tauri/src/templates.rs",
-        "desktop/gateway/src/policy.rs",
-        "desktop/gateway/src/anthropic_compat.rs",
-        "test/golden/relay_anthropic.json"
-      ],
-      "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_drops_typed_web_search_and_invalid_forced_choice",
-        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
-        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
-      ]
-    },
-    {
       "id": "provider.dashscope.responses-tools-cap",
       "scope": "provider",
       "match": {
@@ -100,31 +77,6 @@
   ],
   "tool_rules": [
     {
-      "id": "tool.kimi.web_search.server-tool-filter",
-      "scope": "tool",
-      "match": {
-        "provider": "relay",
-        "provider_contract": "kimi-anthropic-relay",
-        "tool_type_family": "web_search_*"
-      },
-      "status": "limited",
-      "action": "drop",
-      "reason": "Live A/B on the current Science request shape showed that the Science-supplied web_search_20250305 declaration triggers an upstream 429 while the same request succeeds when that typed declaration is removed. CSSwitch temporarily drops only Kimi typed web_search_* declarations and recomputes forced tool_choice; same-named ordinary client tools, Science-local Python/Bash/R/Compute, and host.mcp remain untouched. The same Coding Plan can execute the versioned tool through Claude Code plus an upstream cc-switch passthrough, so this is a request-shape workaround rather than a permanent provider capability verdict. web_search_20250305 is an Anthropic GA versioned schema: CSSwitch neither strips its suffix nor adds guessed beta routing. /coding/v1/search is a separate host-service endpoint and is not evidence for Messages server-tool compatibility.",
-      "evidence": [
-        "desktop/gateway/src/anthropic_compat.rs",
-        ".trellis/tasks/08-03-kimi-protocol-compatibility/research/kimi-first-turn-429-regression-audit.md",
-        "test/golden/relay_anthropic.json"
-      ],
-      "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_drops_server_tool_blocks_and_compacts_indexes",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_nonstream_filter_preserves_signed_thinking_and_rejects_unsigned_content",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_nonstream_filter_rejects_envelope_only_and_nonterminal_server_tool_responses",
-        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
-      ]
-    },
-    {
       "id": "tool.kimi.unsupported-server-tool-filter",
       "scope": "tool",
       "match": {
@@ -141,130 +93,103 @@
       },
       "status": "unsupported",
       "action": "drop",
-      "reason": "Kimi Code's Anthropic endpoint has no verified execution contract for these provider-owned declarations. CSSwitch drops only the typed forms and recomputes tool_choice; ordinary Python, Bash, Compute, web_search functions and host.mcp orchestration remain client-owned.",
+      "reason": "Kimi Code's Anthropic endpoint has no verified execution contract for these provider-owned declarations. CSSwitch drops only the typed forms and recomputes tool_choice; ordinary Python, Bash, Compute, web_search functions and host.mcp orchestration remain client-owned. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
         "desktop/gateway/src/anthropic_compat.rs",
-        ".trellis/tasks/08-03-kimi-protocol-compatibility/research/official-provider-capability-matrix.md"
+        ".trellis/tasks/archive/2026-08/08-03-kimi-protocol-compatibility/research/official-provider-capability-matrix.md"
       ],
       "tests": [
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools"
       ]
     },
     {
-      "id": "provider.kimi-coding.thinking-upstream-default",
+      "id": "provider.kimi.thinking-upstream-default",
       "scope": "provider",
       "match": {
         "provider": "relay",
-        "provider_contract": "kimi-coding-anthropic",
+        "provider_contract": "kimi-anthropic-relay",
         "thinking_policy": "upstream_default"
       },
       "status": "supported",
       "action": "normalize",
-      "reason": "Claude Science sends a non-standard thinking type of `auto`. Live probes against api.kimi.com/coding show the k3 family silently returns no thinking blocks for `auto` (and for `adaptive`), while omitting the field entirely leaves the upstream default thinking on for all four published models. CSSwitch therefore removes only those two non-standard values and passes the standard `enabled`/`disabled` through untouched. Rewriting to `enabled` would also work upstream but would pull in the thinking-continuity store, which this upstream does not need: live multi-turn probes confirm it accepts history whose assistant thinking blocks were stripped, including messages carrying tool_use, so the DeepSeek chain-break defect does not apply here.",
+      "reason": "Claude Science sends a non-standard thinking type of `auto`. Live probes against api.kimi.com/coding show the k3 family silently returns no thinking blocks for `auto` (and for `adaptive`), while omitting the field entirely leaves the upstream default thinking on for all four published models. CSSwitch therefore removes only those two non-standard values and passes the standard `enabled`/`disabled` through untouched. Rewriting to `enabled` would also work upstream but would pull in the thinking-continuity store, which this upstream does not need: live multi-turn probes confirm it accepts history whose assistant thinking blocks were stripped, including messages carrying tool_use, so the DeepSeek chain-break defect does not apply here. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_drops_science_auto_thinking_so_the_upstream_default_applies",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_passes_standard_thinking_values_through_untouched",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_never_enables_the_open_platform_thinking_continuity_path"
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_drops_science_auto_thinking_so_the_upstream_default_applies",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_passes_standard_thinking_values_through_untouched",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_never_enables_the_open_platform_thinking_continuity_path"
       ]
     },
     {
-      "id": "provider.kimi-coding.specified-tool-choice-disables-thinking",
+      "id": "provider.kimi.specified-tool-choice-disables-thinking",
       "scope": "provider",
       "match": {
         "provider": "relay",
-        "provider_contract": "kimi-coding-anthropic",
+        "provider_contract": "kimi-anthropic-relay",
         "tool_choice_type": "tool"
       },
       "status": "limited",
       "action": "degrade",
-      "reason": "Kimi for Coding rejects `tool_choice: {\"type\": \"tool\"}` with 400 `tool_choice 'specified' is incompatible with thinking enabled` whenever thinking is on, and its thinking is on by default, so a request that merely omits the field still fails. A captured Claude Science session reproduces this on every work-item classifier call. CSSwitch keeps the forced tool — the classifier depends on receiving structured output — and sets thinking to disabled for that one request instead. The `any` and `auto` forms are unaffected upstream and are deliberately left alone, unlike the DeepSeek policy which disables thinking for both.",
+      "reason": "Kimi for Coding rejects `tool_choice: {\"type\": \"tool\"}` with 400 `tool_choice 'specified' is incompatible with thinking enabled` whenever thinking is on, and its thinking is on by default, so a request that merely omits the field still fails. A captured Claude Science session reproduces this on every work-item classifier call. CSSwitch keeps the forced tool — the classifier depends on receiving structured output — and sets thinking to disabled for that one request instead. The `any` and `auto` forms are unaffected upstream and are deliberately left alone, unlike the DeepSeek policy which disables thinking for both. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_specified_tool_choice_disables_thinking_but_keeps_the_forced_tool",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_leaves_any_and_auto_tool_choice_thinking_alone"
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_specified_tool_choice_disables_thinking_but_keeps_the_forced_tool",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_leaves_any_and_auto_tool_choice_thinking_alone"
       ]
     },
     {
-      "id": "provider.kimi-coding.document-block-placeholder",
+      "id": "provider.kimi.document-block-placeholder",
       "scope": "provider",
       "match": {
         "provider": "relay",
-        "provider_contract": "kimi-coding-anthropic"
+        "provider_contract": "kimi-anthropic-relay"
       },
       "status": "limited",
       "action": "degrade",
-      "reason": "Kimi for Coding's Anthropic surface does not implement the `document` content block. Live probes show every source form fails identically — base64 application/pdf, text/plain, url, and a bare {\"type\":\"document\"} with no source — each returning the opaque `400 invalid_request_error: \"Invalid request Error\"`. A control block type that does not exist at all returns that same message, which places `document` in the parser's unknown-block path rather than a format mismatch. Because the block persists in conversation history, one attachment fails every later turn of the session. This is the payload of Claude Science's platform PDF-vision path: a captured session shows read_file(pages=[1]) returning tool_result {\"status\":\"queued_for_vision\"} followed by a \"[System] Attached file\" text block and the PDF as a `document` block. That payload is a real PDF rather than a pre-rendered image: media_type application/pdf, 134 KB against a 1.28 MB 21-page file on disk, i.e. the requested pages extracted into a smaller PDF. Rasterising it is the model provider's job — official Anthropic supports PDF document blocks natively — so on this upstream nothing arrives to render. That platform path therefore does not work on this channel, and CSSwitch cannot make it work — it replaces each block with an attributed note naming the media type so the turn survives instead of failing, and points at the route that does work. Reading PDFs is still possible: the agent can render pages locally and pass them as image blocks, which this upstream accepts; a live session read a scanned patent exactly that way. The loss is not a CSSwitch regression relative to sibling channels either — DeepSeek's endpoint accepts the same block but answers CANNOT_READ with or without it, for both a synthetic marker PDF and the real 133 KB patent. Image blocks are untouched.",
+      "reason": "Kimi for Coding's Anthropic surface does not implement the `document` content block. Live probes show every source form fails identically — base64 application/pdf, text/plain, url, and a bare {\"type\":\"document\"} with no source — each returning the opaque `400 invalid_request_error: \"Invalid request Error\"`. A control block type that does not exist at all returns that same message, which places `document` in the parser's unknown-block path rather than a format mismatch. Because the block persists in conversation history, one attachment fails every later turn of the session. This is the payload of Claude Science's platform PDF-vision path: a captured session shows read_file(pages=[1]) returning tool_result {\"status\":\"queued_for_vision\"} followed by a \"[System] Attached file\" text block and the PDF as a `document` block. That payload is a real PDF rather than a pre-rendered image: media_type application/pdf, 134 KB against a 1.28 MB 21-page file on disk, i.e. the requested pages extracted into a smaller PDF. Rasterising it is the model provider's job — official Anthropic supports PDF document blocks natively — so on this upstream nothing arrives to render. That platform path therefore does not work on this channel, and CSSwitch cannot make it work — it replaces each block with an attributed note naming the media type so the turn survives instead of failing, and points at the route that does work. Reading PDFs is still possible: the agent can render pages locally and pass them as image blocks, which this upstream accepts; a live session read a scanned patent exactly that way. The loss is not a CSSwitch regression relative to sibling channels either — DeepSeek's endpoint accepts the same block but answers CANNOT_READ with or without it, for both a synthetic marker PDF and the real 133 KB patent. Image blocks are untouched. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_replaces_document_blocks_with_a_visible_note",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_leaves_images_and_other_content_untouched",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_replaces_document_blocks_with_a_visible_note",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_leaves_images_and_other_content_untouched",
         "desktop/gateway/src/anthropic_compat.rs::tests::other_relay_contracts_keep_their_document_blocks"
       ]
     },
     {
-      "id": "tool.kimi-coding.web_search.client-tool-bridge",
+      "id": "tool.kimi.web_search.client-tool-bridge",
       "scope": "tool",
       "match": {
         "provider": "relay",
-        "provider_contract": "kimi-coding-anthropic",
+        "provider_contract": "kimi-anthropic-relay",
         "tool_type_family": "web_search_*"
       },
       "status": "limited",
       "action": "normalize",
-      "reason": "Kimi for Coding does execute web_search_20250305 server-side, but it answers 429 rate_limit_error 'The engine is currently overloaded' whenever the tool is declared and the model then decides not to search. Live probes reproduce this 9/9 with max_tokens, turn count, system prompt, client tools, max_uses, tool_choice and prompt complexity all ruled out; DeepSeek's Anthropic endpoint has no such defect. Claude Science declares this tool on every request as the first of its 25 tools, so a captured session failed 100% of turns. CSSwitch therefore replaces the typed server declaration with a same-named client tool, which never trips the defect. A resulting tool_use is the model's own request to search: the gateway swallows it — Science declared web_search as a server tool and owns no local executor — replays the turn upstream with the real server tool, and splices the returned server_tool_use and web_search_tool_result blocks into the same message so Science renders them natively. The splice happens inside the filtered SSE stream because the gateway withholds message_stop until a clean EOF. A failing follow-up surfaces as a terminal SSE error rather than invented assistant content.",
+      "reason": "Kimi for Coding does execute web_search_20250305 server-side, but it answers 429 rate_limit_error 'The engine is currently overloaded' whenever the tool is declared and the model then decides not to search. Live probes reproduce this 9/9 with max_tokens, turn count, system prompt, client tools, max_uses, tool_choice and prompt complexity all ruled out; DeepSeek's Anthropic endpoint has no such defect. Claude Science declares this tool on every request as the first of its 25 tools, so a captured session failed 100% of turns. CSSwitch therefore replaces the typed server declaration with a same-named client tool, which never trips the defect. A resulting tool_use is the model's own request to search: the gateway swallows it — Science declared web_search as a server tool and owns no local executor — replays the turn upstream with the real server tool, and splices the returned server_tool_use and web_search_tool_result blocks into the same message so Science renders them natively. The splice happens inside the filtered SSE stream because the gateway withholds message_stop until a clean EOF. A failing follow-up surfaces as a terminal SSE error rather than invented assistant content. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
+        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
         "desktop/gateway/src/kimi_coding_search.rs",
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_swaps_server_web_search_for_the_client_tool_bridge",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_bridge_does_not_duplicate_an_existing_client_web_search",
-        "desktop/gateway/src/kimi_coding_search.rs::tests::the_search_is_spliced_into_the_same_message_before_message_stop",
-        "desktop/gateway/src/kimi_coding_search.rs::tests::bridge_tool_use_is_swallowed_and_its_query_captured",
-        "desktop/gateway/src/kimi_coding_search.rs::tests::a_failing_follow_up_surfaces_instead_of_inventing_an_answer",
-        "desktop/gateway/src/kimi_coding_search.rs::tests::nonstream_merge_drops_the_bridge_call_and_appends_real_evidence"
-      ]
-    },
-    {
-      "id": "tool.kimi-coding.unsupported-server-tool-filter",
-      "scope": "tool",
-      "match": {
-        "provider": "relay",
-        "provider_contract": "kimi-coding-anthropic",
-        "tool_type_family": [
-          "web_fetch_*",
-          "code_execution_*",
-          "mcp_toolset",
-          "mcp_servers",
-          "tool_search_tool_*",
-          "advisor_*"
-        ]
-      },
-      "status": "unsupported",
-      "action": "drop",
-      "reason": "Kimi for Coding has no verified execution contract for these provider-owned declarations. CSSwitch drops only the typed forms and recomputes tool_choice; ordinary client tools of the same name stay untouched. Tracked separately from the open-platform Kimi rule because the two upstreams are different services and must be able to diverge.",
-      "evidence": [
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        ".trellis/tasks/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
-        "desktop/gateway/src/anthropic_compat.rs"
-      ],
-      "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_coding_swaps_server_web_search_for_the_client_tool_bridge"
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_swaps_server_web_search_for_the_client_tool_bridge",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_bridge_does_not_duplicate_an_existing_client_web_search",
+        "desktop/gateway/src/kimi_search.rs::tests::the_search_is_spliced_into_the_same_message_before_message_stop",
+        "desktop/gateway/src/kimi_search.rs::tests::bridge_tool_use_is_swallowed_and_its_query_captured",
+        "desktop/gateway/src/kimi_search.rs::tests::a_failing_follow_up_surfaces_instead_of_inventing_an_answer",
+        "desktop/gateway/src/kimi_search.rs::tests::nonstream_merge_drops_the_bridge_call_and_appends_real_evidence"
       ]
     },
     {

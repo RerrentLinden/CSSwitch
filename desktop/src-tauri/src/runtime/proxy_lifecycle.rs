@@ -291,7 +291,7 @@ fn configure_reasoning_state_dir(
 }
 
 fn contract_requires_reasoning_state(contract_id: &str) -> bool {
-    matches!(contract_id, "kimi-anthropic-relay" | "deepseek-native")
+    matches!(contract_id, "deepseek-native")
 }
 
 pub(crate) fn configure_managed_proxy_command(
@@ -1378,9 +1378,10 @@ mod tests {
 
     #[test]
     fn reasoning_state_is_scoped_to_exact_anthropic_provider_contracts() {
-        assert!(contract_requires_reasoning_state("kimi-anthropic-relay"));
         assert!(contract_requires_reasoning_state("deepseek-native"));
         for contract in [
+            // Kimi retired its continuity store with the forced `enabled` rewrite.
+            "kimi-anthropic-relay",
             "anthropic-relay",
             "custom-anthropic",
             "qwen-native",

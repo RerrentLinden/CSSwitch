@@ -3597,11 +3597,10 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(body["stop_reason"], "end_turn")
             self.assertEqual(body["usage"], {"input_tokens": 2, "output_tokens": 3})
             first_upstream = json.loads(upstream.requests[0]["body"])
-            self.assertEqual(upstream.requests[0]["path"], "/v1/messages?beta=true")
-            self.assertEqual(
-                upstream.requests[0]["headers"]["anthropic-beta"],
-                "claude-code-20250219",
-            )
+            # The gateway no longer forces a beta query or a Claude Code beta
+            # token onto Kimi: both endpoints get Science's own request shape.
+            self.assertEqual(upstream.requests[0]["path"], "/v1/messages")
+            self.assertNotIn("anthropic-beta", upstream.requests[0]["headers"])
             self.assertIn("authorization", upstream.requests[0]["headers"])
             self.assertNotIn("x-api-key", upstream.requests[0]["headers"])
             self.assertIn("anthropic-version", upstream.requests[0]["headers"])
@@ -3668,89 +3667,6 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(len(upstream.requests), before + 1)
         finally:
             self.stop_gateway(proc)
-            upstream.shutdown()
-            upstream.server_close()
-
-    def test_managed_kimi_reasoning_continuity_survives_gateway_restart(self):
-        upstream = MockUpstream(json.dumps({
-            "id": "msg_kimi_restart",
-            "type": "message",
-            "role": "assistant",
-            "model": "k3",
-            "content": [
-                {"type": "thinking", "thinking": "kimi-authentic-plan", "signature": "opaque"},
-                {"type": "text", "text": "first answer"},
-            ],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 1, "output_tokens": 2},
-        }).encode())
-        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
-        thread.start()
-
-        def post(port, messages):
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-            conn.request(
-                "POST",
-                "/secret/v1/messages",
-                body=json.dumps({
-                    "model": "claude-opus-4-8",
-                    "max_tokens": 128,
-                    "messages": messages,
-                }).encode(),
-                headers={"content-type": "application/json"},
-            )
-            response = conn.getresponse()
-            body = json.loads(response.read())
-            conn.close()
-            return response.status, body
-
-        first_proc = second_proc = None
-        try:
-            with tempfile.TemporaryDirectory(prefix="csswitch-kimi-reasoning-") as state_dir:
-                os.chmod(state_dir, 0o700)
-                state_dir = os.path.realpath(state_dir)
-                common = {
-                    "provider": "relay",
-                    "contract_id": "kimi-anthropic-relay",
-                    "openai_base_url": f"http://127.0.0.1:{upstream.server_port}/coding",
-                    "openai_model": "k3",
-                    "relay_thinking": "enabled",
-                    "env_overrides": {
-                        "CSSWITCH_REASONING_STATE_DIR": state_dir,
-                        "CSSWITCH_REASONING_PROFILE_SCOPE": "1" * 64,
-                    },
-                }
-                first_proc, first_port = self.start_current_gateway(
-                    launch_id="a" * 32,
-                    **common,
-                )
-                status, body = post(first_port, [{"role": "user", "content": "hello"}])
-                self.assertEqual(status, 200, body)
-                self.stop_gateway(first_proc)
-                first_proc = None
-
-                second_proc, second_port = self.start_current_gateway(
-                    launch_id="b" * 32,
-                    **common,
-                )
-                stripped = [
-                    {"role": "user", "content": "hello"},
-                    {"role": "assistant", "content": [{"type": "text", "text": "first answer"}]},
-                    {"role": "user", "content": "follow up"},
-                ]
-                status, body = post(second_port, stripped)
-                self.assertEqual(status, 200, body)
-                mapped = json.loads(upstream.requests[-1]["body"])
-                self.assertEqual(
-                    mapped["messages"][1]["content"][0],
-                    {"type": "thinking", "thinking": "kimi-authentic-plan", "signature": "opaque"},
-                )
-                self.assertEqual(mapped["messages"][1]["content"][1]["text"], "first answer")
-        finally:
-            if first_proc is not None:
-                self.stop_gateway(first_proc)
-            if second_proc is not None:
-                self.stop_gateway(second_proc)
             upstream.shutdown()
             upstream.server_close()
 
@@ -3954,7 +3870,7 @@ class RustGatewayLoopback(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
-    def test_v081_kimi_same_conversation_failed_tail_edit_resend_posts_once(self):
+    def test_kimi_invalid_tool_history_fails_closed_and_valid_resend_posts_once(self):
         upstream = MockUpstream(json.dumps({
             "id": "msg_kimi_recovered",
             "type": "message",
@@ -4025,6 +3941,9 @@ class RustGatewayLoopback(unittest.TestCase):
                 self.assertEqual(error["error"]["type"], "invalid_request_error")
             self.assertEqual(len(upstream.requests), 0, "deterministic history errors must not post upstream")
 
+            # The open-platform-only failed-tail cleanup was removed together with
+            # the rest of that channel's bespoke handling: a valid history is now
+            # forwarded verbatim, and the resend still posts exactly once.
             recovered_history = complete_round + [
                 {"role": "user", "content": "round two"},
                 {"role": "assistant", "content": [
@@ -4041,11 +3960,7 @@ class RustGatewayLoopback(unittest.TestCase):
             mapped = json.loads(upstream.requests[0]["body"])
             self.assertEqual(mapped["messages"][:4], complete_round)
             self.assertEqual(mapped["messages"][-1]["content"], "round two edited and resent")
-            self.assertFalse(any(
-                block.get("type") in {"server_tool_use", "web_search_tool_result"}
-                for message in mapped["messages"]
-                for block in (message.get("content") if isinstance(message.get("content"), list) else [])
-            ))
+            self.assertEqual(mapped["messages"], recovered_history)
         finally:
             self.stop_gateway(proc)
             upstream.shutdown()

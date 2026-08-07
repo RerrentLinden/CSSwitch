@@ -235,7 +235,7 @@ fn upstream_url_for(
 }
 
 fn contract_requires_reasoning_continuity(contract_id: &str) -> bool {
-    matches!(contract_id, "kimi-anthropic-relay" | "deepseek-native")
+    matches!(contract_id, "deepseek-native")
 }
 
 fn reasoning_state_path(
@@ -574,47 +574,50 @@ mod tests {
 
     #[test]
     fn reasoning_state_is_required_only_for_exact_formal_managed_anthropic_contracts() {
-        for contract in ["kimi-anthropic-relay", "deepseek-native"] {
-            assert!(reasoning_state_path(true, GatewayIntent::Formal, contract, None).is_err());
-            assert!(reasoning_state_path(
+        let contract = "deepseek-native";
+        assert!(reasoning_state_path(true, GatewayIntent::Formal, contract, None).is_err());
+        assert!(reasoning_state_path(
+            true,
+            GatewayIntent::Formal,
+            contract,
+            Some("relative/state".into())
+        )
+        .is_err());
+        assert!(reasoning_state_path(
+            true,
+            GatewayIntent::Formal,
+            contract,
+            Some("/private/tmp/../unsafe".into())
+        )
+        .is_err());
+        assert_eq!(
+            reasoning_state_path(
                 true,
                 GatewayIntent::Formal,
                 contract,
-                Some("relative/state".into())
+                Some("/private/tmp/csswitch-reasoning-test".into())
             )
-            .is_err());
-            assert!(reasoning_state_path(
-                true,
-                GatewayIntent::Formal,
-                contract,
-                Some("/private/tmp/../unsafe".into())
-            )
-            .is_err());
+            .unwrap(),
+            Some(std::path::PathBuf::from(
+                "/private/tmp/csswitch-reasoning-test"
+            ))
+        );
+        assert_eq!(
+            reasoning_state_path(true, GatewayIntent::ScratchMessage, contract, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            reasoning_state_path(false, GatewayIntent::Formal, contract, None).unwrap(),
+            None
+        );
+        // Kimi retired its thinking-continuity store together with the forced
+        // `enabled` rewrite, so it now behaves like any other relay.
+        for contract in ["anthropic-relay", "kimi-anthropic-relay"] {
             assert_eq!(
-                reasoning_state_path(
-                    true,
-                    GatewayIntent::Formal,
-                    contract,
-                    Some("/private/tmp/csswitch-reasoning-test".into())
-                )
-                .unwrap(),
-                Some(std::path::PathBuf::from(
-                    "/private/tmp/csswitch-reasoning-test"
-                ))
-            );
-            assert_eq!(
-                reasoning_state_path(true, GatewayIntent::ScratchMessage, contract, None).unwrap(),
-                None
-            );
-            assert_eq!(
-                reasoning_state_path(false, GatewayIntent::Formal, contract, None).unwrap(),
+                reasoning_state_path(true, GatewayIntent::Formal, contract, None).unwrap(),
                 None
             );
         }
-        assert_eq!(
-            reasoning_state_path(true, GatewayIntent::Formal, "anthropic-relay", None).unwrap(),
-            None
-        );
     }
 
     #[test]

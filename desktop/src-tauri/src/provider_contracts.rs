@@ -351,9 +351,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 },
             };
             let expected_auth_scheme = match contract.id.as_str() {
-                "kimi-anthropic-relay" | "kimi-coding-anthropic" | "opencode-go-anthropic" => {
-                    AuthScheme::Bearer
-                }
+                "kimi-anthropic-relay" | "opencode-go-anthropic" => AuthScheme::Bearer,
                 _ => match contract.adapter.as_str() {
                     "deepseek" => AuthScheme::AnthropicXApiKey,
                     "relay" => AuthScheme::AnthropicDual,
@@ -422,22 +420,10 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     AuthScheme::AnthropicDual,
                     "adaptive",
                 ),
+                // 开放平台与订阅制编码端点共用一份契约：两者的兼容补偿完全相同，
+                // 只有 base_url 与模型预设不同，而那两项都在 template 层。
                 "kimi-anthropic-relay" => (
-                    &["kimi"][..],
-                    &["anthropic"][..],
-                    "relay",
-                    "CSSWITCH_RELAY_KEY",
-                    &[ModelPolicy::SavedCatalog][..],
-                    ModelPolicy::SavedCatalog,
-                    ModelDiscovery::AnthropicModelsOrManual,
-                    Transport::AnthropicMessages,
-                    EndpointPolicy::ProfileRequired,
-                    EndpointJoin::AnthropicV1,
-                    AuthScheme::Bearer,
-                    "enabled",
-                ),
-                "kimi-coding-anthropic" => (
-                    &["kimi-coding"][..],
+                    &["kimi", "kimi-coding"][..],
                     &["anthropic"][..],
                     "relay",
                     "CSSWITCH_RELAY_KEY",
@@ -593,7 +579,6 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
         "qwen-native",
         "anthropic-relay",
         "kimi-anthropic-relay",
-        "kimi-coding-anthropic",
         "custom-anthropic",
         "custom-openai-chat",
         "custom-openai-responses",
@@ -644,7 +629,7 @@ mod tests {
     fn static_provider_contracts_load_and_are_unambiguous() {
         let catalog = load_provider_contracts().unwrap();
         assert_eq!(catalog.schema_version, 1);
-        assert_eq!(catalog.contracts.len(), 13);
+        assert_eq!(catalog.contracts.len(), 12);
         assert_eq!(static_catalog_digest().len(), 64);
         assert_eq!(
             contract_for("codex", "openai_responses")

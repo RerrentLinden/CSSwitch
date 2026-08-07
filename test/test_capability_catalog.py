@@ -54,9 +54,9 @@ ALLOWED_ACTIONS = {
 
 REQUIRED_RULE_IDS = {
     "provider.relay.force-model-shell",
-    "provider.kimi.relay-thinking-enabled",
+    "provider.kimi.thinking-upstream-default",
     "provider.dashscope.responses-tools-cap",
-    "tool.kimi.web_search.server-tool-filter",
+    "tool.kimi.web_search.client-tool-bridge",
     "tool.kimi.unsupported-server-tool-filter",
     "tool.deepseek.web_search.server-tool-preserve",
     "tool.deepseek.unsupported-server-tool-filter",
@@ -71,9 +71,9 @@ REQUIRED_RULE_IDS = {
 
 RUNTIME_OBSERVABILITY_RULE_IDS = {
     "provider.relay.force-model-shell",
-    "provider.kimi.relay-thinking-enabled",
+    "provider.kimi.thinking-upstream-default",
     "provider.dashscope.responses-tools-cap",
-    "tool.kimi.web_search.server-tool-filter",
+    "tool.kimi.web_search.client-tool-bridge",
     "tool.kimi.unsupported-server-tool-filter",
     "tool.deepseek.web_search.server-tool-preserve",
     "tool.deepseek.unsupported-server-tool-filter",
@@ -162,8 +162,8 @@ class CapabilityCatalogSchema(unittest.TestCase):
             for entry in data[section]
         }
         expected = {
-            "provider.kimi.relay-thinking-enabled": "kimi-anthropic-relay",
-            "tool.kimi.web_search.server-tool-filter": "kimi-anthropic-relay",
+            "provider.kimi.thinking-upstream-default": "kimi-anthropic-relay",
+            "tool.kimi.web_search.client-tool-bridge": "kimi-anthropic-relay",
             "tool.kimi.unsupported-server-tool-filter": "kimi-anthropic-relay",
             "provider.deepseek.anthropic-native": "deepseek-native",
             "tool.deepseek.web_search.server-tool-preserve": "deepseek-native",
@@ -185,9 +185,9 @@ class CapabilityCatalogSchema(unittest.TestCase):
         migrated = {
             "provider.deepseek.anthropic-native",
             "provider.relay.force-model-shell",
-            "provider.kimi.relay-thinking-enabled",
+            "provider.kimi.thinking-upstream-default",
             "provider.dashscope.responses-tools-cap",
-            "tool.kimi.web_search.server-tool-filter",
+            "tool.kimi.web_search.client-tool-bridge",
             "tool.kimi.unsupported-server-tool-filter",
             "tool.deepseek.web_search.server-tool-preserve",
             "tool.deepseek.unsupported-server-tool-filter",

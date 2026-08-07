@@ -42,6 +42,10 @@ pub fn template_id_for_legacy_slot(slot: &str) -> &'static str {
     }
 }
 
+/// 两个 Kimi 渠道共用一个 provider contract，因此补偿行为与提示口径一致。
+/// 证据来自 api.kimi.com/coding 的实测；开放平台沿用同一套补偿。
+const KIMI_COMPATIBILITY_NOTICE: &str = "上游的服务端 web_search 有已知缺陷：声明该工具但本轮未实际搜索时会返回 429。CSSwitch 已自动桥接，联网搜索可正常使用，搜索轮会多一次上游往返。另：上游不接受 PDF 等文档附件，会被替换为占位说明，文档内容请让 Agent 用文件工具读取。";
+
 static TEMPLATES: &[Template] = &[
     Template {
         id: "deepseek",
@@ -111,14 +115,14 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://platform.moonshot.cn",
         icon: "kimi",
         icon_color: "#16182F",
-        compatibility_notice: None,
+        compatibility_notice: Some(KIMI_COMPATIBILITY_NOTICE),
     },
     Template {
         id: "kimi-coding",
         name: "Kimi for Coding",
         category: "cn_official",
+        // 订阅制编码端点。与开放平台 Kimi 共用同一套兼容补偿，只有地址和模型清单不同。
         api_format: "anthropic",
-        // 订阅制编码端点，与开放平台 Kimi 的鉴权、模型清单和服务端搜索行为都不同。
         base_url: "https://api.kimi.com/coding",
         base_url_editable: true,
         preset_catalog_id: Some("kimi-coding"),
@@ -126,9 +130,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://www.kimi.com",
         icon: "kimi",
         icon_color: "#16182F",
-        compatibility_notice: Some(
-            "上游的服务端 web_search 有已知缺陷：声明该工具但本轮未实际搜索时会返回 429。CSSwitch 已自动桥接，联网搜索可正常使用，搜索轮会多一次上游往返。另：上游不接受 PDF 等文档附件，会被替换为占位说明，文档内容请让 Agent 用文件工具读取。",
-        ),
+        compatibility_notice: Some(KIMI_COMPATIBILITY_NOTICE),
     },
     Template {
         id: "minimax",
@@ -469,12 +471,16 @@ mod tests {
 
     #[test]
     fn thinking_policy_per_provider() {
-        assert_eq!(
-            crate::provider_contracts::contract_for("kimi", "anthropic")
-                .unwrap()
-                .thinking_policy,
-            "enabled"
-        );
+        // Both Kimi templates share one contract and leave thinking to the
+        // upstream default; neither forces `enabled` any more.
+        for template in ["kimi", "kimi-coding"] {
+            assert_eq!(
+                crate::provider_contracts::contract_for(template, "anthropic")
+                    .unwrap()
+                    .thinking_policy,
+                "upstream_default"
+            );
+        }
         assert_eq!(
             crate::provider_contracts::contract_for("glm", "anthropic")
                 .unwrap()

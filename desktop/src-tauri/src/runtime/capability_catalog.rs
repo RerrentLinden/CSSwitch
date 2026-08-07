@@ -324,31 +324,56 @@ mod tests {
         let ctx = context_for_profile(&p, "off");
         assert_eq!(ctx.provider, "relay");
         assert_eq!(ctx.provider_contract, "kimi-anthropic-relay");
-        assert_eq!(ctx.thinking_policy, "enabled");
+        assert_eq!(ctx.thinking_policy, "upstream_default");
     }
 
     #[test]
-    fn kimi_coding_profile_is_bound_to_its_own_contract_and_rules() {
-        let p = Profile {
-            template_id: "kimi-coding".into(),
-            api_format: "anthropic".into(),
-            base_url: "https://api.kimi.com/coding".into(),
-            model: "kimi-for-coding".into(),
-            ..Default::default()
-        };
-        let ctx = context_for_profile(&p, "off");
-        assert_eq!(ctx.provider, "relay");
-        assert_eq!(ctx.provider_contract, "kimi-coding-anthropic");
-        assert_eq!(ctx.thinking_policy, "upstream_default");
+    fn both_kimi_templates_share_one_contract_and_one_rule_set() {
+        for (template, base_url, model) in [
+            (
+                "kimi",
+                "https://api.moonshot.cn/anthropic",
+                "kimi-k2.7-code",
+            ),
+            (
+                "kimi-coding",
+                "https://api.kimi.com/coding",
+                "kimi-for-coding",
+            ),
+        ] {
+            let p = Profile {
+                template_id: template.into(),
+                api_format: "anthropic".into(),
+                base_url: base_url.into(),
+                model: model.into(),
+                ..Default::default()
+            };
+            let ctx = context_for_profile(&p, "off");
+            assert_eq!(ctx.provider, "relay", "{template}");
+            assert_eq!(ctx.provider_contract, "kimi-anthropic-relay", "{template}");
+            assert_eq!(ctx.thinking_policy, "upstream_default", "{template}");
 
-        let active = ids(&diagnostics_for_profile(Some(&p), "off"), "active_rules");
-        assert!(active.contains(&"provider.kimi-coding.thinking-upstream-default".to_string()));
-        // The open-platform Kimi rules must never leak into this channel.
-        assert!(!active.contains(&"provider.kimi.relay-thinking-enabled".to_string()));
-        // Request-shape rules stay out of the profile-level active set.
-        assert!(!active.contains(&"tool.kimi-coding.web_search.server-tool-filter".to_string()));
-        assert!(!active
-            .contains(&"provider.kimi-coding.specified-tool-choice-disables-thinking".to_string()));
+            let active = ids(&diagnostics_for_profile(Some(&p), "off"), "active_rules");
+            assert!(
+                active.contains(&"provider.kimi.thinking-upstream-default".to_string()),
+                "{template}"
+            );
+            // The retired open-platform rules must not come back.
+            assert!(
+                !active.contains(&"provider.kimi.relay-thinking-enabled".to_string()),
+                "{template}"
+            );
+            assert!(
+                !active.contains(&"tool.kimi.web_search.server-tool-filter".to_string()),
+                "{template}"
+            );
+            // Request-shape rules stay out of the profile-level active set.
+            assert!(
+                !active
+                    .contains(&"provider.kimi.specified-tool-choice-disables-thinking".to_string()),
+                "{template}"
+            );
+        }
     }
 
     #[test]
@@ -363,8 +388,8 @@ mod tests {
         let v = diagnostics_for_profile(Some(&p), "off");
         let active = ids(&v, "active_rules");
         assert!(active.contains(&"provider.relay.force-model-shell".to_string()));
-        assert!(active.contains(&"provider.kimi.relay-thinking-enabled".to_string()));
-        assert!(!active.contains(&"tool.kimi.web_search.server-tool-filter".to_string()));
+        assert!(active.contains(&"provider.kimi.thinking-upstream-default".to_string()));
+        assert!(!active.contains(&"tool.kimi.web_search.client-tool-bridge".to_string()));
         assert!(!active.contains(&"tool.relay.input-schema-normalize".to_string()));
         assert!(!active.contains(&"tool.siliconflow.forced-named-to-any".to_string()));
 
@@ -379,7 +404,7 @@ mod tests {
             &diagnostics_for_profile(Some(&custom), "off"),
             "active_rules",
         );
-        assert!(!custom_active.contains(&"provider.kimi.relay-thinking-enabled".to_string()));
+        assert!(!custom_active.contains(&"provider.kimi.thinking-upstream-default".to_string()));
 
         let boundaries = ids(&v, "boundary_rules");
         assert!(boundaries.contains(&"transport.connect.anthropic-fastfail-401".to_string()));

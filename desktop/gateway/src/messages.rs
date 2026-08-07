@@ -61,8 +61,6 @@ const INFERENCE_TIMEOUTS: InferenceTimeouts = InferenceTimeouts {
 };
 
 const MAX_ERROR_BODY_BYTES: u64 = 16 * 1024;
-const KIMI_CLAUDE_CODE_BETA: &str = "claude-code-20250219";
-const KIMI_CLAUDE_CODE_UA: &str = "claude-cli/2.1.220 (external, cli)";
 
 #[derive(Clone, Debug, Default)]
 pub struct AnthropicTransport {
@@ -193,17 +191,11 @@ fn auth_scheme(cfg: &GatewayConfig) -> AuthScheme {
         })
 }
 
-fn is_kimi_anthropic_relay(cfg: &GatewayConfig) -> bool {
-    cfg.provider_contract
-        .as_ref()
-        .is_some_and(|contract| contract.contract_id == "kimi-anthropic-relay")
-}
-
 fn messages_post_url<'a>(
     cfg: &'a GatewayConfig,
     transport: Option<&AnthropicTransport>,
 ) -> Result<Cow<'a, str>, UpstreamError> {
-    if transport.is_none() && !is_kimi_anthropic_relay(cfg) {
+    if transport.is_none() {
         return Ok(Cow::Borrowed(&cfg.upstream_url));
     }
     let mut url = reqwest::Url::parse(&cfg.upstream_url).map_err(|_| UpstreamError {
@@ -211,8 +203,7 @@ fn messages_post_url<'a>(
         upstream_status: None,
         detail: "Anthropic upstream URL is invalid".into(),
     })?;
-    let mut beta_query =
-        is_kimi_anthropic_relay(cfg) || transport.is_some_and(|transport| transport.beta_query);
+    let mut beta_query = transport.is_some_and(|transport| transport.beta_query);
     if !beta_query && !url.query_pairs().any(|(key, _)| key == "beta") {
         return Ok(Cow::Borrowed(&cfg.upstream_url));
     }
@@ -240,25 +231,10 @@ fn messages_post_url<'a>(
     Ok(Cow::Owned(url.into()))
 }
 
-fn merged_anthropic_beta(
-    cfg: &GatewayConfig,
-    transport: Option<&AnthropicTransport>,
-) -> Option<String> {
-    let incoming = transport.and_then(|transport| transport.anthropic_beta.as_deref());
-    if !is_kimi_anthropic_relay(cfg) {
-        return incoming.map(str::to_string);
-    }
-    match incoming {
-        Some(value)
-            if value
-                .split(',')
-                .any(|token| token.trim() == KIMI_CLAUDE_CODE_BETA) =>
-        {
-            Some(value.to_string())
-        }
-        Some(value) if !value.trim().is_empty() => Some(format!("{KIMI_CLAUDE_CODE_BETA},{value}")),
-        _ => Some(KIMI_CLAUDE_CODE_BETA.to_string()),
-    }
+fn merged_anthropic_beta(transport: Option<&AnthropicTransport>) -> Option<String> {
+    transport
+        .and_then(|transport| transport.anthropic_beta.as_deref())
+        .map(str::to_string)
 }
 
 fn models_timeout_secs(provider: &str) -> u64 {
@@ -333,15 +309,9 @@ fn post_with_timeouts(
 ) -> Result<Response, UpstreamError> {
     let api_key = cfg.api_key.as_deref().unwrap_or("");
     let upstream_url = messages_post_url(cfg, transport)?;
-    let kimi = is_kimi_anthropic_relay(cfg);
     let user_agent = transport
         .and_then(|transport| transport.user_agent.as_deref())
-        .filter(|user_agent| !kimi || user_agent.starts_with("claude-cli/"))
-        .unwrap_or(if kimi {
-            KIMI_CLAUDE_CODE_UA
-        } else {
-            UPSTREAM_UA
-        });
+        .unwrap_or(UPSTREAM_UA);
     let mut request = inference_client(timeouts, enforce_total)?
         .post(upstream_url.as_ref())
         .header("content-type", "application/json")
@@ -356,12 +326,10 @@ fn post_with_timeouts(
     {
         request = request.header("anthropic-version", "2023-06-01");
     }
-    if let Some(beta) = merged_anthropic_beta(cfg, transport) {
+    if let Some(beta) = merged_anthropic_beta(transport) {
         request = request.header("anthropic-beta", beta);
     }
-    if kimi {
-        request = request.header("x-app", "cli");
-    } else if let Some(x_app) = transport.and_then(|transport| transport.x_app.as_deref()) {
+    if let Some(x_app) = transport.and_then(|transport| transport.x_app.as_deref()) {
         request = request.header("x-app", x_app);
     }
     request = match auth_scheme(cfg) {
@@ -1109,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_anthropic_loopback_merges_beta_and_uses_claude_code_identity() {
+    fn kimi_anthropic_loopback_forwards_science_identity_without_injecting_anything() {
         let (url, request_rx, upstream) = spawn_captured_response();
         let transport = AnthropicTransport::from_inbound(
             "/v1/messages",
@@ -1132,10 +1100,16 @@ mod tests {
         let request = String::from_utf8(request_rx.recv().unwrap())
             .unwrap()
             .to_ascii_lowercase();
-        assert!(request.starts_with("post /v1/messages?beta=true http/1.1\r\n"));
-        assert!(request.contains("anthropic-beta: claude-code-20250219,incoming-a,incoming-b\r\n"));
-        assert!(request.contains("user-agent: claude-cli/2.1.220 (external, cli)\r\n"));
-        assert!(request.contains("x-app: cli\r\n"));
+        // The gateway no longer forces a beta query, a Claude Code beta token or
+        // a claude-cli identity onto this upstream: Science's own headers pass
+        // through untouched.
+        assert!(request.starts_with("post /v1/messages http/1.1\r\n"));
+        assert!(!request.contains("beta=true"));
+        assert!(request.contains("anthropic-beta: incoming-a,incoming-b\r\n"));
+        assert!(!request.contains("claude-code-20250219"));
+        assert!(request.contains("user-agent: claude-science/1.2\r\n"));
+        assert!(!request.contains("claude-cli/"));
+        assert!(request.contains("x-app: science\r\n"));
         assert!(request.contains("authorization: bearer fake-key\r\n"));
         assert!(!request.contains("x-api-key:"));
         upstream.join().unwrap();

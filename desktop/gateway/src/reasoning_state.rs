@@ -34,7 +34,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) enum RestorePolicy {
-    KimiAll,
     DeepSeekToolUse,
 }
 
@@ -235,7 +234,6 @@ impl ReasoningStore {
             }
             let already_present = message_has_reasoning(&messages[index])?;
             let needs_restore = match policy {
-                RestorePolicy::KimiAll => true,
                 RestorePolicy::DeepSeekToolUse => message_has_tool_use(&messages[index])?,
             };
             if !needs_restore || already_present {
@@ -273,9 +271,8 @@ impl ReasoningStore {
             .get("content")
             .and_then(Value::as_array)
             .ok_or_else(|| "thinking continuity response content is invalid".to_string())?;
-        let (blocks, visible_content) = split_reasoning_blocks(response_content, policy)?;
+        let (blocks, visible_content) = split_reasoning_blocks(response_content)?;
         let must_capture = match policy {
-            RestorePolicy::KimiAll => true,
             RestorePolicy::DeepSeekToolUse => visible_content.iter().any(is_tool_binding_block),
         };
         if !must_capture {
@@ -650,10 +647,7 @@ fn valid_bounded_string(value: Option<&Value>, max: usize) -> bool {
     })
 }
 
-fn split_reasoning_blocks(
-    content: &[Value],
-    policy: RestorePolicy,
-) -> Result<(Vec<StoredBlock>, Vec<Value>), String> {
+fn split_reasoning_blocks(content: &[Value]) -> Result<(Vec<StoredBlock>, Vec<Value>), String> {
     let mut blocks = Vec::new();
     let mut visible = Vec::with_capacity(content.len());
     let mut reasoning_bytes = 0_usize;
@@ -684,10 +678,6 @@ fn split_reasoning_blocks(
                 index,
                 block: block.clone(),
             });
-        } else if policy == RestorePolicy::KimiAll
-            && crate::anthropic_compat::zero_information_kimi_block(block)
-        {
-            continue;
         } else {
             visible.push(block.clone());
         }
@@ -1399,22 +1389,19 @@ mod tests {
     }
 
     #[test]
-    fn kimi_pure_text_round_trip_survives_restart_and_key_order_changes() {
+    fn store_round_trip_survives_restart_and_key_order_changes() {
         let root = TestRoot::new();
         let request = first_request();
         let response = complete_response(
             json!([
-                {"type": "text", "text": ""},
                 {"type": "thinking", "thinking": "provider-only", "signature": "opaque"},
-                {"type": "text", "text": ""},
-                {"type": "text", "text": "answer"},
-                {"type": "text", "text": ""}
+                {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": "1+1"}}
             ]),
-            "end_turn",
+            "tool_use",
         );
         let first = store(&root, "profile-a");
         let pending = first
-            .capture_message(&request, &response, "k3", RestorePolicy::KimiAll)
+            .capture_message(&request, &response, "k3", RestorePolicy::DeepSeekToolUse)
             .unwrap()
             .unwrap();
         first.commit(pending).unwrap();
@@ -1425,28 +1412,34 @@ mod tests {
             .any(|window| window == b"provider-only"));
         assert!(!format!("{first:?}").contains(root.path().to_str().unwrap()));
 
-        let mut text = Map::new();
-        text.insert("text".into(), Value::String("answer".into()));
-        text.insert("type".into(), Value::String("text".into()));
+        // Rebuild the tool_use block with the keys inserted in a different
+        // order: the fingerprint is semantic, so it must still match.
+        let mut tool_use = Map::new();
+        tool_use.insert("input".into(), json!({"code": "1+1"}));
+        tool_use.insert("name".into(), Value::String("python".into()));
+        tool_use.insert("id".into(), Value::String("toolu_1".into()));
+        tool_use.insert("type".into(), Value::String("tool_use".into()));
         let mut next = json!({
             "messages": [
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": []},
-                {"role": "user", "content": "follow up"}
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "2"}
+                ]}
             ]
         });
-        next["messages"][1]["content"] = Value::Array(vec![Value::Object(text)]);
+        next["messages"][1]["content"] = Value::Array(vec![Value::Object(tool_use)]);
         drop(first);
 
         let restarted = store(&root, "profile-a");
         restarted
-            .restore_request(&mut next, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut next, "k3", RestorePolicy::DeepSeekToolUse)
             .unwrap();
         assert_eq!(
             next["messages"][1]["content"][0]["thinking"],
             "provider-only"
         );
-        assert_eq!(next["messages"][1]["content"][1]["text"], "answer");
+        assert_eq!(next["messages"][1]["content"][1]["id"], "toolu_1");
     }
 
     #[test]
@@ -1459,30 +1452,36 @@ mod tests {
         let first_response = complete_response(
             json!([
                 {"type": "thinking", "thinking": "first-plan", "signature": "first-sig"},
-                {"type": "text", "text": "first answer"}
+                {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": "1"}}
             ]),
-            "end_turn",
+            "tool_use",
         );
         let first_pending = store
             .capture_message(
                 &first_request,
                 &first_response,
                 "k3",
-                RestorePolicy::KimiAll,
+                RestorePolicy::DeepSeekToolUse,
             )
             .unwrap()
             .unwrap();
         store.commit(first_pending).unwrap();
 
+        // cache_control markers move between turns as the client re-anchors its
+        // prompt cache; the fingerprint must ignore them.
         let mut second_request = json!({"messages": [
             {"role": "user", "content": [
                 {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
             ]},
-            {"role": "assistant", "content": "first answer"},
-            {"role": "user", "content": "next"}
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": "1"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "1"}
+            ]}
         ]});
         store
-            .restore_request(&mut second_request, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut second_request, "k3", RestorePolicy::DeepSeekToolUse)
             .unwrap();
         assert_eq!(
             second_request["messages"][1]["content"][0]["thinking"],
@@ -1492,38 +1491,41 @@ mod tests {
         let second_response = complete_response(
             json!([
                 {"type": "thinking", "thinking": "second-plan", "signature": "second-sig"},
-                {"type": "text", "text": "second answer"}
+                {"type": "tool_use", "id": "toolu_2", "name": "python", "input": {"code": "2"}}
             ]),
-            "end_turn",
+            "tool_use",
         );
         let second_pending = store
             .capture_message(
                 &second_request,
                 &second_response,
                 "k3",
-                RestorePolicy::KimiAll,
+                RestorePolicy::DeepSeekToolUse,
             )
             .unwrap()
             .unwrap();
         store.commit(second_pending).unwrap();
 
         let third_template = json!({
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": [
-                    {"type": "text", "text": "first answer", "cache_control": {"type": "ephemeral"}}
+                    {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": "1"}, "cache_control": {"type": "ephemeral"}}
                 ]},
                 {"role": "user", "content": [
-                    {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "1", "cache_control": {"type": "ephemeral"}}
                 ]},
-                {"role": "assistant", "content": "second answer"},
-                {"role": "user", "content": "third"}
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_2", "name": "python", "input": {"code": "2"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "2"}
+                ]}
             ]
         });
         let mut third_request = third_template.clone();
         store
-            .restore_request(&mut third_request, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut third_request, "k3", RestorePolicy::DeepSeekToolUse)
             .unwrap();
         assert_eq!(
             third_request["messages"][1]["content"][0]["thinking"],
@@ -1534,10 +1536,11 @@ mod tests {
             "second-plan"
         );
 
-        let mut changed_text = third_template;
-        changed_text["messages"][1]["content"][0]["text"] = json!("changed");
+        // A genuine history edit must fail closed rather than replay stale state.
+        let mut changed_tool = third_template;
+        changed_tool["messages"][1]["content"][0]["input"] = json!({"code": "changed"});
         assert!(store
-            .restore_request(&mut changed_text, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut changed_tool, "k3", RestorePolicy::DeepSeekToolUse)
             .is_err());
     }
 
@@ -1792,9 +1795,6 @@ mod tests {
                 RestorePolicy::DeepSeekToolUse,
             )
             .is_err());
-        assert!(store
-            .capture_message(&request, &response, "k3", RestorePolicy::KimiAll)
-            .is_err());
     }
 
     #[test]
@@ -1810,7 +1810,7 @@ mod tests {
         );
         let first = store(&root, "profile-a");
         let first_pending = first
-            .capture_message(&request, &response, "k3", RestorePolicy::KimiAll)
+            .capture_message(&request, &response, "k3", RestorePolicy::DeepSeekToolUse)
             .unwrap()
             .unwrap();
         let first_target = first_pending.target.clone();
@@ -1824,19 +1824,19 @@ mod tests {
 
         let mut wrong_model = clean_history.clone();
         assert!(first
-            .restore_request(&mut wrong_model, "k3-256k", RestorePolicy::KimiAll)
+            .restore_request(&mut wrong_model, "k3-256k", RestorePolicy::DeepSeekToolUse)
             .is_err());
         let mut wrong_tool = clean_history.clone();
         wrong_tool["messages"][1]["content"][0]["input"] = json!({"code": "2+2"});
         assert!(first
-            .restore_request(&mut wrong_tool, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut wrong_tool, "k3", RestorePolicy::DeepSeekToolUse)
             .is_err());
         drop(first);
 
         let changed_scope = store(&root, "profile-b");
         let mut scoped = clean_history.clone();
         assert!(changed_scope
-            .restore_request(&mut scoped, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut scoped, "k3", RestorePolicy::DeepSeekToolUse)
             .is_err());
         let second_response = complete_response(
             json!([
@@ -1846,7 +1846,12 @@ mod tests {
             "tool_use",
         );
         let second_pending = changed_scope
-            .capture_message(&request, &second_response, "k3", RestorePolicy::KimiAll)
+            .capture_message(
+                &request,
+                &second_response,
+                "k3",
+                RestorePolicy::DeepSeekToolUse,
+            )
             .unwrap()
             .unwrap();
         assert_ne!(first_target, second_pending.target);
@@ -1863,7 +1868,7 @@ mod tests {
         );
         let mut scoped = clean_history.clone();
         changed_scope
-            .restore_request(&mut scoped, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut scoped, "k3", RestorePolicy::DeepSeekToolUse)
             .unwrap();
         assert_eq!(
             scoped["messages"][1]["content"][0]["thinking"],
@@ -1874,7 +1879,7 @@ mod tests {
         let reopened = store(&root, "profile-a");
         let mut original_scope = clean_history.clone();
         reopened
-            .restore_request(&mut original_scope, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut original_scope, "k3", RestorePolicy::DeepSeekToolUse)
             .unwrap();
         assert_eq!(
             original_scope["messages"][1]["content"][0]["thinking"],
@@ -1895,7 +1900,7 @@ mod tests {
         let reopened = store(&root, "profile-a");
         let mut tampered = clean_history;
         assert!(reopened
-            .restore_request(&mut tampered, "k3", RestorePolicy::KimiAll)
+            .restore_request(&mut tampered, "k3", RestorePolicy::DeepSeekToolUse)
             .is_err());
     }
 
@@ -1908,12 +1913,17 @@ mod tests {
             json!([
                 {"type": "thinking", "thinking": half, "signature": "sig-a"},
                 {"type": "thinking", "thinking": "x".repeat(MAX_ENTRY_BYTES / 2), "signature": "sig-b"},
-                {"type": "text", "text": "answer"}
+                {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": "1"}}
             ]),
-            "end_turn",
+            "tool_use",
         );
         assert!(bounded
-            .capture_message(&first_request(), &response, "k3", RestorePolicy::KimiAll)
+            .capture_message(
+                &first_request(),
+                &response,
+                "k3",
+                RestorePolicy::DeepSeekToolUse
+            )
             .is_err());
         drop(bounded);
 
@@ -1970,12 +1980,17 @@ mod tests {
         let response = complete_response(
             json!([
                 {"type": "thinking", "thinking": "capacity-plan", "signature": "sig"},
-                {"type": "text", "text": "answer"}
+                {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": "1"}}
             ]),
-            "end_turn",
+            "tool_use",
         );
         let pending = store
-            .capture_message(&first_request(), &response, "k3", RestorePolicy::KimiAll)
+            .capture_message(
+                &first_request(),
+                &response,
+                "k3",
+                RestorePolicy::DeepSeekToolUse,
+            )
             .unwrap()
             .unwrap();
         let target = pending.target.clone();

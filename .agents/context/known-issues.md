@@ -32,9 +32,12 @@
 - `BUG-083-SSH-LATE` 已完成源码级修复：SSH 可预检项先于 OAuth，生命周期串行区会重检精确候选与既有受管 Gateway 上下文，真正晚失败会精确补偿 OAuth、active profile、Gateway、Science、managed stub、journal 与耐久清理状态。当前证据仅来自临时 HOME、假凭证、假 Science、本地 Gateway 和 loopback；production artifact/runtime、已安装 App、真实 provider、真实 SSH server、签名和公开发布仍未验证，产品 gate 保持 open。
 - fresh xhigh 复审接受一个与本 bug 分离的 P3 威胁模型边界：最终校验后，若同 UID 对 CSSwitch 私有根实施恶意 pathname 替换，当前实现并非全程 fd-relative。该边界沿用[既有 runtime / 安全记录](../../docs/evidence/investigations/2026-07-18-v070-ui-redesign-runtime-security-review.md)，在当前私有根威胁模型内不阻断 `BUG-083-SSH-LATE`，本窗口不另建 bug。
 
-## Kimi for Coding 渠道
+## Kimi 渠道（开放平台 / for Coding）
 
-- 上游对"声明了 `web_search_20250305` 但本轮模型未实际搜索"的请求返回 429 `rate_limit_error`，DeepSeek 同条件无此缺陷。补偿为客户端工具桥接：换成同名客户端工具，模型主动调用时 gateway 用真 server 工具补发一次并把搜索块拼回同一条消息。已在真实 Science 验证原生 web_search 渲染。详见[渠道文档](../../docs/features/kimi-for-coding-channel.md)。
+- 两个渠道共用 provider contract `kimi-anthropic-relay` 与同一套补偿；差异只有默认地址与模型预设。**以下各条的实测证据全部来自 `api.kimi.com/coding`，开放平台按用户判定沿用、未独立实测。**
+- 开放平台原有的一批只服务它的处理已全部移除：`?beta=true` 查询参数、强制注入的 `anthropic-beta: claude-code-20250219`、伪装成 `claude-cli/*` 的 User-Agent、强制 `x-app: cli`、失败历史尾巴清理、thinking 强制 `enabled` 与思考续写存储。**若开放平台实际依赖 beta 标识或 claude-cli 身份放行，表现将是请求被拒或能力降级**；恢复实现见 git 历史。
+
+- 上游对"声明了 `web_search_20250305` 但本轮模型未实际搜索"的请求返回 429 `rate_limit_error`，DeepSeek 同条件无此缺陷。补偿为客户端工具桥接：换成同名客户端工具，模型主动调用时 gateway 用真 server 工具补发一次并把搜索块拼回同一条消息。已在真实 Science 验证原生 web_search 渲染。详见[渠道文档](../../docs/features/kimi-channels.md)。
 - 该端点还存在与 web_search 无关的偶发 429（一次无工具基础请求也曾 429）。任何把 429 解释为"本轮没搜索"的策略都不可靠。
 - 上游搜索轮的块序为 `text, server_tool_use, web_search_tool_result, thinking, text`，thinking 不在首块，与 Anthropic 规范和 DeepSeek 的表现都不同。经桥接改写后已在真实 Science 中验证渲染正常（原生 Web Search 组件、结果列表与来源链接齐全）。
 - 已验证 `kimi-for-coding`、`kimi-for-coding-highspeed`、`k3`、`k3-256k` 四个模型的 thinking 与 `tool_choice` 行为；图片、视频输入、原生流式结构化输出未验证。

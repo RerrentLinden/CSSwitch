@@ -132,13 +132,13 @@ impl StreamFilter {
         match self {
             StreamFilter::Kimi(filter) if filter.dropped() > 0 => {
                 eprintln!(
-                    "relay stream rules=tool.kimi.web_search.server-tool-filter dropped={}",
+                    "relay stream rules=tool.kimi.unsupported-server-tool-filter dropped={}",
                     filter.dropped()
                 );
             }
             StreamFilter::KimiCodingSearch(bridge) if bridge.swallowed_blocks() > 0 => {
                 eprintln!(
-                    "relay stream rules=tool.kimi-coding.web_search.client-tool-bridge bridged={} queries={}",
+                    "relay stream rules=tool.kimi.web_search.client-tool-bridge bridged={} queries={}",
                     bridge.swallowed_blocks(),
                     bridge.queries().len()
                 );
@@ -2146,34 +2146,22 @@ fn handle_messages(
             .provider_contract
             .as_ref()
             .map(|contract| contract.contract_id.as_str());
-        let (mut transformed, metadata) =
-            match anthropic_compat::transform_relay_request_for_contract(
-                raw,
-                &target_model,
-                cfg.relay_thinking.as_deref(),
-                &cfg.upstream_url,
-                provider_contract_id,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    invalid_request_json(stream, &e);
-                    return;
-                }
-            };
-        let continuity = if metadata.kimi_compatibility {
-            match restore_continuity_or_reject(
-                stream,
-                cfg,
-                &mut transformed,
-                &target_model,
-                RestorePolicy::KimiAll,
-            ) {
-                Ok(capture) => capture,
-                Err(()) => return,
+        let (transformed, metadata) = match anthropic_compat::transform_relay_request_for_contract(
+            raw,
+            &target_model,
+            cfg.relay_thinking.as_deref(),
+            &cfg.upstream_url,
+            provider_contract_id,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                invalid_request_json(stream, &e);
+                return;
             }
-        } else {
-            None
         };
+        // Kimi runs no thinking-continuity store: it accepts history whose
+        // assistant thinking blocks were stripped, so there is nothing to restore.
+        let continuity = None;
         let message_count = transformed
             .get("messages")
             .and_then(Value::as_array)
@@ -2208,7 +2196,8 @@ fn handle_messages(
                 ))
             } else {
                 metadata
-                    .kimi_compatibility
+                    .flavor
+                    .filters_server_tool_blocks()
                     .then(|| StreamFilter::Kimi(anthropic_compat::KimiServerToolFilter::new()))
             };
             handle_stream(
@@ -2223,7 +2212,7 @@ fn handle_messages(
         }
         match messages::post_nonstream(cfg, transformed, anthropic_transport) {
             Ok(mut resp) => {
-                if metadata.kimi_compatibility {
+                if metadata.flavor.filters_server_tool_blocks() {
                     resp.body = match anthropic_compat::filter_kimi_nonstream_response(&resp.body) {
                         Ok(body) => body,
                         Err(error) => {
@@ -4237,86 +4226,83 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn continuity_restore_errors_surface_sanitized_reason_for_kimi_and_deepseek() {
+    fn continuity_restore_errors_surface_sanitized_reason_for_deepseek() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = bridge_temp_dir("continuity-errors");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        for (provider, contract, policy) in [
-            ("relay", "kimi-anthropic-relay", RestorePolicy::KimiAll),
-            (
-                "deepseek",
-                "deepseek-native",
-                RestorePolicy::DeepSeekToolUse,
-            ),
-        ] {
-            let credential = "provider-credential-must-not-leak";
-            let cfg = GatewayConfig {
-                provider: provider.into(),
-                port: 0,
-                auth_secret: Some("request-path-secret-must-not-leak".into()),
-                api_key: Some(credential.into()),
-                upstream_url: "https://provider.invalid/private/path/v1/messages".into(),
-                models_url: None,
-                relay_thinking: None,
-                provider_contract: None,
-                intent: crate::config::GatewayIntent::Formal,
-                static_model_resolver: None,
-                shim_mode: "off".into(),
-                codex_state_root: None,
-                codex_contract: None,
-                reasoning_store: Some(Arc::new(
-                    ReasoningStore::open(
-                        &root,
-                        credential,
-                        contract,
-                        "https://provider.invalid/private/path/v1/messages",
-                        "profile-scope-must-not-leak",
-                    )
-                    .unwrap(),
-                )),
-                launch_id: "launch-id-must-not-leak".into(),
-                skill_data_dir: None,
-                skill_bridge_dir: None,
-                skill_bridge_token: None,
-                science_host_context: None,
-            };
-            let mut request = json!({
-                "thinking": {"type": "enabled"},
-                "messages": [
-                    {"role": "user", "content": "prompt-must-not-leak"},
-                    {"role": "assistant", "content": [{
-                        "type": "tool_use",
-                        "id": "tool-id-must-not-leak",
-                        "name": "private-tool-name-must-not-leak",
-                        "input": {"path": "/private/request/path-must-not-leak"},
-                    }]},
-                ],
-            });
-            let response = capture_tcp_response(|stream| {
-                assert!(restore_continuity_or_reject(
-                    stream,
-                    &cfg,
-                    &mut request,
-                    "model-id-must-not-leak",
-                    policy,
+        let (provider, contract, policy) = (
+            "deepseek",
+            "deepseek-native",
+            RestorePolicy::DeepSeekToolUse,
+        );
+        let credential = "provider-credential-must-not-leak";
+        let cfg = GatewayConfig {
+            provider: provider.into(),
+            port: 0,
+            auth_secret: Some("request-path-secret-must-not-leak".into()),
+            api_key: Some(credential.into()),
+            upstream_url: "https://provider.invalid/private/path/v1/messages".into(),
+            models_url: None,
+            relay_thinking: None,
+            provider_contract: None,
+            intent: crate::config::GatewayIntent::Formal,
+            static_model_resolver: None,
+            shim_mode: "off".into(),
+            codex_state_root: None,
+            codex_contract: None,
+            reasoning_store: Some(Arc::new(
+                ReasoningStore::open(
+                    &root,
+                    credential,
+                    contract,
+                    "https://provider.invalid/private/path/v1/messages",
+                    "profile-scope-must-not-leak",
                 )
-                .is_err());
-            });
+                .unwrap(),
+            )),
+            launch_id: "launch-id-must-not-leak".into(),
+            skill_data_dir: None,
+            skill_bridge_dir: None,
+            skill_bridge_token: None,
+            science_host_context: None,
+        };
+        let mut request = json!({
+            "thinking": {"type": "enabled"},
+            "messages": [
+                {"role": "user", "content": "prompt-must-not-leak"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "tool-id-must-not-leak",
+                    "name": "private-tool-name-must-not-leak",
+                    "input": {"path": "/private/request/path-must-not-leak"},
+                }]},
+            ],
+        });
+        let response = capture_tcp_response(|stream| {
+            assert!(restore_continuity_or_reject(
+                stream,
+                &cfg,
+                &mut request,
+                "model-id-must-not-leak",
+                policy,
+            )
+            .is_err());
+        });
 
-            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
-            let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
-            assert_eq!(
-                body,
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": "thinking continuity state is missing",
-                    },
-                })
-            );
-        }
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "thinking continuity state is missing",
+                },
+            })
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

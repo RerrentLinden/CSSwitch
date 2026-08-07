@@ -18,8 +18,11 @@
     "messages": [],
     "model": "kimi-k2.7-code",
     "thinking": {
-      "budget_tokens": 1024,
-      "type": "enabled"
+      "type": "disabled"
+    },
+    "tool_choice": {
+      "name": "web_search",
+      "type": "tool"
     },
     "tools": [
       {
@@ -85,7 +88,7 @@
   },
   "kimi_rule_ids": [
     "provider.relay.force-model-shell",
-    "provider.kimi.relay-thinking-enabled",
+    "provider.kimi.specified-tool-choice-disables-thinking",
     "tool.relay.input-schema-normalize"
   ],
   "kimi_target_model": "kimi-k2.7-code",

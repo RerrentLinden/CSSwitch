@@ -1,23 +1,28 @@
-# Kimi for Coding 渠道
+# Kimi 渠道（开放平台 / for Coding）
 
-订阅制编码端点 `https://api.kimi.com/coding`，与开放平台 Kimi（`api.moonshot.cn/anthropic`）是两个独立服务，
-鉴权、模型清单、服务端搜索支持和缺陷集都不同，因此使用独立的 provider contract，不共用任何分支。
+CSSwitch 提供两个 Kimi 渠道：开放平台 `https://api.moonshot.cn/anthropic` 与订阅制编码端点
+`https://api.kimi.com/coding`。两者**共用同一个 provider contract 与同一套兼容补偿**，
+差异只有默认地址和模型预设清单，而这两项都在 template 层。
+
+> **证据边界**：下述四条补偿的实测证据全部来自 `api.kimi.com/coding`。
+> 开放平台按用户判定沿用同一套补偿，**未独立实测**。若开放平台的行为与此处描述不符，
+> 表现应为可见错误而非静默降级。
 
 ## 后端契约（已交付）
 
 | 项 | 值 |
 | --- | --- |
-| template id | `kimi-coding` |
-| provider contract | `kimi-coding-anthropic` |
+| template id | `kimi`（开放平台） / `kimi-coding`（编码端点） |
+| provider contract | `kimi-anthropic-relay`（两者共用） |
 | adapter / transport | `relay` / `anthropic_messages` |
 | 鉴权 | `bearer` |
 | 端点拼接 | `anthropic_v1`（base + `/v1/messages`） |
-| 默认 base_url | `https://api.kimi.com/coding`（可编辑） |
-| 模型发现 | `anthropic_models_or_manual`（`/v1/models` 实测可用） |
+| 默认 base_url | `https://api.moonshot.cn/anthropic` / `https://api.kimi.com/coding`（均可编辑） |
+| 模型发现 | `anthropic_models_or_manual` |
 | thinking policy | `upstream_default` |
-| 模型预设 id | `kimi-coding` |
+| 模型预设 id | `kimi` / `kimi-coding` |
 
-模型预设（来自实测 `/v1/models`）：
+编码端点的模型预设（来自实测 `/v1/models`）：
 
 | upstream_model | display_name | context | 角色绑定 |
 | --- | --- | --- | --- |
@@ -26,9 +31,28 @@
 | `k3` | K3 | 1M | fable |
 | `k3-256k` | K3-256k | 262k | — |
 
+## 开放平台曾经独有、现已移除的处理
+
+开放平台早期各自演化出一套只服务它的改动。用户判定这些属于过度补偿，本轮全部移除，
+两个渠道自此走同一条代码路径：
+
+| 移除项 | 原行为 | 现行为 |
+| --- | --- | --- |
+| `?beta=true` 查询参数 | 无条件追加到上游 URL | 不再追加 |
+| `anthropic-beta` 头 | 强制注入 `claude-code-20250219` | 只透传 Science 的入站值 |
+| User-Agent | 强制改写为 `claude-cli/…`，并丢弃非 `claude-cli/` 的入站 UA | 透传入站值 |
+| `x-app` 头 | 强制为 `cli` | 透传入站值 |
+| 失败历史尾巴清理 | 删除历史里的空 assistant 占位块 | 不再处理 |
+| thinking 强制 `enabled` | 任意取值改写为 `enabled` + budget | 交给上游默认（见下节 1） |
+| thinking 续写存储 | 落盘保存 / 恢复 thinking 块 | 已退役，仅 DeepSeek 保留 |
+
+前四项是 Claude Code 客户端身份伪装。**如需恢复，实现完整保留在 git 历史中**，
+不在代码里留注释掉的死代码。
+
 ## 上游缺陷与已实施的补偿
 
-四条都由真实 live 请求确认，并各自绑定 capability 规则与单测。
+四条都由 `api.kimi.com/coding` 的真实 live 请求确认，并各自绑定 capability 规则与单测。
+两个渠道共用这些补偿。
 
 ### 1. 非标准 `thinking: {"type":"auto"}` 导致静默不思考
 
@@ -36,7 +60,7 @@ Claude Science 发送非标准的 `auto`。`k3` 系列不认识该取值，返�
 而省略该字段时四个模型都正常思考。
 
 补偿：删除 `auto` / `adaptive`，交还上游默认。标准的 `enabled` / `disabled` 原样透传。
-规则 `provider.kimi-coding.thinking-upstream-default`。
+规则 `provider.kimi.thinking-upstream-default`。
 
 **不引入** thinking 续写机制：实测该端点接受 thinking 块被剥离的历史（含带 `tool_use` 的消息），
 DeepSeek 的链断裂 400 问题不适用于此渠道。
@@ -50,19 +74,19 @@ Science 的工作项分类器（`create_work_item`）正是这个形状，每建
 
 补偿：仅当 `tool_choice.type == "tool"` 时置 `thinking: {"type":"disabled"}`，保留强制工具本身
 （分类器依赖拿到结构化输出）。`any` 与 `auto` 上游无此问题，不做任何补偿。
-规则 `provider.kimi-coding.specified-tool-choice-disables-thinking`。
+规则 `provider.kimi.specified-tool-choice-disables-thinking`。
 
 ### 3. 声明 web_search 但未搜索时返回 429
 
 上游确实原生支持 `web_search_20250305`，但只要声明了该工具而模型本轮**没有实际发起搜索**，
 就返回 `429 rate_limit_error: "The engine is currently overloaded"`。
 已排除 max_tokens、轮次、system prompt、客户端工具、`max_uses`、`tool_choice`、提示复杂度等变量；
-DeepSeek 的 Anthropic 端点无此缺陷，属 Kimi 独有。
+DeepSeek 的 Anthropic 端点无此缺陷，属 Kimi 独有（编码端点实测）。
 
 Science 每轮都声明该工具（25 个工具里的第 1 个），因此真实会话**每一轮都失败**，
 Science 侧表现为把 429 当容量问题无限退避重试。
 
-补偿：**客户端工具桥接**（规则 `tool.kimi-coding.web_search.client-tool-bridge`，
+补偿：**客户端工具桥接**（规则 `tool.kimi.web_search.client-tool-bridge`，
 实现见 `desktop/gateway/src/kimi_coding_search.rs`）。
 
 ```
@@ -127,7 +151,7 @@ Science 声明 web_search_20250305(server)
 所以**该平台路径在本渠道不可用，CSSwitch 也无法让它可用** —— 文件根本送不到上游，谈不上渲染。
 
 补偿：把每个 `document` 块替换为一段署名的说明文本（注明 media type），让该轮得以继续而不是整轮失败，
-并指向真正可行的路径。规则 `provider.kimi-coding.document-block-placeholder`。
+并指向真正可行的路径。规则 `provider.kimi.document-block-placeholder`。
 
 **准确地说损失了什么**：丢失的是 Science 平台侧的 PDF→视觉通道。**读 PDF 本身仍然可行** ——
 Agent 可以自己把页面渲染成图像再作为 `image` 块传入，上游接受；真实会话中一份扫描版专利正是这样读到的。
@@ -150,6 +174,7 @@ Agent 可以自己把页面渲染成图像再作为 `image` 块传入，上游�
   不再依赖 base_url 正则兜底。
 - **兼容性提示** —— 模板 `compatibility_notice` 在新建与编辑表单的模型配置说明行后呈现，
   文案说明 429 缺陷**以及桥接已让联网搜索可用**，避免被误读成能力缺失。
+  两个 Kimi 模板共用同一份文案常量 `KIMI_COMPATIBILITY_NOTICE`。
 - **模型预设** —— 四个模型按 `catalog/model-presets.v1.json` 预填到默认 / 高质量 / 快速 / Fable 四槽。
   预览模式的通用规则会把最后一个模型当作 haiku，与真实预设不符，因此加了
   `MOCK_ROLE_BINDING_OVERRIDES` 使预览与真实目录一致。
