@@ -500,11 +500,11 @@ function modelIconMarkup(profile) {
   const meta = modelFamilyMeta(profile);
   return `<img class="model-family-icon profile-model-icon" src="${meta.src}" alt="" aria-hidden="true" title="${escapeHtml(meta.label)}" data-model-family="${meta.key}" />`;
 }
-const PAGE_META = {
-  switch: ["", "模型连接", ""],
-  skills: ["", "Skill & MCP", ""],
-  status: ["", "状态", ""],
-  settings: ["", "设置", ""],
+const PAGE_TITLES = {
+  switch: "模型连接",
+  skills: "Skill & MCP",
+  status: "状态",
+  settings: "设置",
 };
 
 const THEME_STORAGE_KEY = "csswitch-theme";
@@ -528,12 +528,13 @@ function applyTheme(theme, { persist = true } = {}) {
 
 function setPage(page) {
   if (page === "profiles") page = "switch";
-  const meta = PAGE_META[page] || PAGE_META.switch;
   document.querySelectorAll("[data-page]").forEach((node) => node.classList.toggle("active", node.dataset.page === page));
   document.querySelectorAll("[data-page-target]").forEach((node) => node.classList.toggle("active", node.dataset.pageTarget === page));
-  if (els.pageEyebrow) els.pageEyebrow.textContent = meta[0];
-  if (els.pageTitle) els.pageTitle.textContent = meta[1];
-  if (els.pageSubtitle) els.pageSubtitle.textContent = meta[2];
+  // 页面级操作挂在页头，随页面切换显隐；模式与表单视图的显隐仍由既有 class 规则接管。
+  document.querySelectorAll("[data-page-actions]").forEach((node) => {
+    node.hidden = node.dataset.pageActions !== page;
+  });
+  if (els.pageTitle) els.pageTitle.textContent = PAGE_TITLES[page] || PAGE_TITLES.switch;
   if (page === "skills") skillPage?.ensureLoaded();
 }
 
@@ -1606,6 +1607,19 @@ function profileModelControl(p) {
   </select>`;
 }
 
+// 一行只挂一个状态标。原先「当前选择」「上次应用」并排两个标签，既让配置名无处可放，
+// 也没说清两者的关系——它们其实是同一件事的两个阶段。
+function profileBadgeMarkup(p, active, codex, codexEnabled) {
+  if (codex && !codexEnabled) return '<span class="badge warn">入口已关闭</span>';
+  const applied = p.id === configState.applied_profile_id;
+  if (active) {
+    return applied
+      ? '<span class="badge on">当前 · 已应用</span>'
+      : '<span class="badge on">当前 · 待应用</span>';
+  }
+  return applied ? '<span class="badge">上次应用</span>' : "";
+}
+
 function renderList() {
   const list = els.profileList;
   const ps = configState.profiles || [];
@@ -1629,10 +1643,8 @@ function renderList() {
         '<div class="profile-identity">' +
           '<div class="prow-top">' +
             modelIconMarkup(p) +
-            '<span class="pname">' + escapeHtml(p.name) + "</span>" +
-            (active ? '<span class="badge on">当前选择</span>' : "") +
-            (p.id === configState.applied_profile_id ? '<span class="badge">上次应用</span>' : "") +
-            (codex && !codexEnabled ? '<span class="badge warn">入口已关闭</span>' : "") +
+            '<span class="pname" title="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + "</span>" +
+            profileBadgeMarkup(p, active, codex, codexEnabled) +
           "</div>" +
         "</div>" +
         '<div class="profile-model-cell">' + profileModelControl(p) + "</div>" +
@@ -2727,7 +2739,7 @@ function wire() {
     "connSec", "connTitle", "connBaseGroup", "connBase", "connBaseHint", "connFetchBtn",
     "connModelGroup", "connModelLabel", "connModelInfo", "connModel", "connModelDisplayName", "connModelHint", "connCodexCatalog", "connCodexCatalogMeta", "connCodexCatalogList", "connStaticCatalog", "connRoleQuality", "connRoleQualityDisplayName", "connRoleFast", "connRoleFastDisplayName", "connRoleFable", "connRoleFableDisplayName", "connCatalogWarning", "connKeyGroup", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
     "metaSec", "metaName", "metaNotes", "metaSaveBtn", "metaCancelBtn",
-    "themeBtn", "pageEyebrow", "pageTitle", "pageSubtitle",
+    "themeBtn", "pageTitle",
     "currentProfileIcon", "currentProfileName", "currentProfileState", "currentRouteMode", "currentProfileModel", "currentProfileMeta",
     "proxyStateText", "sandboxStateText", "upstreamStateText", "scienceRuntimeMeta",
   ].forEach((id) => (els[id] = $(id)));

@@ -21,6 +21,20 @@
   --shadow: 0 18px 50px rgba(73, 54, 41, 0.12);
   --shadow-soft: 0 8px 24px rgba(73, 54, 41, 0.08);
   --radius: 14px;
+
+  /* 排版刻度：同类元素只从这六档里取值，不再出现 0.5px 级的随手微调。 */
+  --fs-title: 20px;
+  --fs-section: 15px;
+  --fs-body: 12px;
+  --fs-meta: 11px;
+  --fs-micro: 10px;
+
+  /* 间距刻度：4 的倍数，替代原先 3/5/7/9/11/13/18/21/22 的散值。 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
 }
 
 :root[data-theme="dark"] {
@@ -62,8 +76,8 @@ button, input, select, textarea { font: inherit; }
 button, summary, [data-tauri-drag-region] { -webkit-user-select: none; user-select: none; }
 button { color: inherit; }
 h1, h2, h3, p { margin: 0; }
-h1 { font-size: 25px; line-height: 1.15; letter-spacing: -0.025em; }
-h2 { font-size: 17px; line-height: 1.25; letter-spacing: -0.015em; }
+h1 { font-size: var(--fs-title); line-height: 1.15; letter-spacing: -0.025em; }
+h2 { font-size: var(--fs-section); line-height: 1.25; letter-spacing: -0.015em; }
 p { color: var(--sub); line-height: 1.55; }
 code { padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px; background: var(--field); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 
@@ -108,28 +122,33 @@ code { padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px; back
 .sidebar-version { padding: 2px 5px 0; color: var(--muted); font-size: 9.5px; }
 
 .workspace { min-width: 0; min-height: 0; position: relative; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; background: var(--panel); }
+/* 页头只放标题与该页的主操作；原先预留的 eyebrow / 副标题两个槽位四页全空，白占竖向空间。 */
 .workspace-header {
-  min-height: 74px; display: flex; align-items: center; justify-content: space-between; gap: 18px;
-  padding: 15px 28px; border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4);
+  padding: var(--sp-2) var(--sp-5); border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
 }
-.workspace-header p { margin-top: 5px; font-size: 11.5px; }
-.eyebrow, .section-kicker { color: var(--accent2); font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
-.eyebrow { margin-bottom: 5px; }
-.eyebrow:empty, .workspace-header p:empty { display: none; }
+.page-actions { display: flex; align-items: center; gap: var(--sp-2); }
+.page-action-group { display: flex; align-items: center; gap: var(--sp-2); }
+.page-action-group[hidden] { display: none; }
+.section-kicker { color: var(--accent2); font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
 .workspace-scroll { min-height: 0; overflow: auto; padding: 18px 28px 28px; scrollbar-gutter: stable; }
 .app-page { display: none; min-width: 0; }
 .app-page.active { display: block; }
 
 .connection-page { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
 .connection-overview-grid { display: grid; grid-template-columns: minmax(210px, .72fr) minmax(0, 1.28fr); gap: 12px; align-items: start; }
-.connection-controls { min-width: 0; grid-column: 1 / -1; display: grid; grid-template-columns: minmax(210px, .72fr) minmax(0, 1.28fr); gap: 12px; align-items: stretch; }
-.connection-controls .surface { padding: 13px; }
-.connection-controls .mode-surface { display: flex; flex-direction: column; justify-content: center; }
-.connection-controls h2 { font-size: 13px; }
+/* 操作对象与运行状态合成一条工具条：两者都是一眼扫过的信息，不值得各占一张卡片。
+   运行状态的权威表达在「状态」页，这里只做轻量引用。 */
+.connection-controls { min-width: 0; grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-2) var(--sp-3); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.status-strip { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.status-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px var(--sp-2); border-radius: 8px; background: var(--field); color: var(--sub); font-size: var(--fs-micro); white-space: nowrap; }
+.status-chip strong { color: var(--ink); font-size: var(--fs-micro); font-weight: 650; }
+/* 刻意不设 display：它的显隐由 .official-only 控制，自带 display 的类会盖掉那条规则。 */
+.official-chip { padding: 5px var(--sp-2); border-radius: 8px; background: var(--field); color: var(--sub); font-size: var(--fs-micro); white-space: nowrap; }
 .surface { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: 0 1px 0 color-mix(in srgb, #fff 35%, transparent); }
 .surface-note { margin-top: 9px; font-size: 10.5px; }
-.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; margin-top: 10px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--field); }
-.seg-btn { height: 31px; border: 0; border-radius: 7px; background: transparent; color: var(--sub); cursor: pointer; font-size: 11.5px; font-weight: 650; }
+.seg { flex: none; display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--field); }
+.seg-btn { height: 29px; padding: 0 var(--sp-3); border: 0; border-radius: 7px; background: transparent; color: var(--sub); cursor: pointer; font-size: var(--fs-meta); font-weight: 650; }
 .seg-btn.active { color: var(--ink); background: var(--surface); box-shadow: 0 2px 7px rgba(45, 35, 29, .1); }
 .official-only { display: none; }
 .panel.mode-official .tp-only { display: none !important; }
@@ -139,10 +158,10 @@ code { padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px; back
 
 .current-card { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(330px, .9fr); align-items: center; gap: 22px; padding: 18px; border-color: color-mix(in srgb, var(--accent) 34%, var(--line)); background: linear-gradient(135deg, var(--surface), color-mix(in srgb, var(--accent-soft) 42%, var(--surface))); }
 .current-head, .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.current-head { align-items: center; justify-content: center; }
-.current-profile-identity { min-width: 0; max-width: 100%; display: flex; align-items: center; justify-content: center; gap: 12px; }
+.current-head { align-items: center; justify-content: flex-start; }
+.current-profile-identity { min-width: 0; max-width: 100%; display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3); }
 .current-profile-copy { min-width: 0; }
-.current-head h2 { overflow: hidden; font-size: 20px; text-overflow: ellipsis; white-space: nowrap; }
+.current-head h2 { overflow: hidden; font-size: var(--fs-title); text-overflow: ellipsis; white-space: nowrap; }
 .current-model { margin-top: 7px; color: var(--sub); font-size: 12px; font-weight: 650; }
 .model-family-icon { display: block; flex: none; box-sizing: border-box; object-fit: contain; border: 1px solid color-mix(in srgb, var(--line) 78%, #fff); background: #fff; }
 .current-model-icon { width: 38px; height: 38px; padding: 7px; border-radius: 11px; box-shadow: 0 3px 10px rgba(55, 40, 30, .08); }
@@ -167,17 +186,11 @@ code { padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px; back
 .btn.danger:hover, .abtn.danger:hover { border-color: var(--red); color: var(--red); background: var(--red-soft); }
 .btn.warning { border-color: var(--amber); color: var(--amber); background: var(--amber-soft); }
 .btn.full { width: 100%; margin-top: 12px; }
-.status-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin-top: 11px; }
-.status-row { display: flex; align-items: flex-start; flex-direction: column; justify-content: center; gap: 3px; min-height: 44px; padding: 7px 9px; border-radius: 8px; background: var(--field); color: var(--sub); font-size: 10.5px; }
-.status-row span { display: flex; align-items: center; gap: 7px; }
-.status-row strong { padding-left: 15px; color: var(--ink); font-size: 10px; white-space: nowrap; }
 .dot, .lt { width: 8px; height: 8px; flex: none; display: inline-block; border-radius: 50%; background: var(--muted); }
 .dot.green { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 18%, transparent); }
 .dot.amber, .lt.a { background: var(--amber); }
 .dot.red, .lt.r { background: var(--red); }
 .lt.g { background: var(--green); }
-.official-status { margin-top: 11px; }
-.official-status p { margin-top: 9px; font-size: 10.5px; }
 .quick-guide ol { margin: 11px 0 0; padding-left: 18px; color: var(--sub); font-size: 10.5px; line-height: 1.7; }
 
 .section-heading { margin-bottom: 14px; }
@@ -188,17 +201,22 @@ code { padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px; back
 .profile-heading { align-items: center; margin-bottom: 10px; }
 .profile-heading h2 { margin-top: 0; }
 .profile-list { display: flex; min-width: 0; flex-direction: column; gap: 7px; }
-.profile-list-head, .prow { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 180px 96px 152px; align-items: center; gap: 12px; }
-.profile-list-head { padding: 0 12px 1px; color: var(--sub); font-size: 9.5px; font-weight: 700; }
+/* 每一行都是独立的 grid，所以后三列必须是定值，否则各行列宽会各算各的、对不齐。
+   把定值收窄，把省下的宽度还给配置名这一列。 */
+.profile-list-head, .prow { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 156px 84px 152px; align-items: center; gap: var(--sp-3); }
+.profile-list-head { padding: 0 12px 1px; color: var(--sub); font-size: var(--fs-micro); font-weight: 700; }
 .profile-list-head span:last-child { text-align: right; }
 .prow { position: relative; padding: 10px 11px; border: 1px solid var(--line); border-radius: 11px; background: var(--field); }
 .prow.pactive { border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 54%, var(--surface)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent); }
 .prow.pworking { border-color: var(--amber); }
 .profile-identity, .profile-model-cell, .profile-key-cell { min-width: 0; }
-.prow-top { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px; }
+.prow-top { display: flex; align-items: center; flex-wrap: nowrap; gap: var(--sp-2); }
 .profile-model-icon { width: 25px; height: 25px; padding: 4px; border-radius: 8px; }
-.pname { min-width: 0; overflow: hidden; color: var(--ink); font-size: 12.5px; font-weight: 730; text-overflow: ellipsis; white-space: nowrap; }
-.badge { padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--sub); font-size: 9px; }
+/* 名称是这一行里唯一允许收缩的元素；图标与状态标各自保持完整宽度。 */
+/* 只收缩、不扩张：扩张会把状态标推到列的另一头，和名称断开关系。 */
+.pname { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--ink); font-size: var(--fs-body); font-weight: 730; text-overflow: ellipsis; white-space: nowrap; }
+/* white-space 缺失曾让中文标签被逐字拆成竖排；flex 缺省则让它被压到内容宽度以下。 */
+.badge { flex: none; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--sub); font-size: var(--fs-micro); white-space: nowrap; }
 .badge.on { border-color: var(--accent); color: #fffaf2; background: var(--accent); }
 .profile-model-select { width: 100%; height: 29px; padding: 0 24px 0 8px; border-radius: 8px; background: var(--surface); font-size: 10px; font-weight: 650; }
 .profile-model-text, .profile-key-cell strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 10.5px; white-space: nowrap; }
@@ -230,23 +248,28 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
 .empty-state { padding: 42px 20px; text-align: center; }
 .empty-state p { margin-top: 7px; }
 
-.status-page-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-.status-detail-card p { min-height: 50px; margin-top: 7px; font-size: 10.5px; }
-.status-detail-card h2 { margin-top: 5px; }
-.science-runtime-meta { margin-top: 8px; color: var(--muted); font-size: 9.5px; line-height: 1.45; }
-.large-state { display: flex; align-items: center; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--ink); font-size: 11px; font-weight: 700; }
-.diagnostics-card { margin-top: 12px; }
+/* 三项状态各占一行，灯与状态文字落在同一组 grid 列上，天生对齐。
+   原先靠给说明段落设 min-height 硬撑等高，只要有一张卡多一段文字就失效。 */
+.status-lines { display: grid; gap: var(--sp-1); margin: var(--sp-3) 0 0; padding: 0; list-style: none; }
+.status-line { display: grid; grid-template-columns: auto 88px 68px minmax(0, 1fr); align-items: center; gap: var(--sp-3); min-height: 38px; padding: 0 var(--sp-3); border-radius: 9px; background: var(--field); }
+.status-line-name { color: var(--ink); font-size: var(--fs-meta); font-weight: 700; }
+.status-line-state { color: var(--ink); font-size: var(--fs-meta); font-weight: 650; white-space: nowrap; }
+.status-line-note { min-width: 0; overflow: hidden; color: var(--muted); font-size: var(--fs-micro); text-overflow: ellipsis; white-space: nowrap; }
+.diagnostics-card { margin-top: var(--sp-3); }
 .diagnostic-actions { margin-top: 0; }
 .adv summary { list-style: none; display: flex; align-items: center; justify-content: space-between; cursor: pointer; }
 .adv summary::-webkit-details-marker { display: none; }
-.adv summary strong { display: block; margin-top: 5px; font-size: 17px; }
-.summary-hint { color: var(--muted); font-size: 9.5px; }
+.adv summary strong { display: block; font-size: var(--fs-section); }
+/* 安全边界说明必须留着，但默认收起：需要时展开，不需要时不占版面。 */
+.boundary-note { margin: var(--sp-2) 0 0 25px; }
+.boundary-note summary { color: var(--sub); cursor: pointer; font-size: var(--fs-micro); }
+.boundary-note p { margin-top: var(--sp-2); font-size: var(--fs-micro); }
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 220px)); gap: 12px; margin-top: 20px; }
 .permission-card { margin-top: 18px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--field); }
 .ssh-bridge-toggle { display: flex; align-items: center; gap: 9px; margin: 0; color: var(--ink); cursor: pointer; }
 .ssh-bridge-toggle input { width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--accent); }
 .ssh-bridge-toggle span { font-size: 11.5px; font-weight: 700; }
-.permission-card p { margin: 9px 0 0 25px; font-size: 9.5px; }
+.permission-card p { margin: var(--sp-2) 0 0 25px; font-size: var(--fs-micro); }
 .runtime-choice { border-color: var(--amber); background: var(--amber-soft); }
 .runtime-choice-title { color: var(--ink); font-weight: 750; }
 .runtime-choice-text { margin-top: 5px; color: var(--sub); font-size: 10px; line-height: 1.5; }
@@ -257,10 +280,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
 .msg.ok { color: var(--green); }
 
 /* Skill list */
-.extension-page-intro { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
-.extension-page-intro h2 { margin-top: 4px; }
-.extension-page-intro p { max-width: 560px; margin-top: 5px; font-size: 10px; }
-.extension-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .skill-page-root { min-width: 0; }
 .skill-loading { padding: 36px; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--sub); text-align: center; }
 .extension-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -274,7 +293,10 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
 .skill-summary-card > span:first-child { display: block; margin-bottom: 7px; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .04em; }
 .skill-summary-card strong { display: block; overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
 .skill-summary-card small { display: block; margin-top: 4px; color: var(--sub); font-size: 9px; }
-.skill-summary-card .skill-status + .skill-status { margin-top: 6px; }
+/* 这张卡里的两条状态原本靠 margin-top 分隔，但 .skill-status 是 inline-flex，
+   两条会挤成一行且没有间隔。改成各占一行，那条 margin 才生效。 */
+.skill-summary-card .skill-status { display: flex; }
+.skill-summary-card .skill-status + .skill-status { margin-top: var(--sp-1); }
 .skill-warning { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 9px 11px; border-left: 3px solid var(--amber); border-radius: 8px; background: var(--amber-soft); color: var(--sub); font-size: 9.5px; }
 .skill-warning strong { color: var(--ink); white-space: nowrap; }
 .skill-filter-surface { padding: 12px; margin-bottom: 12px; }
@@ -337,7 +359,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
   .workspace-header { padding-inline: 20px; }
   .workspace-scroll { padding: 14px 20px 24px; }
   .connection-overview-grid, .connection-controls { grid-template-columns: minmax(180px, .68fr) minmax(0, 1.32fr); }
-  .current-card { grid-template-columns: minmax(0, 1fr) minmax(290px, .92fr); gap: 18px; }
+  /* 两列在最小窗口下会把配置名压成两三个字，堆叠比硬挤更可读。 */
+  .current-card { grid-template-columns: 1fr; gap: var(--sp-4); }
   .connection-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .profile-list-head { display: none; }
   .prow { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "identity actions" "model key"; gap: 7px 12px; }
@@ -352,8 +375,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
   .skill-row .skill-cell:nth-child(3) { grid-area: package; }
   .skill-row .skill-cell:nth-child(4) { grid-area: attachment; }
   .skill-actions { grid-area: actions; align-self: center; }
-  .status-page-grid { grid-template-columns: 1fr; }
-  .status-detail-card p { min-height: 0; }
+  /* 窄屏下说明退居次要，先保证名称与状态读得出来。 */
+  .status-line { grid-template-columns: auto 88px minmax(0, 1fr); }
+  .status-line-note { display: none; }
   .skill-filter-row { grid-template-columns: minmax(140px, 1fr) minmax(118px, .55fr); }
 }
 
@@ -376,7 +400,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
   .connection-overview-grid { grid-template-columns: 1fr; }
   .connection-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .current-card { grid-template-columns: 1fr; gap: 14px; }
-  .status-list { grid-template-columns: 1fr; }
   .connection-actions { grid-template-columns: 1fr 1fr; }
   .connection-actions .hero { grid-column: 1 / -1; }
   .connection-actions #stopBtn { grid-column: auto; }
@@ -384,9 +407,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
   .prow-acts { justify-content: flex-start; }
   .skill-row { grid-template-columns: minmax(0, 1fr) 64px; grid-template-areas: "primary actions" "source actions" "package actions" "attachment actions"; }
   .form-grid, .settings-grid, .chips, .skill-filter-row, .skill-summary-grid { grid-template-columns: 1fr; }
-  .extension-page-intro { align-items: stretch; flex-direction: column; }
-  .extension-actions { display: grid; grid-template-columns: 1fr 1fr; }
-  .extension-page-intro .btn { width: 100%; }
+  .page-actions { flex-wrap: wrap; }
   .feedback { position: fixed; top: 62px; right: 12px; bottom: auto; width: calc(100% - 24px); }
 }
 .codex-experimental{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}

@@ -42,10 +42,15 @@
 
       <main class="workspace">
         <header class="workspace-header" data-tauri-drag-region>
-          <div>
-            <div class="eyebrow" id="pageEyebrow"></div>
-            <h1 id="pageTitle">模型连接</h1>
-            <p id="pageSubtitle"></p>
+          <h1 id="pageTitle">模型连接</h1>
+          <div class="page-actions">
+            <div class="page-action-group tp-only list-only" data-page-actions="switch" hidden>
+              <button class="btn primary" id="newBtn">新建配置</button>
+            </div>
+            <div class="page-action-group" data-page-actions="skills" hidden>
+              <button class="btn" id="refreshSkillsBtn" type="button">刷新</button>
+              <button class="btn primary" id="importSkillBtn" type="button" disabled>导入本地 Skill 包</button>
+            </div>
           </div>
         </header>
 
@@ -74,22 +79,16 @@
                 </section>
 
                 <aside class="connection-controls">
-                  <section class="surface mode-surface modeseg">
-                    <h2>操作对象</h2>
-                    <div class="seg" id="modeSeg">
-                      <button type="button" class="seg-btn active" data-mode="proxy">第三方模型</button>
-                      <button type="button" class="seg-btn" data-mode="official">官方 Claude</button>
-                    </div>
-                  </section>
-                  <section class="surface status-overview">
-                    <h2>运行状态</h2>
-                    <div class="status-list">
-                      <div class="status-row"><span><i id="ltProxy" class="lt a"></i>代理</span><strong id="proxyStateText">检查中</strong></div>
-                      <div class="status-row"><span><i id="ltSandbox" class="lt a"></i>Science</span><strong id="sandboxStateText">检查中</strong></div>
-                      <div class="status-row"><span><i id="ltUpstream" class="lt a"></i>上游</span><strong id="upstreamStateText">检查中</strong></div>
-                    </div>
-                    <div class="official-only official-status"><span class="state-pill neutral">由 Science 管理</span></div>
-                  </section>
+                  <div class="seg" id="modeSeg" role="group" aria-label="操作对象">
+                    <button type="button" class="seg-btn active" data-mode="proxy">第三方模型</button>
+                    <button type="button" class="seg-btn" data-mode="official">官方 Claude</button>
+                  </div>
+                  <div class="status-strip">
+                    <span class="status-chip" title="把 Claude Science 的请求路由到当前第三方模型"><i id="ltProxy" class="lt a"></i>代理<strong id="proxyStateText">检查中</strong></span>
+                    <span class="status-chip" title="运行在 CSSwitch 管理的独立 HOME 与数据目录中"><i id="ltSandbox" class="lt a"></i>Science<strong id="sandboxStateText">检查中</strong></span>
+                    <span class="status-chip" title="当前代理探测到的连接健康状态"><i id="ltUpstream" class="lt a"></i>上游<strong id="upstreamStateText">检查中</strong></span>
+                    <span class="official-only official-chip">由 Science 管理</span>
+                  </div>
                 </aside>
               </div>
 
@@ -115,7 +114,6 @@
               <section class="surface profiles-surface tp-only" id="listSec">
                 <div class="section-heading profile-heading">
                   <h2>配置方案</h2>
-                  <button class="btn primary" id="newBtn">新建配置</button>
                 </div>
                 <div id="profileList" class="profile-list"></div>
               </section>
@@ -175,56 +173,69 @@
           </section>
 
           <section class="app-page" data-page="skills" aria-label="Skill 与 MCP">
-            <section class="surface extension-page-intro" aria-labelledby="extensionPageTitle">
-              <div>
-                <div class="section-kicker">EXTENSIONS</div>
-                <h2 id="extensionPageTitle">Skill</h2>
-                <p>查看当前 Science 组织中已发现的 Skill，并在运行时可信时回读 OPERON 绑定状态。</p>
-              </div>
-              <div class="extension-actions">
-                <button class="btn" id="refreshSkillsBtn" type="button">刷新</button>
-                <button class="btn primary" id="importSkillBtn" type="button" disabled>导入本地 Skill 包</button>
-              </div>
-            </section>
             <div id="skillPageRoot" class="skill-page-root">
               <div class="skill-loading">正在载入 Skill 页面…</div>
             </div>
           </section>
 
           <section class="app-page" data-page="status" aria-label="状态">
-            <div class="status-page-grid">
-              <section class="surface status-detail-card"><div class="section-kicker">PROXY</div><h2>本地代理</h2><p>负责把 Claude Science 请求路由到当前第三方模型。</p><div class="large-state"><i class="lt a" data-mirror-light="ltProxy"></i><span data-mirror-text="proxyStateText">检查中</span></div></section>
-              <section class="surface status-detail-card"><div class="section-kicker">SANDBOX</div><h2>隔离 Science</h2><p>运行在 CSSwitch 管理的独立 HOME 与数据目录中。</p><div class="science-runtime-meta" id="scienceRuntimeMeta">更新由官方 Claude Science 管理；隔离实例不登录或检查更新。</div><div class="large-state"><i class="lt a" data-mirror-light="ltSandbox"></i><span data-mirror-text="sandboxStateText">检查中</span></div></section>
-              <section class="surface status-detail-card"><div class="section-kicker">UPSTREAM</div><h2>模型上游</h2><p>仅代表当前代理探测到的连接健康状态。</p><div class="large-state"><i class="lt a" data-mirror-light="ltUpstream"></i><span data-mirror-text="upstreamStateText">检查中</span></div></section>
-            </div>
+            <section class="surface status-board">
+              <h2>运行状态</h2>
+              <ul class="status-lines">
+                <li class="status-line">
+                  <i class="lt a" data-mirror-light="ltProxy"></i>
+                  <span class="status-line-name">本地代理</span>
+                  <strong class="status-line-state" data-mirror-text="proxyStateText">检查中</strong>
+                  <span class="status-line-note">把 Claude Science 的请求路由到当前第三方模型</span>
+                </li>
+                <li class="status-line">
+                  <i class="lt a" data-mirror-light="ltSandbox"></i>
+                  <span class="status-line-name">隔离 Science</span>
+                  <strong class="status-line-state" data-mirror-text="sandboxStateText">检查中</strong>
+                  <span class="status-line-note" id="scienceRuntimeMeta">更新由官方 Claude Science 管理；隔离实例不登录或检查更新。</span>
+                </li>
+                <li class="status-line">
+                  <i class="lt a" data-mirror-light="ltUpstream"></i>
+                  <span class="status-line-name">模型上游</span>
+                  <strong class="status-line-state" data-mirror-text="upstreamStateText">检查中</strong>
+                  <span class="status-line-note">当前代理探测到的连接健康状态</span>
+                </li>
+              </ul>
+            </section>
             <section class="surface diagnostics-card">
-              <div class="section-heading"><div><div class="section-kicker">DIAGNOSTICS</div><h2>诊断与支持</h2><p>这些动作沿用现有后端能力，不会改变 Skill 或 MCP 配置。</p></div></div>
+              <h2>诊断与支持</h2>
               <div class="diagnostic-actions"><button class="btn" id="doctorBtn">运行自检</button><button class="btn" id="logsBtn">打开日志</button><button class="btn" id="updateBtn">检查更新</button><button class="btn" id="reportBtn">反馈 / 报 bug</button></div>
             </section>
           </section>
 
           <section class="app-page" data-page="settings" aria-label="设置">
             <details class="surface adv tp-only" id="advSec" open>
-              <summary><span><span class="section-kicker">RUNTIME</span><strong>运行设置</strong></span><span class="summary-hint">修改后按现有规则保存</span></summary>
+              <summary><strong>运行设置</strong></summary>
               <div class="settings-grid">
                 <div class="field"><label for="proxyPort">代理端口</label><input id="proxyPort" inputmode="numeric" value="18991" /></div>
                 <div class="field"><label for="sandboxPort">沙箱端口</label><input id="sandboxPort" inputmode="numeric" value="8990" /></div>
               </div>
               <div class="permission-card">
                 <label class="ssh-bridge-toggle" for="reuseSystemSsh"><input id="reuseSystemSsh" type="checkbox" /><span>允许隔离 Science 使用系统 SSH 配置</span></label>
-                <p>启用后，Science 调用系统 OpenSSH 时会读取你的 <code>~/.ssh/config</code>。CSSwitch 不复制整个 <code>.ssh</code>，也不启动 sshd 或开放端口。</p>
-                <p>这相当于授权该隔离 Science 实例使用已有 SSH 身份；更改后需要重新“一键开始”。</p>
+                <details class="boundary-note">
+                  <summary>这项授权意味着什么</summary>
+                  <p>启用后，Science 调用系统 OpenSSH 时会读取你的 <code>~/.ssh/config</code>。CSSwitch 不复制整个 <code>.ssh</code>，也不启动 sshd 或开放端口。</p>
+                  <p>这相当于授权该隔离 Science 实例使用已有 SSH 身份；更改后需要重新“一键开始”。</p>
+                </details>
               </div>
             </details>
 
             <section class="surface settings-section tp-only codex-experimental" aria-labelledby="codexSettingsTitle">
               <div class="section-heading">
-                <div><div class="section-kicker">EXPERIMENTAL</div><h2 id="codexSettingsTitle">Codex 账号与连接</h2><p>登录身份、模型目录和网络路线只服务于 Codex 配置，不改变其他第三方模型。</p></div>
+                <h2 id="codexSettingsTitle">Codex 账号与连接</h2>
                 <span class="badge warn">实验 · 非官方</span>
               </div>
               <div class="permission-card codex-entry-card">
                 <label class="ssh-bridge-toggle" for="codexEnabled"><input id="codexEnabled" type="checkbox" /><span>启用 Codex 实验入口</span></label>
-                <p>CSSwitch 使用独立 OAuth 私有文件，不读取或修改 <code>~/.codex</code>、原生 Codex 登录或 macOS 钥匙串。关闭入口不会退出这里的 Codex 授权。</p>
+                <details class="boundary-note">
+                  <summary>凭据存放在哪里</summary>
+                  <p>CSSwitch 使用独立 OAuth 私有文件，不读取或修改 <code>~/.codex</code>、原生 Codex 登录或 macOS 钥匙串。关闭入口不会退出这里的 Codex 授权。登录身份、模型目录与网络路线只服务于 Codex 配置，不改变其他第三方模型。</p>
+                </details>
               </div>
               <div class="codex-settings-grid">
                 <section class="codex-auth-box" aria-labelledby="codexAccountTitle">
@@ -248,7 +259,7 @@
                     <div class="field"><label for="codexProxyUrl">代理 URL</label><input id="codexProxyUrl" type="password" autocomplete="off" spellcheck="false" placeholder="socks5h://127.0.0.1:7890" disabled /></div>
                   </div>
                   <div class="hint" id="codexNetworkResolved">当前路线：直接 socket，可能由系统 TUN 接管。</div>
-                  <div class="hint">自动模式读取 HTTPS_PROXY / ALL_PROXY 并应用 NO_PROXY；显式模式支持 HTTP、HTTPS、SOCKS5 和 SOCKS5h。</div>
+                  <div class="hint">自动模式读取 HTTPS_PROXY / ALL_PROXY 并应用 NO_PROXY；显式模式支持 HTTP、HTTPS、SOCKS5、SOCKS5h。</div>
                   <div class="action-row codex-auth-actions"><button class="btn" id="codexNetworkSaveBtn">保存网络路线</button></div>
                 </section>
               </div>
