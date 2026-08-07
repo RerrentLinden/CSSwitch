@@ -10,13 +10,15 @@ bash test/run_all.sh
 
 | 层 | 入口 | 覆盖范围 |
 |---|---|---|
-| `offline` | `test/run-offline.sh` | Python 纯单元：capability、catalog、process ownership；不使用网络 |
-| `loopback` | `test/run-loopback.sh` | 从当前源码构建 Rust gateway，运行 127.0.0.1 mock / provider / installed matrix 合同 |
-| `scripts` | `test/run-scripts.sh` | shell、doctor 与 verify-proxy 运维合同 |
-| `rust` | `test/run-rust.sh` | desktop backend 与 gateway 的 fmt、clippy、tests |
+| `offline` | `test/run-offline.sh` | Python 纯单元：capability、catalog、process ownership、codex browser auth、build sidecar identity、profile pin、skill runtime boundary；不使用网络 |
+| `loopback` | `test/run-loopback.sh` | 从当前源码构建 Rust gateway，运行 127.0.0.1 mock / provider / installed matrix / external skill bridge 合同 |
+| `scripts` | `test/run-scripts.sh` | shell、doctor 与 verify-proxy 运维合同，以及 run_all 聚合契约（沙盒桩层） |
+| `rust` | `test/run-rust.sh` | 全部四个 Cargo 工程（src-tauri、gateway、codex-network、skill-package）的 fmt、clippy、tests；skill-package 单线程执行 |
 | `frontend` | `test/run-frontend.sh` | `desktop/src/main.js` 的 Node 语法检查 |
 
-每层必须输出一个 `S0_LAYER <layer> <status>`。缺标记行按失败处理；loopback 层的有界重试不会把最终失败吞掉。
+每层必须输出一个 `S0_LAYER <layer> <status>`，状态后可跟注记（如 rust 层的 `ignored=N`）。缺标记行按失败处理；loopback 层的有界重试不会把最终失败吞掉。
+
+rust 层会累计并展示 cargo test 报告的 ignored 测试数（2026-08 基线：src-tauri 29 + skill-package 4，共 33）。这些全部是带显式理由标签的 Acceptance-boundary / 真机 E2E 测试（需真实 Science 二进制、真实凭证或 DMG 级 artifact，属[真机验收](real-machine-acceptance.md)范围），`#[ignore]` 理由随 cargo test 输出逐条可见。ignored 数偏离基线时需人工审读新增项的理由标签。
 
 ## 两种总判定
 

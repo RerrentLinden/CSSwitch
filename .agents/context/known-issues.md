@@ -47,7 +47,5 @@
 ## 测试
 
 - 真机验收矩阵描述应执行的场景，不表示最终 v0.8.2 DMG 已逐项全部执行。每次验收必须绑定 exact artifact，并把通过、失败、环境阻塞与未执行分开记录。
-- source gate（`test/run_all.sh`）要求 `git status --porcelain --untracked-files=all` 完全为空，未提交或未跟踪文件都会让它在 preflight 以 `worktree is not clean` 退出（对外表现为静默 exit 12）。这是刻意设计——证据要绑定到确切的干净 commit——不是缺陷；开发中途跑不通属预期，提交后即可执行。其唯一第三方依赖 `jsonschema` 在门禁实际使用的 `/usr/bin/python3` 中已具备。
-- `desktop/gateway/src/reasoning_state.rs` 有 4 处既有 clippy 错误（`needless_return` ×3、`manual_c_str_literals` ×1），会让 `test/run-rust.sh` 的 `-D warnings` 判红。
-- `test/run-rust.sh` 只在 PATH 与 `~/.cargo/bin` 找 cargo，rustup 工具链不在这两处时会**静默输出 env-blocked 并以 0 退出**，导致该层看似通过实则未执行。
-- `test/quality/fixtures/source_gate/expected_test_ids.v1.json` 的 RUST-GATEWAY 套件存在既有漂移：11 个已存在的测试未注册、5 个已注册项在代码中不存在。因门禁跑不起来而长期未被发现。
+- 门禁总入口 `test/run_all.sh` 为五层聚合器（见 [testing.md](../../docs/operations/testing.md)），无第三方 Python 依赖、不要求 worktree 干净；`env-blocked` 计入 `current-env clean` 但阻断 `release-ready green`，报告时不得把两者混写。
+- rust 层的 ignored 测试基线为 33（全部带显式理由的 Acceptance-boundary / 真机 E2E），偏离基线需人工审读，见 testing.md。
