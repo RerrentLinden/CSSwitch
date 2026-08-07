@@ -163,7 +163,13 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             self.assertEqual(phases.count("formal"), 1, case.case_id)
             self.assertEqual(phases.count("reuse"), 2, case.case_id)
             self.assertEqual(phases.count("restart"), 1, case.case_id)
-            self.assertEqual(phases.count("discovery"), 0 if case.base_kind == "native" else 1)
+            # discovery 步只在 case 声明了 models 端点时存在；native（真实官方端点）
+            # 与无模型发现端点的 anthropic 通路（如 eeb4ae3 后的 deepseek）都没有。
+            self.assertEqual(
+                phases.count("discovery"),
+                1 if case.models_path else 0,
+                case.case_id,
+            )
             self.assertTrue(all("8765" not in step.path for step in scenario.steps))
         silicon = build_case_scenario(CASE_DEFINITIONS["siliconflow"])
         self.assertEqual(silicon.steps[0].path, "http://api.siliconflow.cn/v1/models")
@@ -354,7 +360,9 @@ class InstalledProviderMatrixTests(unittest.TestCase):
         inspector = FakeInspector()
         inspector.accept_all_listeners = True
         inspector.executables[os.getpid()] = Path(sys.executable)
-        with self._session("deepseek-off", inspector) as session:
+        # qwen-chat 是仍为 native 的 case；deepseek 自 eeb4ae3 起走自定义端点，
+        # 不再具备"native discovery 不打 mock"的语义。
+        with self._session("qwen-chat", inspector) as session:
             ready = session.start_mock()
             self.assertNotIn(ready["port"], {8765, session.proxy_port, session.sandbox_port})
             self.assertTrue(ready["listener_verified"])

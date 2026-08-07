@@ -9,4 +9,6 @@ echo "== ops (doctor 契约 + verify-proxy 自门) =="
 bash test/test_ops_scripts.sh || fail=1
 echo "== real-machine guard（纯隔离 fixture，不启动 OAuth / Science） =="
 bash test/test_real_machine_guard.sh || fail=1
+echo "== run_all 聚合契约（沙盒桩层，不递归实跑） =="
+bash test/test_run_all_aggregator.sh || fail=1
 if [ "$fail" -eq 0 ]; then echo "S0_LAYER scripts pass"; exit 0; else echo "S0_LAYER scripts fail"; exit 1; fi

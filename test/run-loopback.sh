@@ -15,10 +15,8 @@ fi
 # The normal gate must exercise a binary built from the current gateway source.
 # The injected command exists only for the runner's deterministic retry tests.
 if [ -z "${CSSWITCH_LOOPBACK_TEST_CMD:-}" ]; then
-  if ! command -v cargo >/dev/null 2>&1; then
-    [ -x "$HOME/.cargo/bin/cargo" ] && export PATH="$HOME/.cargo/bin:$PATH"
-  fi
-  if ! command -v cargo >/dev/null 2>&1; then
+  . "$ROOT/test/_cargo_path.sh"
+  if ! ensure_rust_toolchain_on_path; then
     echo "S0_LAYER loopback env-blocked (no cargo for current Rust gateway build)"; exit 0
   fi
   if ! cargo build --manifest-path desktop/gateway/Cargo.toml; then
@@ -35,7 +33,9 @@ run_loopback_once() {
   if [ -n "${CSSWITCH_LOOPBACK_TEST_CMD:-}" ]; then
     eval "$CSSWITCH_LOOPBACK_TEST_CMD"
   else
-    python3 -m unittest test.test_gateway_rust test.test_provider_mock_scenarios test.test_installed_provider_matrix -v
+    # test_external_skill_install_bridge 为原孤儿测试（v083 审计），需当前源码构建的
+    # gateway 二进制（上方已导出 CSSWITCH_GATEWAY_BIN）+ loopback，故归本层调度。
+    python3 -m unittest test.test_gateway_rust test.test_provider_mock_scenarios test.test_installed_provider_matrix test.test_external_skill_install_bridge -v
   fi
 }
 

@@ -1,13 +1,43 @@
-#!/bin/bash
-# Compatibility name only: authority remains the fixed source-gate CLI.
+#!/usr/bin/env bash
+# S0 分层验收门汇总器（保留老入口名，只汇总不承载测试细节）。
+# 用法：run_all.sh [--require-release-ready]
+#   两种总判定：
+#     current-env clean = 本环境无 fail（可有 env-blocked / needs-real-machine）
+#     release-ready green = 5 层均 pass 且无 env-blocked
 set -u
-if [ "$#" -ne 2 ] || [ "$1" != "--output-root" ]; then
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+REQUIRE_RELEASE=0
+if [ "${1:-}" = "--require-release-ready" ]; then
+  REQUIRE_RELEASE=1
+elif [ "$#" -gt 0 ]; then
+  echo "用法: run_all.sh [--require-release-ready]" >&2
   exit 64
 fi
-case "$2" in
-  --require-release-ready) exit 64 ;;
-esac
-ROOT="$(cd "$(dirname "$0")/.." && pwd)" || exit 12
-cd "$ROOT" || exit 12
-exec /usr/bin/python3 -I test/quality/source_gate/cli.py run \
-  --output-root "$2"
+LAYERS="offline loopback scripts rust frontend"
+# 注：本机 /bin/bash 是 3.2（macOS 系统自带，不支持 declare -A），
+# 用「STATUS_<layer>」这组固定命名的普通变量代替关联数组，行为等价。
+any_fail=0; not_release=0
+echo "== S0 分层验收门 =="
+for L in $LAYERS; do
+  line="$(bash "test/run-$L.sh" 2>&1 | tee /dev/stderr | grep -E '^S0_LAYER ' | tail -1)"
+  st="$(echo "$line" | awk '{print $3}')"
+  if [ -z "$st" ]; then st="fail"; line="S0_LAYER $L fail (缺少标记行)"; fi   # 无标记行 = 当 fail 处理（不静默）
+  eval "STATUS_$L=\"\$st\""
+  eval "DETAIL_$L=\"\$(echo \"\$line\" | cut -d' ' -f3-)\""
+  case "$st" in
+    fail) any_fail=1; not_release=1 ;;
+    pass) : ;;
+    *) not_release=1 ;;   # env-blocked / skipped / needs-real-machine 都不满足 release-ready
+  esac
+done
+echo "---- 汇总 ----"
+for L in $LAYERS; do
+  eval "detail=\"\$DETAIL_$L\""
+  printf '  %-9s %s\n' "$L" "$detail"
+done
+echo "----"
+if [ "$any_fail" -eq 0 ]; then echo "current-env clean: YES（本环境无 fail）"; else echo "current-env clean: NO（有 fail）"; fi
+if [ "$not_release" -eq 0 ]; then echo "release-ready green: YES（5 层均 pass、无 env-blocked）"; else echo "release-ready green: NO（有 env-blocked / fail，须在具备全部能力的机器复跑）"; fi
+if [ "$any_fail" -ne 0 ]; then exit 1; fi
+if [ "$REQUIRE_RELEASE" -eq 1 ] && [ "$not_release" -ne 0 ]; then exit 2; fi
+exit 0

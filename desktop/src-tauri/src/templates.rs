@@ -539,12 +539,10 @@ mod tests {
         }
         // Qwen native adapter 的上游 URL 仍由 gateway 管理，运行时不吃自定义
         // base_url，故保持只读，避免「能填但不生效」的假象。
-        for id in ["qwen"] {
-            assert!(
-                !by_id(id).unwrap().base_url_editable,
-                "{id} 是原生 adapter，base_url 应只读"
-            );
-        }
+        assert!(
+            !by_id("qwen").unwrap().base_url_editable,
+            "qwen 是原生 adapter，base_url 应只读"
+        );
     }
 
     fn slot(base_url: &str) -> ProviderCfgV1 {

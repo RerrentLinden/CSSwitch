@@ -114,6 +114,7 @@ PY
 )"
 DEEPSEEK_API_KEY=fake CSSWITCH_AUTH_TOKEN="$SEC" CSSWITCH_LAUNCH_ID=ops-test \
   CSSWITCH_TOOLUSE_SHIM=off CSSWITCH_UPSTREAM_URL="http://127.0.0.1:1/never" \
+  CSSWITCH_RELAY_BASE_URL="http://127.0.0.1:1/never" \
   CSSWITCH_STATIC_MODEL_CATALOG_V1="$STATIC_CATALOG" \
   "$GATEWAY" --provider deepseek --port "$P" \
   >/dev/null 2>&1 &

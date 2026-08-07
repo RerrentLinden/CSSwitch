@@ -83,6 +83,9 @@ class ExternalSkillInstallBridge(unittest.TestCase):
             env.update(
                 {
                     "DEEPSEEK_API_KEY": "test-only-key",
+                    # deepseek 自 eeb4ae3 起要求显式端点；本测试只走 skill-bridge
+                    # 文件协议，不发 provider 流量，指向 discard 端口即可。
+                    "CSSWITCH_RELAY_BASE_URL": "http://127.0.0.1:9",
                     "CSSWITCH_GATEWAY_INTENT": "scratch-models",
                     "CSSWITCH_SKILL_DATA_DIR": str(data_dir),
                     "CSSWITCH_SKILL_BRIDGE_DIR": str(bridge_dir),

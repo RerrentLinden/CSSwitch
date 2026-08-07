@@ -1071,7 +1071,7 @@ fn open_private_file_handle(
             return Err("thinking continuity store entry cannot be opened".into());
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        return Ok(Some(file));
+        Ok(Some(file))
     }
 
     #[cfg(not(unix))]
@@ -1188,7 +1188,7 @@ fn unlink_private_file(directory: &File, _root: &Path, name: &str) -> std::io::R
         if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -1204,8 +1204,7 @@ fn sync_directory(directory: &File) -> Result<(), String> {
 fn list_directory_names(directory: &File, _root: &Path) -> Result<Vec<String>, String> {
     #[cfg(unix)]
     {
-        let dot =
-            CStr::from_bytes_with_nul(b".\0").expect("static directory name is NUL terminated");
+        let dot = c".";
         let fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -1244,7 +1243,7 @@ fn list_directory_names(directory: &File, _root: &Path) -> Result<Vec<String>, S
         if unsafe { libc::closedir(stream) } != 0 {
             return Err("thinking continuity store cannot be listed".into());
         }
-        return result;
+        result
     }
 
     #[cfg(not(unix))]
