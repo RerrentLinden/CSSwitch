@@ -133,44 +133,21 @@ Science 的工作项分类器正是这个形状,每建一个工作项触发一�
 | 不带 / `auto` / `any` | 200,`[thinking, tool_use]` |
 | `{"type":"tool"}` | **400** |
 
-### 3. web_search 的两条缺陷与客户端工具桥
+### 3. web_search 的客户端工具桥(不可退役)
 
-历史成因是 429:只要**声明了却没实际搜索**就返回 429(引擎过载),
-而 Science 每轮都声明它。2026-08-19 复测 32 次**未再复现**该 429。
+最初的成因是 429:只要**声明了却没实际搜索**就返回 429,而 Science 每轮都声明它。
+2026-08-19 复测 32 次未再复现该 429,于是尝试退役这条桥——**失败并已回滚**。
 
-但原生透传仍然会坏,原因是第二条缺陷:**Kimi 自己生成了一对配不上的 id**。
-它发出的 `server_tool_use.id`(`tool_…`)与 `web_search_tool_result.tool_use_id`
-(`srvtoolu_…`)完全不同,把它自己的输出原样回传,它自己回
-`400 tool_call_id  is not found`。一次搜索让此后每一轮都失败。
+真正被它挡住的不是 429,是**上游那条原生搜索通道本身是坏的**:向 Kimi 声明服务端
+web_search 之后,它会往助手内容里注入空的 `Search results for query:` 文本头,
+返回与查询无关的内容,模型因此判定"web_search 工具在当前会话中不可用",
+转去写 Python 调学术 API,整轮任务被带偏。全程零报错,功能却完全不工作。
 
-把两个 id 对齐(任一方向)即可通过——这是一条约二十行的窄规则,理论上能取代
-920 行的桥接。但 429 是负载相关的,一次复测不足以证明它永久消失,
-所以桥接暂时保持默认。
+桥接绕开该通道:它不向 Kimi 声明服务端工具,而是自己发起补发请求拿真结果。
 
-解法是把服务端工具换成同名的客户端工具——客户端工具从不触发 429:
-
-```mermaid
-sequenceDiagram
-    participant S as Science
-    participant G as 网关
-    participant K as Kimi
-    S->>G: tools 含 web_search 服务端工具
-    G->>K: 换成客户端工具 web_search{query}
-    alt 模型没调用(绝大多数轮次)
-        K-->>G: 普通回答
-        G-->>S: 原样透传,零额外开销
-    else 模型发出 tool_use{web_search}
-        K-->>G: tool_use{query}
-        Note over G: 截获,不转发给 Science
-        G->>K: 补发调用,带真 server 工具
-        K-->>G: server_tool_use + web_search_tool_result
-        G-->>S: 拼进同一条消息,按原生 web_search 渲染
-    end
-```
-
-三条硬约束:客户端 `tool_use` **绝不能泄漏**给 Science(它没有本地执行器,泄漏会
-让该轮永久挂起);content block index 必须连续无空洞;补发失败要发终止 SSE error,
-不伪造助手内容。
+> **退役判据的教训**:验一条补偿能否删掉,要验**功能是否正常**,不能只验**是否报错**。
+> 那次尝试 16 次调用全绿,搜索却是废的。细节见
+> [Kimi 渠道 §3b](features/kimi-channels.md)。
 
 ### 4. `document` 块不被接受
 
