@@ -47,8 +47,11 @@ fn append_rule(rule_ids: &mut Vec<String>, rule: &str) {
 /// 请求体上的全部 DeepSeek 补偿,按依赖顺序执行。
 pub fn normalize_request(body: &mut Value, target_model: &str, rule_ids: &mut Vec<String>) {
     clamp_body_max_tokens(body, target_model);
-    normalize_thinking_auto(body, rule_ids);
-    disable_thinking_for_tool_choice(body, rule_ids);
+    // 指定工具型 tool_choice 会把 thinking 直接压成 disabled,thinking 原本的取值
+    // 就此失去意义;先判它,免得日志里记一条净效果为零的 auto→adaptive。
+    if !disable_thinking_for_tool_choice(body, rule_ids) {
+        normalize_thinking_auto(body, rule_ids);
+    }
     strip_effort_when_thinking_disabled(body, rule_ids);
     replay_tool_thinking_history(body, rule_ids);
     repair_malformed_server_tool_blocks(body, rule_ids);
@@ -88,12 +91,13 @@ fn normalize_thinking_auto(body: &mut Value, rule_ids: &mut Vec<String>) {
 /// 2026-08-19 实测边界:`auto`、`any`、`none` 以及不带该字段的请求在
 /// thinking enabled / adaptive 下都返回 200 且照常输出 thinking 块,
 /// 因此**只对 `tool` 这一种形态补偿**——对 auto/any 也关思考是白白牺牲推理质量。
-fn disable_thinking_for_tool_choice(body: &mut Value, rule_ids: &mut Vec<String>) {
+/// 返回是否已把 thinking 压成 disabled(调用方据此跳过 thinking 取值的归一化)。
+fn disable_thinking_for_tool_choice(body: &mut Value, rule_ids: &mut Vec<String>) -> bool {
     if !has_thinking_incompatible_tool_choice(body) {
-        return;
+        return false;
     }
     let Some(obj) = body.as_object_mut() else {
-        return;
+        return false;
     };
     let already_disabled = obj.get("thinking") == Some(&json!({"type": "disabled"}));
     obj.insert("thinking".to_string(), json!({"type": "disabled"}));
@@ -101,6 +105,7 @@ fn disable_thinking_for_tool_choice(body: &mut Value, rule_ids: &mut Vec<String>
     if !already_disabled || removed_effort {
         append_rule(rule_ids, RULE_TOOL_CHOICE_DISABLES_THINKING);
     }
+    true
 }
 
 fn has_thinking_incompatible_tool_choice(body: &Value) -> bool {
@@ -496,6 +501,26 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("output_config").is_none());
         assert!(rules.contains(&RULE_TOOL_CHOICE_DISABLES_THINKING.to_string()));
+    }
+
+    #[test]
+    fn specified_tool_choice_supersedes_the_auto_rewrite() {
+        // auto + 指定工具:最终必须是 disabled(上游在 adaptive 下同样拒收指定工具),
+        // 且不该记录那条被立刻覆盖、净效果为零的 auto→adaptive。
+        let (body, rules) = normalize(
+            json!({
+                "thinking": {"type": "auto"},
+                "tool_choice": {"type": "tool", "name": "classify"},
+                "messages": []
+            }),
+            "deepseek-v4-pro",
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(rules.contains(&RULE_TOOL_CHOICE_DISABLES_THINKING.to_string()));
+        assert!(
+            !rules.contains(&RULE_THINKING_AUTO_ADAPTIVE.to_string()),
+            "被覆盖的改写不该出现在规则日志里"
+        );
     }
 
     #[test]

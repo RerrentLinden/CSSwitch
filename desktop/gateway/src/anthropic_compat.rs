@@ -738,6 +738,18 @@ fn is_specified_tool_choice(body: &Value) -> bool {
 /// history with stripped thinking blocks is accepted here even alongside
 /// `tool_use`.
 fn normalize_upstream_default_thinking(body: &mut Value, rule_ids: &mut Vec<String>) {
+    if is_specified_tool_choice(body) {
+        // Keep the forced tool — Science's internal classifier calls depend on
+        // it — and give up thinking for that one request instead. This decides
+        // the thinking field outright, so the auto/adaptive handling below
+        // would have no net effect and is skipped rather than logged.
+        body["thinking"] = json!({"type": "disabled"});
+        append_rule_id(
+            rule_ids,
+            RULE_PROVIDER_KIMI_SPECIFIED_TOOL_CHOICE_DISABLES_THINKING,
+        );
+        return;
+    }
     let declared = body
         .get("thinking")
         .and_then(Value::as_object)
@@ -748,15 +760,6 @@ fn normalize_upstream_default_thinking(body: &mut Value, rule_ids: &mut Vec<Stri
             object.remove("thinking");
         }
         append_rule_id(rule_ids, RULE_PROVIDER_KIMI_THINKING_UPSTREAM_DEFAULT);
-    }
-    if is_specified_tool_choice(body) {
-        // Keep the forced tool — Science's internal classifier calls depend on
-        // it — and give up thinking for that one request instead.
-        body["thinking"] = json!({"type": "disabled"});
-        append_rule_id(
-            rule_ids,
-            RULE_PROVIDER_KIMI_SPECIFIED_TOOL_CHOICE_DISABLES_THINKING,
-        );
     }
 }
 

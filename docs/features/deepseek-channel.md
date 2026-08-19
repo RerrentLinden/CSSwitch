@@ -80,6 +80,11 @@ DSML shim。现在全部退役:上游要的只是"历史里有 thinking 块",占
 
 只有上游会拒收的组合才被改写;能过的原样送。
 
+两条规则**同时命中**时(`auto` + 指定工具),tool_choice 优先:thinking 直接压成
+`disabled`,thinking 原本的取值失去意义,`auto→adaptive` 不再执行也不记入规则日志——
+否则日志会显示一条净效果为零的改写,误导排查。DeepSeek 在 `adaptive` 下同样拒收
+指定工具,所以这里必须是 `disabled` 而不是 `adaptive`。
+
 tool_choice 的边界是实测出来的(2026-08-19,thinking enabled 与 adaptive 各测一轮):
 
 | tool_choice | 上游响应 |
