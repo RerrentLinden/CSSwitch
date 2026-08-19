@@ -95,7 +95,7 @@ render_block(index: u64, block: &Value) -> Vec<u8>
 
 ### 6. 必需测试
 
-- 用"模拟规范客户端"的还原函数做往返断言：从 start 取壳并清空流式字段，仅靠 delta 累积，断言还原结果与原块**完全相等**。参见 `kimi_coding_search::tests::spliced_blocks_survive_a_spec_compliant_client_round_trip`。
+- 用"模拟规范客户端"的还原函数做往返断言：从 start 取壳并清空流式字段，仅靠 delta 累积，断言还原结果与原块**完全相等**。
 - 断言注入块在 `message_delta` 之前、`message_stop` 之后不出现，且索引连续。
 - 断言上游调用失败时产出终止 error 而非内容。
 
@@ -403,6 +403,146 @@ match body.get("tool_choice") {
 // 判据 == 实测出的拒收边界
 body.get("tool_choice").and_then(Value::as_object)
     .and_then(|c| c.get("type")).and_then(Value::as_str) == Some("tool")
+```
+
+---
+
+## 场景：重排 Science 尾随机器上下文以保住 Kimi 搜索意图
+
+### 1. 范围 / 触发条件
+
+真实 Science 在用户问题后追加独立 `role=user` 的 compute snapshot；Kimi 原生
+web_search 会把最后一条 user 当查询主题时适用。direct A/B 必须只交换两条消息顺序，
+以排除响应过滤器、system 内容与工具声明等变量。
+
+### 2. 签名
+
+```text
+reorder_science_context_before_user_intent(&mut Value, &mut Vec<String>)
+RULE_PROVIDER_KIMI_SCIENCE_CONTEXT_TAIL_REORDER =
+  "provider.kimi.science-context-tail-reorder"
+```
+
+### 3. 合同
+
+- 仅 Kimi + typed `web_search_*` 生效；同名 client tool、DeepSeek 与 Generic 零改写。
+- 只看末尾相邻两条 user message，且两条都必须是 string 或全 text blocks。前一条含
+  `tool_result` 等非 text 块时不得交换，避免拆断 assistant/tool_result 历史配对。
+- 末条大小写无关包含 `compute snapshot`，并同时含独立词 `cores` 与独立词 `RAM`，
+  或含带数字容量的 `GiB`（`32GiB` / `32 GiB`）。裸 `GiB` 与 `hardcores` 不命中。
+- 交换完整 `Value`，不得删除、重建或改写正文，更不得在响应后伪造 query。
+- 只有实际交换才记录规则 ID；所有边界外形态 `rule_ids` 不得出现该规则。
+
+### 4. 校验与错误矩阵
+
+| 条件 | 行为 |
+| --- | --- |
+| typed search + text intent + 精确 compute tail | 交换末两条，记录规则 |
+| 单条 compute 问题 / 普通双 user | 原样 |
+| `program` / `hardcores` / 裸 `GiB` | 原样 |
+| 前条或末条含非 text block | 原样 |
+| client tool / 兄弟 provider | 原样 |
+
+### 5. 正常 / 基线 / 错误案例
+
+- 正常：`[Rust 问题, compute snapshot]` → `[compute snapshot, Rust 问题]`，两条内容逐值相等；
+  真机首张卡片直接搜索 Rust。
+- 基线：普通连续 user message 保持顺序，规则不记入日志。
+- 错误：只因出现硬件词就全局移动上下文，或把 compute context 插进
+  `assistant tool_use → user tool_result` 中间。
+
+### 6. 必需测试
+
+- 用真实 Science 脱敏形状断言顺序、正文与规则 ID。
+- 反向覆盖：单消息、普通双 user、大小写与单词边界、裸/带数字 GiB、非 text、
+  历史工具结果、client tool、DeepSeek、Generic。
+- 真机全新会话至少覆盖两次不同主题搜索、历史复述、不联网轮与整页重载；同时确认
+  query 语义正确、`search-pair-id-adopt adopted=1`，且无 repair / 400 / upstream failure。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+响应卡片主题错 → 把 query 文本改成用户问题 → 结果仍来自错误搜索，只是 UI 看似正确
+```
+
+#### Correct
+
+```text
+direct A/B 证明尾部消息顺序敏感 → 仅在精确 Science 签名下交换完整消息 → 上游首次生成正确 query
+```
+
+---
+
+## 场景：归一 Kimi 原生 web_search 响应配对
+
+### 1. 范围 / 触发条件
+
+Kimi 响应出现相邻的 `server_tool_use` + `web_search_tool_result` 时适用。Science
+按两块的配对键决定是否保留搜索卡片；键不一致会让搜索框和查询词在流结束后消失，
+并使后续请求依赖历史配对修复。
+
+### 2. 签名
+
+```text
+SearchNoiseFilter::feed(&[u8]) -> Result<Vec<u8>, String>  # 流式
+strip_nonstream_noise(&mut Value) -> StripStats            # 非流式
+StripStats::{any_activity, rewrote_body}
+RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT =
+  "provider.kimi.search-pair-id-adopt"
+```
+
+### 3. 合同
+
+- `result.tool_use_id=K` 存在且与 `use.id` 不同时，只把 `use.id` 改为上游已有的 `K`；
+  不改 `input.query`、结果内容或块索引。
+- 只有 `use.id` 存在时，反向补到 `result.tool_use_id`。
+- 两半都无键且结果为空才是幻影对，整对剥离；带键的空结果是合法零结果搜索，必须保留。
+- 两半都无键但结果非空时不得发明键：原样放行并计 `unkeyed_pairs`。
+- `adopted_pairs > 0` 时非流式 body 必须重序列化；`unkeyed_pairs` 单独出现时是零改写，
+  `rules=-`，但日志仍记 `unkeyed=N`。
+- 真机验收既要确认卡片在整页重载后仍在，也要人工确认查询与结果语义相关；
+  “无 400 / 有 Web Search 卡片”不足以证明搜索功能正确。
+
+### 4. 校验与错误矩阵
+
+| use.id | result.tool_use_id | result.content | 行为 |
+| --- | --- | --- | --- |
+| 无或不等于 `K` | `K` | 任意 | `use.id := K`，`adopted_pairs += 1` |
+| `U` | 无 | 任意 | `result.tool_use_id := U`，`adopted_pairs += 1` |
+| 无 | 无 | 空 | 剥离整对，`pair_blocks += 2` |
+| 无 | 无 | 非空 | 原样放行，`unkeyed_pairs += 1` |
+| `K` | `K` | 任意 | 字节级原样放行，零命中 |
+
+### 5. 正常 / 基线 / 错误案例
+
+- 正常：`tool_*` / `srvtoolu_*` 不匹配时采用结果侧键，流结束和整页重载后查询词仍可见，
+  下一轮不再触发 `web-search-result-pairing-repair`。
+- 基线：已经配对的搜索对保持原字节，兄弟 provider 不进入过滤器。
+- 错误：为无键非空对生成新 ID，或只在流式路径修复，导致非流式仍丢卡片。
+
+### 6. 必需测试
+
+- 流式与非流式都覆盖：双键不匹配、反向采钥、带键空结果、无键非空、已配对零改写。
+- 断言采钥不改变块索引、查询输入与结果内容；非流式 `adopted_pairs > 0` 后 body 被重序列化。
+- 断言规则日志包含 `search-pair-id-adopt` 与 `adopted=N`；只有无钥对时 `rules=-`
+  且包含 `unkeyed=N`。
+- 真机用全新会话跑“显式搜索 → 追问 → 不搜索 → 再追问”，然后整页重载；
+  同时检查无 400 / `upstream_failure`、无历史 pairing repair，并人工核对查询语义。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+看到相邻搜索对 → 无条件生成统一的新 ID → 卡片看似恢复，但伪造了上游身份且掩盖无键异常
+```
+
+#### Correct
+
+```text
+优先采用结果侧现有键；仅单侧有键时向另一侧补齐；两侧无键则不发明身份
 ```
 
 ---

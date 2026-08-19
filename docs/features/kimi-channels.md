@@ -158,10 +158,11 @@ m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
 结果块,**此后每一轮都 400 `tool_call_id is not found`**(真实会话第 3 轮当场复现,
 Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id 孤儿"一行的来源)。
 
-补偿:响应侧规则 `provider.kimi.empty-search-pair-strip` 把"无 id 的
+补偿:响应侧规则 `provider.kimi.empty-search-pair-strip` 把"两半都无键的
 `server_tool_use` + 空内容结果块"整对剥掉,幻影对从此进不了历史;请求侧
 `web-search-result-pairing-repair` 的无 id 分支负责救活修复落地前已中毒的历史
-(实测同一会话 Resume 后 400 → 200)。**带 id 的真实零结果搜索不受影响**,原样透传。
+(实测同一会话 Resume 后 400 → 200)。**带键的真实零结果搜索不剥离**;
+两半键不一致时由 §3d 的采钥规则归一后保留。
 
 > 另:搜索轮的下一轮里,Science 会把上一轮的搜索结果存盘瘦身,并在 user 消息里
 > 附一段 `[System] Prior-turn server_tool(…) — results persisted.` 说明,UI 渲染成
@@ -175,6 +176,41 @@ Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id �
 剥离命中、落盘干净)→ 搜索历史 + python 工具循环(3 次 LLM 调用零失败,这正是
 当初 502 死循环的形态)→ 搜索 + 工具混合轮。K2.7 新起一轮原生搜索,正常回答。
 全程 `upstream_failure` 仅出现在修复落地前的中毒历史上。
+
+### 3d. 搜索对配对键采钥(响应侧归一)
+
+上面已经出现过两次的事实:上游自己发出的真实搜索对,两半配对键**恒不匹配**
+(`server_tool_use.id` 为 `tool_…`,`web_search_tool_result.tool_use_id` 为
+`srvtoolu_…`)。原样放行时,Science 落盘会丢弃无法配对的 `server_tool_use`,
+只留孤儿结果块——**流式期间可见的 Web Search 卡片(含查询词)在流结束后消失**,
+且此后每一轮请求都要靠请求侧配对修复以 `input: {}` 空壳兜底(2026-08-19
+真机复现,live 证据 D5)。
+
+补偿:规则 `provider.kimi.search-pair-id-adopt`,响应侧在放行真实搜索对之前把
+`server_tool_use.id` 改写为同对结果块的 `tool_use_id`——**只采用上游已有的
+`srvtoolu_…` 键,不发明新键**;result 侧无键而 use 侧有键时反向补齐。
+两半都无键的非空对不归一,如实放行、仅记日志(`unkeyed=N`)。带键的空结果
+被判定为真实零结果搜索,走采钥保留(这同时收窄了 §3c 幻影剥离的判据:
+幻影 = 两半都无键 **且** 内容为空)。流式与非流式同一矩阵,采钥不改变块数与
+索引,命中记日志 `adopted=N`。
+
+归一之后 Science 可正常配对、落盘、渲染,查询词保留;§3 的请求侧配对修复
+对**新产生的**轮次不再必要,继续保留用于救活历史存量。
+
+### 3e. Science 尾随机器上下文重排(请求侧)
+
+真实 Science 会把用户问题与本机 `compute snapshot` 放成末尾相邻的两条 user message,
+机器上下文在后。direct K3 A/B 保持正文不变只交换两条顺序时,原顺序稳定搜索机器规格,
+反向顺序稳定搜索用户的 Rust 主题,因此问题位于 Kimi 原生搜索对消息顺序的解释。
+
+规则 `provider.kimi.science-context-tail-reorder` 只在 Kimi 请求声明 typed web_search、
+末尾两条都是 user、两条均为 text-only,且最后一条大小写无关命中
+`compute snapshot`、独立词 `cores` 与独立词 `RAM` 或带数字的 GiB 容量规格时,
+交换两条完整消息。它不删除或重建正文,也不改写 query；普通连续 user、历史工具结果、
+client tool 与兄弟 provider 均保持原样。真机候选在同一 K3 会话完成 Rust 搜索、
+历史复述、Python 搜索、跨搜索不联网比较与两轮连续计算；两张 query/card 和最终结果
+整页重载后均保留。搜索轮与响应侧 `search-pair-id-adopt adopted=1` 正常叠加，
+非搜索轮只命中 empty-pair-strip，全程无 repair / 400 / upstream failure。
 
 ### 4. 不接受 Anthropic `document` 内容块
 

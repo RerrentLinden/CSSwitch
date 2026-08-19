@@ -53,7 +53,9 @@ CSSwitch 服务  ── /v1/messages、/v1/models  按当前模式路由
 
 - **Kimi**:非标准 `thinking: auto` 剥离(K3 收到它会静默不思考)、
   指定型 `tool_choice` 与思考冲突时禁思考、`document` 块换署名占位文本、
-  声明 web_search 却未搜索时的 429 用客户端工具桥接绕开。
+  原生 web_search 直通保留,响应侧剥离搜索噪声头与幻影空搜索对、
+  搜索对配对键采钥归一,请求侧修复历史配对,并把 Science 尾随的机器上下文
+  移到真实搜索问题之前。
 - **DeepSeek**:`thinking auto` → `adaptive`、指定型 `tool_choice` 与思考互斥、
   thinking disabled 与 effort 互斥、带 tool_use 的历史补 thinking 块、
   畸形 server tool 块修复、孤儿工具配对按计数补齐。
@@ -78,8 +80,10 @@ bash test/run_all.sh     # 三层门禁:fmt+clippy / 单测 / 真实服务进程
 **[SuperJJ007/CSSwitch](https://github.com/SuperJJ007/CSswitch)**(MIT)——
 本仓库的直接上游。Kimi 渠道的四条兼容补偿在那里成形,包括
 `thinking: auto` 让 K3 静默不思考的发现、`document` 块的署名占位方案,
-以及 web_search 429 的客户端工具桥接(`kimi_coding_search.rs`,至今仍在使用)。
-本轮精简重构删除了它的沙箱隔离与外部 Skill 机制,但这些补偿与其真机证据被完整保留。
+以及 web_search 429 的客户端工具桥接(`kimi_coding_search.rs`;该桥接已于
+2026-08-19 退役,改为原生 web_search 直通,退役过程与判据教训记录在
+[Kimi 渠道](docs/features/kimi-channels.md))。本轮精简重构删除了它的沙箱隔离
+与外部 Skill 机制,其余补偿与真机证据被完整保留。
 
 **[farion1231/cc-switch](https://github.com/farion1231/cc-switch)**(MIT,© 2025 Jason Young)
 及其 fork **[biociao/cc-switch](https://github.com/biociao/cc-switch)** ——

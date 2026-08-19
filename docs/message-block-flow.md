@@ -141,6 +141,13 @@ Science 的工作项分类器正是这个形状,每建一个工作项触发一�
 2026-08-19 复测 32 次**未再复现**,原先 920 行的客户端工具桥已退役,
 `web_search_20250305` 现在原样透传。
 
+真实 Science 还会把 `compute snapshot` 机器上下文作为独立 user message 追加在
+真实问题之后。Kimi 原生搜索会把最后一条 user 当作查询主题。请求侧规则
+`provider.kimi.science-context-tail-reorder` 仅在 typed web_search、尾部双 user、
+末条 text-only 且同时命中 `compute snapshot`、独立词 `cores` 与 RAM/带数字 GiB
+容量规格时交换两条完整消息；上下文与真实问题原文都不改。普通连续 user、工具结果、
+client tool、DeepSeek 与 Generic 均不重排。
+
 但搜索结果**送回历史**这一步会坏,根因是配对断裂:
 
 ```
@@ -159,10 +166,11 @@ id 不匹配就对齐到最近的那个;**连 id 都没有的孤儿**(幻影空�
 空内容直接删、有内容合成配对键。规则 `provider.kimi.web-search-result-pairing-repair`。
 选补块而非丢块,是为了保住这一轮的搜索证据。
 
-响应侧还有两条剥离(`kimi_search_noise.rs`):上游注入的
-`Search results for query:` 噪声头 text 块,以及"无 id `server_tool_use` +
-空内容结果块"的幻影对——后者正是无 id 孤儿的源头。被吞的块不占输出索引,
-未命中流量字节级零改写。上游成因、危害与真机证据见
-[Kimi 渠道 §3b/§3c](features/kimi-channels.md)。
-
+响应侧有三条整形(`kimi_search_noise.rs`):剥离上游注入的
+`Search results for query:` 噪声头 text 块;剥离"两半都无键 +
+空内容结果块"的幻影对——后者正是无 id 孤儿的源头;以及**配对键采钥**——
+真实搜索对放行前把 `server_tool_use.id` 改写为同对结果块的 `tool_use_id`
+(只采用上游已有的键),让 Science 能正常落盘配对,新轮次不再依赖请求侧修复。
+被吞的块不占输出索引,未命中流量字节级零改写。上游成因、危害与真机证据见
+[Kimi 渠道 §3b/§3c/§3d](features/kimi-channels.md)。
 

@@ -55,7 +55,8 @@ catch-all 转发并记录脱敏端点清单,用于回归这个结论。
 补偿都是窄规则,统一形态:端点/flavor 门控 + 规则 ID + 单测。
 命中的规则会打进请求日志,便于判断"哪条在起效"。
 
-- Kimi:`anthropic_compat.rs`(含 `kimi_coding_search.rs` 的 web_search 桥)
+- Kimi:`anthropic_compat.rs`(请求侧)+ `kimi_search_noise.rs`
+  (搜索轮响应侧:噪声头 / 幻影对剥离、配对键采钥)
 - DeepSeek:`deepseek_compat.rs`
 - 策略(如 thinking 政策)来自 provider contract,不靠环境变量传递。
   环境变量只作显式 override 并留日志。

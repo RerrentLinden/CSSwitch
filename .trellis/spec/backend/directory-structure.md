@@ -14,7 +14,7 @@ desktop/gateway/
     ├── server.rs            推理:模式路由、relay 分支、SSE 转发
     ├── anthropic_compat.rs  Anthropic 中继:relay flavor、Kimi 补偿
     ├── deepseek_compat.rs   DeepSeek 补偿链
-    ├── kimi_coding_search.rs  web_search 客户端工具桥
+    ├── kimi_search_noise.rs Kimi 搜索轮响应侧:噪声/幻影对剥离、配对键采钥
     ├── official_passthrough.rs 官方直通 + 诊断子命令
     ├── messages.rs          上游传输(超时、鉴权、错误保留)
     ├── models.rs            模型清单响应
