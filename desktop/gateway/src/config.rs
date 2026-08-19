@@ -105,6 +105,27 @@ pub fn canonical_shim_mode(provider: &str, raw: Option<&str>) -> &'static str {
     }
 }
 
+/// thinking 策略解析:契约声明为准,环境变量作为显式 override(会记一行日志,
+/// 便于诊断"为什么补偿链和契约不一致")。两者都为空时返回 None。
+pub fn resolve_relay_thinking(env_value: Option<&str>, contract_policy: &str) -> Option<String> {
+    let contract = contract_policy.trim();
+    let contract = (!contract.is_empty()).then(|| contract.to_string());
+    let env = env_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    match (env, contract) {
+        (Some(env), Some(contract)) if env != contract => {
+            eprintln!(
+                "relay thinking policy overridden by env: contract={contract} env={env}"
+            );
+            Some(env)
+        }
+        (Some(env), _) => Some(env),
+        (None, contract) => contract,
+    }
+}
+
 pub fn provider_supported(provider: &str, shim: &str) -> bool {
     match provider {
         "deepseek" => matches!(shim, "off" | "detect" | "rewrite"),
@@ -353,10 +374,13 @@ impl GatewayConfig {
             )?;
             models_url = discovered_models;
             if provider_contract.transport == "anthropic_messages" {
-                relay_thinking = std::env::var("CSSWITCH_RELAY_THINKING")
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty());
+                // 策略的权威来源是 provider contract 的 thinking_policy。
+                // 曾经只读环境变量,任何忘记注入的启动路径都会静默丢掉全部
+                // thinking 类补偿(实测表现为上游 400)。env 现在只是显式 override。
+                relay_thinking = resolve_relay_thinking(
+                    std::env::var("CSSWITCH_RELAY_THINKING").ok().as_deref(),
+                    &provider_contract.thinking_policy,
+                );
             }
             inference
         } else if provider == "qwen" {
@@ -570,6 +594,32 @@ mod tests {
         assert!(!provider_supported("relay", "rewrite"));
         assert!(provider_supported("codex", "off"));
         assert!(!provider_supported("codex", "rewrite"));
+    }
+
+    #[test]
+    fn thinking_policy_comes_from_the_contract_without_any_env() {
+        // 回归:曾经只读 env,忘记注入就静默丢掉全部 thinking 补偿(上游 400)。
+        assert_eq!(
+            super::resolve_relay_thinking(None, "upstream_default"),
+            Some("upstream_default".to_string())
+        );
+        assert_eq!(
+            super::resolve_relay_thinking(Some("  "), "deepseek_native"),
+            Some("deepseek_native".to_string())
+        );
+        assert_eq!(super::resolve_relay_thinking(None, ""), None);
+    }
+
+    #[test]
+    fn env_overrides_the_contract_thinking_policy() {
+        assert_eq!(
+            super::resolve_relay_thinking(Some("enabled"), "upstream_default"),
+            Some("enabled".to_string())
+        );
+        assert_eq!(
+            super::resolve_relay_thinking(Some("enabled"), ""),
+            Some("enabled".to_string())
+        );
     }
 
     #[test]

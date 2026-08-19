@@ -2141,7 +2141,9 @@ fn handle_messages(
         }
         return;
     }
-    if cfg.provider == "relay" {
+    // DeepSeek 的官方 /anthropic 端点与 Kimi 同为 Anthropic Messages 中继,
+    // 共用契约驱动的补偿链;两者的差异全部落在 RelayFlavor 上。
+    if cfg.provider == "relay" || cfg.provider == "deepseek" {
         let provider_contract_id = cfg
             .provider_contract
             .as_ref()

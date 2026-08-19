@@ -8,6 +8,7 @@ pub mod codex_protocol;
 pub(crate) mod codex_transport;
 pub mod config;
 pub mod connect;
+pub mod deepseek_compat;
 pub mod dsml_shim;
 pub(crate) mod kimi_coding_search;
 pub mod messages;

@@ -115,6 +115,8 @@ pub struct ProviderRuntimeContract {
     pub auth_scheme: AuthScheme,
     pub api_key_env: Option<String>,
     pub transport: String,
+    /// 契约声明的 thinking 策略,是补偿链的权威来源(env 仅显式 override)。
+    pub thinking_policy: String,
     pub endpoint_policy: String,
     pub endpoint_join: EndpointJoin,
     pub connect_timeout: Duration,
@@ -166,7 +168,7 @@ fn parse_catalog() -> Result<ProviderContractCatalog, String> {
             || contract.scratch_policy.is_empty()
             || !matches!(
                 contract.thinking_policy.as_str(),
-                "" | "adaptive" | "enabled" | "upstream_default"
+                "" | "adaptive" | "enabled" | "upstream_default" | "deepseek_native"
             )
         {
             return Err("provider contract catalog contains an invalid capability shape".into());
@@ -226,6 +228,7 @@ pub(crate) fn load_runtime_contract(
         auth_scheme: AuthScheme::parse(&contract.auth_scheme)?,
         api_key_env: contract.api_key_env.clone(),
         transport: contract.transport.clone(),
+        thinking_policy: contract.thinking_policy.clone(),
         endpoint_policy: contract.endpoint_policy.clone(),
         endpoint_join: EndpointJoin::parse(&contract.endpoint_join)?,
         connect_timeout: Duration::from_millis(contract.timeouts.connect_ms),

@@ -279,7 +279,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
         }
         if !matches!(
             contract.thinking_policy.as_str(),
-            "" | "adaptive" | "enabled" | "upstream_default"
+            "" | "adaptive" | "enabled" | "upstream_default" | "deepseek_native"
         ) {
             return Err(format!(
                 "provider contract thinking_policy 非法：{}",

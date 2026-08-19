@@ -43,16 +43,19 @@ pub enum RelayFlavor {
     #[default]
     Generic,
     Kimi,
+    DeepSeek,
 }
 
 impl RelayFlavor {
     pub fn detect(provider_contract_id: Option<&str>, target_model: &str) -> Self {
         match provider_contract_id {
             Some("kimi-anthropic-relay") => Self::Kimi,
+            Some("deepseek-native") => Self::DeepSeek,
             Some(_) => Self::Generic,
             // Standalone gateways have no bound contract and fall back to the
             // historical model-name heuristic.
             None if target_model.to_ascii_lowercase().contains("kimi") => Self::Kimi,
+            None if target_model.to_ascii_lowercase().contains("deepseek") => Self::DeepSeek,
             None => Self::Generic,
         }
     }
@@ -1108,6 +1111,7 @@ fn filter_relay_server_tools(
     normalize_relay_tools(body, rule_ids);
     let policy = match flavor {
         RelayFlavor::Kimi => AnthropicServerToolPolicy::Kimi,
+        RelayFlavor::DeepSeek => AnthropicServerToolPolicy::DeepSeek,
         RelayFlavor::Generic => return ServerToolOutcome::default(),
     };
     apply_anthropic_server_tool_policy_with_outcome(body, policy, rule_ids)
@@ -1266,7 +1270,12 @@ pub fn transform_relay_request_for_contract(
         replace_kimi_document_blocks(&mut body, &mut rule_ids);
     }
     validate_relay_tool_history(&body)?;
-    if relay_thinking == Some("upstream_default") {
+    // DeepSeek 的官方 /anthropic 端点自带一整套请求形态约束(thinking 取值、
+    // tool_choice 与思考互斥、历史 thinking 回传、工具配对),由专属补偿链处理;
+    // 通用 relay thinking 策略不适用。
+    if flavor == RelayFlavor::DeepSeek {
+        crate::deepseek_compat::normalize_request(&mut body, &target_model, &mut rule_ids);
+    } else if relay_thinking == Some("upstream_default") {
         normalize_upstream_default_thinking(&mut body, &mut rule_ids);
     } else {
         normalize_relay_thinking(&mut body, relay_thinking);
