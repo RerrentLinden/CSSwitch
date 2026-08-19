@@ -91,6 +91,12 @@ tool_choice 的边界是实测出来的(2026-08-19,thinking enabled 与 adaptive
 所以补偿只针对指定工具型这一种。早期实现照搬了"任何非 none 都禁思考"的判据,
 那会在最普通的 auto 形态上白白关掉推理——已收窄。
 
+这不是第三方独有的怪癖。Anthropic 官方文档同样限制:
+["Limit tool choice to `auto` or `none` in manual mode" —— 强制工具的 tool_choice
+在 manual extended thinking(`type:"enabled"`)下会报错,adaptive thinking 则支持强制工具](https://platform.claude.com/docs/en/build-with-claude/thinking-tool-workflows)。
+官方的限制其实**更严**(manual 模式下连 `any` 也不允许),DeepSeek 与 Kimi 都只卡 `tool` 一种。
+注意 DeepSeek 在 `adaptive` 下也拒收 `tool`,与官方 adaptive 的行为不同,这是它自己的收紧。
+
 ## 仍未验证
 
 - `document` 块行为(历史记录称 DeepSeek 接受该块但答 `CANNOT_READ`,本轮未复测)。
