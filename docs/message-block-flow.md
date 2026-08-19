@@ -133,174 +133,27 @@ Science 的工作项分类器正是这个形状,每建一个工作项触发一�
 | 不带 / `auto` / `any` | 200,`[thinking, tool_use]` |
 | `{"type":"tool"}` | **400** |
 
-### 3. web_search 的两条缺陷与客户端工具桥
+### 3. web_search:原生透传 + 历史配对修复
 
-历史成因是 429:只要**声明了却没实际搜索**就返回 429(引擎过载),
-而 Science 每轮都声明它。2026-08-19 复测 32 次**未再复现**该 429。
+历史成因是 429:只要**声明了却没实际搜索**就返回 429,而 Science 每轮都声明它。
+2026-08-19 复测 32 次**未再复现**,原先 920 行的客户端工具桥已退役,
+`web_search_20250305` 现在原样透传。
 
-但原生透传仍然会坏,原因是第二条缺陷:**Kimi 自己生成了一对配不上的 id**。
-它发出的 `server_tool_use.id`(`tool_…`)与 `web_search_tool_result.tool_use_id`
-(`srvtoolu_…`)完全不同,把它自己的输出原样回传,它自己回
-`400 tool_call_id  is not found`。一次搜索让此后每一轮都失败。
-
-把两个 id 对齐(任一方向)即可通过——这是一条约二十行的窄规则,理论上能取代
-920 行的桥接。但 429 是负载相关的,一次复测不足以证明它永久消失,
-所以桥接暂时保持默认。
-
-解法是把服务端工具换成同名的客户端工具——客户端工具从不触发 429:
-
-```mermaid
-sequenceDiagram
-    participant S as Science
-    participant G as 网关
-    participant K as Kimi
-    S->>G: tools 含 web_search 服务端工具
-    G->>K: 换成客户端工具 web_search{query}
-    alt 模型没调用(绝大多数轮次)
-        K-->>G: 普通回答
-        G-->>S: 原样透传,零额外开销
-    else 模型发出 tool_use{web_search}
-        K-->>G: tool_use{query}
-        Note over G: 截获,不转发给 Science
-        G->>K: 补发调用,带真 server 工具
-        K-->>G: server_tool_use + web_search_tool_result
-        G-->>S: 拼进同一条消息,按原生 web_search 渲染
-    end
-```
-
-三条硬约束:客户端 `tool_use` **绝不能泄漏**给 Science(它没有本地执行器,泄漏会
-让该轮永久挂起);content block index 必须连续无空洞;补发失败要发终止 SSE error,
-不伪造助手内容。
-
-### 4. `document` 块不被接受
-
-上游的兼容层没实现 `document`,四种 source 形态全部 400。决定性对照:一个
-**根本不存在的块类型**返回完全相同的报文——说明它走的是"未知块"分支。
-
-这个块是 Science **平台 PDF 视觉通道**的载荷,而且会留在历史里,
-**一个附件让此后每一轮都失败**。补偿是换成署名的占位文本,让对话继续。
-
-> 占位文本必须署名。实测中模型引用了未署名的占位文本,被追问来源后
-> **把一个正确结论当成自己编造的撤回了**。
-
----
-
-## 四、DeepSeek 的适配
-
-DeepSeek 走官方 `/anthropic` 端点,协议完整度更高,补偿集中在
-**thinking 与历史结构**:
-
-```mermaid
-flowchart TD
-    IN[入站请求] --> MT[钳制 max_tokens]
-    MT --> TC{tool_choice 是指定工具型?}
-    TC -->|是| TCF[thinking 置 disabled 并剥 effort]
-    TC -->|否| AUTO{thinking 是 auto?}
-    AUTO -->|是| AF[改写成 adaptive]
-    AUTO -->|否| EF[thinking disabled 时剥掉 effort]
-    TCF --> EF
-    AF --> EF
-    EF --> RP[历史里带 tool_use 的助手轮补 thinking 块]
-    RP --> MS[修复畸形 server tool 块]
-    MS --> OT[按计数补齐孤儿工具配对]
-    OT --> OUT[发往上游]
-```
-
-### 与 Kimi 的对照
-
-同一个问题,两家的解法不同,原因是上游行为不同:
-
-| 入站形状 | Kimi | DeepSeek |
-| --- | --- | --- |
-| `thinking: auto` | 200 但静默不思考 → **删掉字段** | **400 拒收** → 改写成 `adaptive` |
-| 指定工具型 `tool_choice` | 400 → 置 `disabled` | 400 → 置 `disabled` + 剥 effort |
-| `web_search` 服务端工具 | 429 → **换客户端工具桥接** | 原生可用 → **原样保留** |
-| `document` 块 | 400 → 换占位文本 | 接受(但答 `CANNOT_READ`) |
-| 历史缺 thinking 块 | 接受 | **400** → 补占位 thinking 块 |
-
-`web_search` 那一行是重点:同一个工具,一家要桥接、一家要保留。**对 DeepSeek 不能
-降级成文本**——实测那样会教模型模仿扁平化的写法,后面它开始用纯文本伪造工具调用。
-
-### 历史 thinking 补块:曾经的 BUG-083
-
-DeepSeek 要求**每个带 `tool_use` 的助手轮都必须带 thinking 块**。Anthropic SDK
-客户端常常保留工具历史却丢掉 thinking,于是下一轮 400。这就是挂了很久的
-"多轮 thinking 返回 400"。
+但搜索结果**送回历史**这一步会坏,根因是配对断裂:
 
 ```
-历史里的助手轮:
-  [tool_use tu_01]                   ← 缺 thinking → 400
-  ↓ 补偿
-  [thinking(占位), tool_use tu_01]    ← 通过
+m3/assistant: web_search_tool_result = srvtoolu_da2nr326…
+m3/assistant: tool_use              = tool_lATdsqlOGD0n…
+m4/user:      tool_result           = tool_lATdsqlOGD0n…
+                ↑ 同一条消息里没有任何 server_tool_use
 ```
 
-实测:31 条消息的长会话,13 次请求命中 9 次,零失败。补偿是**无状态**的——每轮
-重新扫描全部历史再补,所以对话越长命中越频繁,不存在"补一次就失效"。
+Science 落盘时只留结果块、丢掉请求块,而 Kimi 要求这一对能配上,于是回
+`400 tool_call_id  is not found` —— 一次搜索让此后每一轮都失败。
+(另一种形态:两块都在,但 Kimi 自己发的两个 id 本就不同。)
 
-### 两类历史结构损坏
+修复是让这一对配得上:孤儿结果块前面补一个同 id 的 `server_tool_use`;
+id 不匹配就对齐到最近的那个。规则 `provider.kimi.web-search-result-pairing-repair`。
+选补块而非丢块,是为了保住这一轮的搜索证据。
 
-**孤儿工具配对**——`tool_use` 没有对应结果(流式被打断、daemon 重启、并行调用只回
-来一部分),或 `tool_result` 找不到来源(会话恢复、历史压缩把助手轮裁掉了):
 
-```
-assistant: [tool_use tu_01]    ← 有请求
-user:      [ ]                 ← 没有结果 → 400
-```
-
-修复:缺结果的补一条标了 `is_error` 的合成结果;找不到来源的降级成文本。
-**按计数而不是按集合**配对——两个 tool_use 共用同一 id 时,集合判断会以为配上了。
-
-**畸形 server tool 块**——Science 的 daemon 会把缺 `tool_use_id` 的
-`web_search_tool_result` 落盘进历史,DeepSeek 的反序列化器要求该字段必填。
-修复:结构完好的保留,畸形的能抽文本就降级、抽不出就丢弃。
-
-> **证据状态**:这两条是从 cc-switch 语义移植的,**尚未独立实测边界**。
-> 真实容忍度可能比假设的宽。
-
----
-
-## 五、怎么看日志
-
-每次转发都会打一行,`rules=` 后面是本次生效的补偿:
-
-```
-POST /v1/messages relay target=k3 stream=true msgs=19 thinking_type=-
-  rules=provider.kimi.thinking-upstream-default,
-        tool.relay.input-schema-normalize,
-        tool.kimi.web_search.client-tool-bridge
-```
-
-读法:发往 `k3`,历史 19 条消息,最终 thinking 字段**已被删除**(`-`),
-三条规则生效。`rules=-` 表示零改写。
-
-规则日志只记**净效果**:被后续规则覆盖、等于没做的改写不会出现在这里。
-所以看到什么,发出去的就是什么。
-
-### 规则 ID 全集
-
-| 规则 | 渠道 |
-| --- | --- |
-| `provider.kimi.thinking-upstream-default` | Kimi |
-| `provider.kimi.specified-tool-choice-disables-thinking` | Kimi |
-| `provider.kimi.document-block-placeholder` | Kimi |
-| `tool.kimi.web_search.client-tool-bridge` | Kimi |
-| `tool.kimi.unsupported-server-tool-filter` | Kimi |
-| `provider.deepseek.thinking-auto-adaptive` | DeepSeek |
-| `provider.deepseek.specified-tool-choice-disables-thinking` | DeepSeek |
-| `provider.deepseek.thinking-disabled-strips-effort` | DeepSeek |
-| `provider.deepseek.tool-thinking-history-replay` | DeepSeek |
-| `provider.deepseek.malformed-server-tool-block-repair` | DeepSeek |
-| `provider.deepseek.orphan-tool-pairing-repair` | DeepSeek |
-| `tool.deepseek.web_search.server-tool-preserve` | DeepSeek |
-| `tool.deepseek.unsupported-server-tool-filter` | DeepSeek |
-| `tool.relay.input-schema-normalize` | 共用 |
-| `tool.anthropic.unknown-server-tool-preserve` | 共用 |
-
----
-
-## 相关文档
-
-- [Kimi 渠道](features/kimi-channels.md) —— 四条补偿的完整实测证据
-- [DeepSeek 渠道](features/deepseek-channel.md) —— 六条补偿与 thinking 矩阵
-- [架构](architecture.md) —— 边界、数据流、端点合同
-- [真机验收清单](../test/LIVE_ACCEPTANCE.md) —— 怎么复现这些场景

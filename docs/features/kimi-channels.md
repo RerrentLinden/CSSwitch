@@ -67,116 +67,66 @@ Science 的工作项分类器（`create_work_item`）正是这个形状，每建
 （分类器依赖拿到结构化输出）。`any` 与 `auto` 上游无此问题，不做任何补偿。
 规则 `provider.kimi.specified-tool-choice-disables-thinking`。
 
-### 3. 声明 web_search 但未搜索时返回 429(**观察期**)
+### 3. web_search:桥接已退役,改为原生透传 + 历史配对修复
 
-> 2026-08-19 复测:连续两次"声明 web_search 但模型未搜索"均返回 200,**未复现 429**。
-> 上游可能已修。桥接代码与规则保留待观察;若 K3 日常使用持续无 429,可退役该桥。
-> 下面是当初的原始记录。
+#### 曾经的理由:429
 
+历史上只要**声明了 web_search 却没实际搜索**就返回 429(引擎过载),而 Science
+每轮都声明它,于是真实会话每轮都失败。当时的对策是把服务端工具换成同名客户端工具
+(920 行的 `kimi_coding_search.rs`)。
 
-上游确实原生支持 `web_search_20250305`，但只要声明了该工具而模型本轮**没有实际发起搜索**，
-就返回 `429 rate_limit_error: "The engine is currently overloaded"`。
-已排除 max_tokens、轮次、system prompt、客户端工具、`max_uses`、`tool_choice`、提示复杂度等变量；
-DeepSeek 的 Anthropic 端点无此缺陷，属 Kimi 独有（编码端点实测）。
+2026-08-19 复测 **32 次全部 200,零 429**(k3 与 kimi-for-coding 各一轮,含
+"只声明 web_search"与"web_search + 24 个客户端工具"两种形态)。该缺陷不再复现。
 
-Science 每轮都声明该工具（25 个工具里的第 1 个），因此真实会话**每一轮都失败**，
-Science 侧表现为把 429 当容量问题无限退避重试。
+#### 真正的硬缺陷:搜索结果送不回历史
 
-补偿：**客户端工具桥接**（规则 `tool.kimi.web_search.client-tool-bridge`，
-实现见 `desktop/gateway/src/kimi_coding_search.rs`）。
+关掉桥接原生透传后,第 1 轮搜索成功,第 2 轮必然
+`400 tool_call_id  is not found`。逐步定位到根因,过程中推翻了两个旧说法:
 
-```
-Science 声明 web_search_20250305(server)
-        │
-   gateway 换成同名客户端工具 web_search{query}      ← 客户端工具从不触发 429
-        │
-   上游调用 ①
-        ├─ 模型没调 web_search → 原样透传，零额外开销（绝大多数轮次）
-        └─ 模型发出 tool_use{web_search, query}      ← 这是"本轮需要搜索"的确定信号
-                │
-           gateway 截获，不转发给 Science
-                │
-           上游调用 ②：原对话 + "Use web_search to look up: Q" + 真 server 工具
-                │
-           把返回的 server_tool_use / web_search_tool_result 拼进同一条消息
-                │
-           Science 按原生 web_search 渲染
-```
-
-关键约束与已实现的处理：
-
-- **拼接必须发生在过滤流内部。** gateway 会用 `anthropic_sse::Validator` 校验输出流的生命周期，
-  并把 `message_stop` 扣留到干净 EOF；在转发循环结束后追加帧会被判为流被截断。
-  因此过滤器自己持有配置并内联发起补发调用，替换掉上游那个 `stop_reason: tool_use` 的终止帧，
-  `message_stop` 仍用上游的。
-- **客户端 `tool_use` 绝不泄漏给 Science**：Science 把 web_search 声明为 server 工具，没有本地执行器，
-  泄漏会让该轮永久挂起。
-- **content block index 连续无空洞**：吞掉的块不占用输出索引，拼入的块从当前输出索引继续。
-- **多个查询**：调用①可能返回多个 `web_search` 调用，去重后上限 4 个。
-- **失败显式暴露**：调用②失败（含与搜索无关的偶发 429）时发出终止 SSE error，
-  不伪造助手内容、不静默降级。
-
-非流式走同一套逻辑：检测到桥接工具调用后发补发请求，把搜索证据并入响应并剔除该工具调用。
-
-另注：该端点还存在**与 web_search 无关的偶发 429**（一次无工具基础请求也曾 429）。
-这也是不能采用"遇 429 就去掉工具重发"那种方案的原因——它会把偶发 429 误判成"本轮没搜索"。
-
-模型行为观察：当 Science 的其余 24 个客户端工具同时可用时，模型有时会绕开 web_search 改用 `bash`
-等工具，甚至声称环境里没有 web_search。这是模型的选择而非链路故障，桥接在这种轮次保持空闲。
-
-### 3b. 2026-08-19 复测:429 未复现,根因另有其人
-
-**429 部分**:32 次请求(k3 与 kimi-for-coding 各一轮,含"只声明 web_search"与
-"web_search + 24 个客户端工具"两种形态)**全部 200,零 429**。上游这条缺陷当前
-不复现——可能已修,也可能只是当时负载所致(原始报错是引擎过载,本就与负载相关)。
-
-**但原生透传仍然会坏,原因是第二条缺陷。** 用实验开关
-`CSSWITCH_KIMI_WEB_SEARCH=native`(请求与响应两侧同时关闭桥接)在真实 Science
-会话里跑:第 1 轮搜索成功,第 2 轮(历史带上搜索结果)必然
-`400 tool_call_id  is not found`。
-
-#### 根因:Kimi 自己生成了一对配不上的 id
-
-抓取 Kimi 的真实 SSE 输出,两个块的 id 字段是:
-
-| 块 | 字段 | 实际值 |
-| --- | --- | --- |
-| `server_tool_use` | `id` | `tool_lqvW0dv4wjstSjpitzUtPirD` |
-| `web_search_tool_result` | `tool_use_id` | `srvtoolu_da2ngroj5l2ab0irej60` |
-
-**两者完全不同**。把 Kimi 自己的输出原样回传,它自己拒收。
-
-对齐实验证实这就是全部原因:
-
-| 重放方式 | 结果 |
+| 曾经的说法 | 实测结论 |
 | --- | --- |
-| 原样回传 | **400** `tool_call_id  is not found` |
-| 把 `web_search_tool_result.tool_use_id` 改成 `server_tool_use.id` | **200** |
-| 把 `server_tool_use.id` 改成 result 的 `tool_use_id` | **200** |
+| "两个空格说明 id 为空" | **错**。普通工具用一个非空但不匹配的 id,报错完全相同。该报错从不插入具体 id,双空格只是文案格式缺陷 |
+| "结果块不携带 tool_use_id" | **错**。Kimi 发出的块携带它 |
 
-两个方向都能修好,说明上游只校验"这一对能否配上",不关心具体取值。
+真实骨架(诊断 `CSSWITCH_DEBUG_TOOL_SKELETON=1` 打出):
 
-#### 两个被推翻的旧说法
+```
+m3/assistant: web_search_tool_result = srvtoolu_da2nr326d89s73enoue0
+m3/assistant: tool_use              = tool_lATdsqlOGD0n8Cgv
+m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
+```
 
-1. ~~"两个空格说明 id 为空"~~ —— **错**。对照实验:普通工具用一个**非空但不匹配**的
-   `tool_use_id`,报错同样是 `tool_call_id  is not found`(仍是两个空格)。
-   该报错**从不插入具体 id**,双空格只是文案格式缺陷,不能当作 id 为空的证据。
-2. ~~"该块不携带 `tool_use_id`"~~ —— **错**。块携带了,只是与同一条消息里的
-   `server_tool_use.id` 对不上。
+**同一条消息里没有任何 `server_tool_use`** —— Science 落盘时只保留了结果块,
+把与之配对的请求块丢了。Kimi 的兼容层要求这一对能配上,于是拒收。
 
-#### 关于"内部映射成 OpenAI 形态"
+另有一种形态:两个块都在,但 Kimi 自己发出的 `server_tool_use.id`(`tool_…`)
+与 `web_search_tool_result.tool_use_id`(`srvtoolu_…`)本就不是同一个值 ——
+把它自己的输出原样回传,它自己拒收。
 
-这句原出自 cc-switch 的代码注释,本仓库此前沿用。现有的外部证据:
-报错字段名 `tool_call_id` 是 OpenAI 的(Anthropic 用 `tool_use_id`),
-且**普通工具的配对失败与 server tool 结果的配对失败返回完全相同的报错**,
-说明两者共用同一条内部校验路径。这与"统一映射成 OpenAI 形态"一致,
-但仍是**从外部行为推断的机制**,未经上游确认。
+#### 修复:让这一对配得上
 
-#### 对桥接去留的影响
+规则 `provider.kimi.web-search-result-pairing-repair`,约六十行:
 
-`server_tool_use` 与 `web_search_tool_result` 的 id 对齐是一条约二十行的窄规则,
-理论上可以取代 920 行的桥接。前提是 429 确实已经消失——而它是负载相关的,
-一次复测不足以证明。**在真实使用中积累更多样本前,桥接保持默认。**
+| 历史形态 | 动作 | 实测 |
+| --- | --- | --- |
+| 结果块孤立(无 `server_tool_use`) | 在它前面补一个同 id 的 `server_tool_use` | 400 → **200** |
+| 两块都在但 id 不匹配 | 把结果块的 id 改成前面最近的 `server_tool_use.id` | 400 → **200** |
+| 已经配得上 | 不动,也不记规则 | — |
+| 连 `tool_use_id` 都没有 | 不瞎编 | — |
+
+选择补块而不是丢块:丢掉结果块同样能过(实测 200),但会丢失这一轮的搜索证据。
+
+#### 净结果
+
+删除 920 行桥接 + 响应侧剥离过滤器 + 13 个相关测试,换成一条约六十行的窄规则。
+`web_search_20250305` 现在原样透传给上游(规则
+`tool.kimi.web_search.server-tool-preserve`),Science 按原生 web_search 渲染。
+
+真机验收:全新会话连续多轮联网搜索,历史推进到 5 条消息,修复规则命中,
+**零 upstream_failure**。
+
+> 若 429 卷土重来(它是负载相关的),桥接的完整实现保留在 git 历史里,
+> 提交 `1bdbbbd` 之前的 `desktop/gateway/src/kimi_coding_search.rs`。
 
 ### 4. 不接受 Anthropic `document` 内容块
 
