@@ -115,6 +115,164 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// 一次直通转发的结果摘要,供服务侧记脱敏日志。
+pub struct ForwardOutcome {
+    pub status: u16,
+    pub sse: bool,
+    pub response_bytes: u64,
+}
+
+/// 单进程服务的官方模式转发:请求已被上层读取,这里只做上游往返。
+/// 与诊断模式共用同一套 header 剥离与流式转发规则。
+pub fn forward(
+    stream: &mut TcpStream,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    upstream: &str,
+) -> ForwardOutcome {
+    let client = match shared_client() {
+        Some(client) => client,
+        None => {
+            write_plain(
+                stream,
+                502,
+                "Bad Gateway",
+                "passthrough: 上游客户端初始化失败",
+            );
+            return ForwardOutcome {
+                status: 502,
+                sse: false,
+                response_bytes: 0,
+            };
+        }
+    };
+    let Ok(method) = reqwest::Method::from_bytes(method.as_bytes()) else {
+        write_plain(stream, 400, "Bad Request", "passthrough: 非法 HTTP 方法");
+        return ForwardOutcome {
+            status: 400,
+            sse: false,
+            response_bytes: 0,
+        };
+    };
+    if !target.starts_with('/') {
+        write_plain(
+            stream,
+            400,
+            "Bad Request",
+            "passthrough: 仅支持 origin-form 请求目标",
+        );
+        return ForwardOutcome {
+            status: 400,
+            sse: false,
+            response_bytes: 0,
+        };
+    }
+    let url = format!("{}{target}", upstream.trim_end_matches('/'));
+    let mut request = client.request(method, &url);
+    for (name, value) in headers {
+        if should_strip_request_header(name) {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    match request.body(body).send() {
+        Err(error) => {
+            write_plain(
+                stream,
+                502,
+                "Bad Gateway",
+                &format!("passthrough upstream error: {error}"),
+            );
+            ForwardOutcome {
+                status: 502,
+                sse: false,
+                response_bytes: 0,
+            }
+        }
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let sse = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.contains("text/event-stream"))
+                .unwrap_or(false);
+            let response_bytes = relay_response(stream, response);
+            ForwardOutcome {
+                status,
+                sse,
+                response_bytes,
+            }
+        }
+    }
+}
+
+/// 直通用的共享 HTTP 客户端。SSE 与长响应要求关闭总超时。
+fn shared_client() -> Option<&'static reqwest::blocking::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(None)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+/// 把上游响应原样中继给客户端:剥掉连接语义头,其余逐字节透传,
+/// SSE 每块立刻冲刷。返回转发的字节数。
+fn relay_response(stream: &mut TcpStream, mut response: reqwest::blocking::Response) -> u64 {
+    let status = response.status();
+    let mut head_out: Vec<u8> = Vec::with_capacity(1024);
+    head_out.extend_from_slice(
+        format!(
+            "HTTP/1.1 {} {}\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
+        )
+        .as_bytes(),
+    );
+    for (name, value) in response.headers() {
+        if should_strip_response_header(name.as_str()) {
+            continue;
+        }
+        head_out.extend_from_slice(name.as_str().as_bytes());
+        head_out.extend_from_slice(b": ");
+        head_out.extend_from_slice(value.as_bytes());
+        head_out.extend_from_slice(b"\r\n");
+    }
+    head_out.extend_from_slice(b"connection: close\r\n\r\n");
+    if stream.write_all(&head_out).is_err() {
+        return 0;
+    }
+    let _ = stream.flush();
+
+    let mut total: u64 = 0;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match response.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                total += read as u64;
+                if stream.write_all(&buffer[..read]).is_err() {
+                    break;
+                }
+                // SSE 逐帧到达依赖及时冲刷,不能等缓冲区满。
+                let _ = stream.flush();
+            }
+            // 上游中断:连接随之关闭,以 close 定界向客户端表达截断。
+            Err(_) => break,
+        }
+    }
+    total
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     client: &reqwest::blocking::Client,
@@ -214,7 +372,7 @@ fn handle_connection(
                 Some("upstream_error"),
             );
         }
-        Ok(mut resp) => {
+        Ok(resp) => {
             let status = resp.status();
             let sse = resp
                 .headers()
@@ -222,47 +380,7 @@ fn handle_connection(
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("text/event-stream"))
                 .unwrap_or(false);
-            let mut head_out: Vec<u8> = Vec::with_capacity(1024);
-            head_out.extend_from_slice(
-                format!(
-                    "HTTP/1.1 {} {}\r\n",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("")
-                )
-                .as_bytes(),
-            );
-            for (name, value) in resp.headers() {
-                if should_strip_response_header(name.as_str()) {
-                    continue;
-                }
-                head_out.extend_from_slice(name.as_str().as_bytes());
-                head_out.extend_from_slice(b": ");
-                head_out.extend_from_slice(value.as_bytes());
-                head_out.extend_from_slice(b"\r\n");
-            }
-            head_out.extend_from_slice(b"connection: close\r\n\r\n");
-            if stream.write_all(&head_out).is_err() {
-                return;
-            }
-            let _ = stream.flush();
-
-            let mut resp_bytes: u64 = 0;
-            let mut buf = [0_u8; 16 * 1024];
-            loop {
-                match resp.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        resp_bytes += n as u64;
-                        if stream.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                        // SSE 逐帧到达依赖及时冲刷,不能等缓冲区满。
-                        let _ = stream.flush();
-                    }
-                    // 上游中断:连接随之关闭,以 close 定界向客户端表达截断。
-                    Err(_) => break,
-                }
-            }
+            let resp_bytes = relay_response(&mut stream, resp);
             log.write(
                 &head.method,
                 &head.target,

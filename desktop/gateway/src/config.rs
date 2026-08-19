@@ -207,6 +207,45 @@ fn upstream_url_for(
 }
 
 impl GatewayConfig {
+    /// 从用户配置直接装配渠道运行配置(单进程服务用)。
+    /// 与 `from_env_args` 的差别只是输入来源:策略仍旧来自 provider contract,
+    /// 模型目录来自用户在 WebUI 里填的四个槽。
+    pub fn for_channel(profile: &crate::profile::Profile) -> Result<Self, String> {
+        let (adapter, contract_id) = profile.mode.contract().ok_or("官方模式不使用渠道配置")?;
+        let channel = profile
+            .channel(&profile.mode)
+            .ok_or("当前模式没有渠道配置")?;
+        channel.validate()?;
+
+        let contract = crate::provider_contracts::load_runtime_contract(
+            adapter,
+            Some(contract_id),
+            Some(&crate::provider_contracts::catalog_digest()),
+        )?;
+        let base = channel.base_url.trim().trim_end_matches('/');
+        let (upstream_url, models_url) =
+            joined_endpoints(contract.endpoint_join, &contract.transport, base)?;
+        let catalog = channel.static_catalog(adapter);
+        let resolver =
+            crate::static_profile::StaticProfileResolver::from_json(&catalog.to_string())?;
+        let relay_thinking = resolve_relay_thinking(None, &contract.thinking_policy);
+
+        Ok(Self {
+            provider: adapter.to_string(),
+            port: profile.port,
+            auth_secret: None,
+            api_key: Some(channel.api_key.trim().to_string()),
+            upstream_url,
+            models_url,
+            relay_thinking,
+            provider_contract: Some(contract),
+            intent: GatewayIntent::Formal,
+            static_model_resolver: Some(resolver),
+            shim_mode: "off".to_string(),
+            launch_id: String::new(),
+        })
+    }
+
     pub fn from_env_args(args: Vec<String>) -> Result<Self, String> {
         let mut provider = "deepseek".to_string();
         let mut port: Option<u16> = None;

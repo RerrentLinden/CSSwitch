@@ -1204,6 +1204,95 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// 单进程服务的推理入口:按当前激活模式路由。
+/// 官方模式整条透传官方上游;渠道模式按契约装配一次性 GatewayConfig 走补偿链。
+pub fn handle_inference(
+    stream: &mut TcpStream,
+    method: &str,
+    target: &str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    state: &Arc<crate::control::AppState>,
+) {
+    let timer = crate::control::Timer::start();
+    let profile = state
+        .profile
+        .read()
+        .map(|profile| profile.clone())
+        .unwrap_or_default();
+    let path = dequery(target);
+
+    if profile.mode == crate::profile::Mode::Official {
+        let outcome = crate::official_passthrough::forward(
+            stream,
+            method,
+            target,
+            &headers,
+            body,
+            crate::official_passthrough::DEFAULT_UPSTREAM,
+        );
+        state.record(crate::control::log_entry(
+            "inference",
+            json!({
+                "mode": "official",
+                "method": method,
+                "path": path,
+                "status": outcome.status,
+                "sse": outcome.sse,
+                "ms": timer.elapsed_ms(),
+            }),
+        ));
+        return;
+    }
+
+    let cfg = match crate::config::GatewayConfig::for_channel(&profile) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            state.record(crate::control::log_entry(
+                "inference",
+                json!({"mode": profile.mode.as_str(), "path": path, "error": error.clone()}),
+            ));
+            api_error_json(stream, 502, &error);
+            return;
+        }
+    };
+    let head = RequestHead {
+        method: method.to_string(),
+        target: target.to_string(),
+        headers: headers.into_iter().collect(),
+    };
+    let relay_models = models::RelayModelCache::default();
+    match method {
+        "GET" => handle_get(stream, &cfg, target, &relay_models),
+        // body 已由服务层读走,不能再走 handle_post(它会自己读 socket 并永远阻塞)。
+        "POST" if path == "/v1/messages" => {
+            let transport = match head.anthropic_transport() {
+                Ok(transport) => Some(transport),
+                Err(error) => {
+                    invalid_request_json(stream, &error);
+                    return;
+                }
+            };
+            let body = if body.is_empty() {
+                b"{}".to_vec()
+            } else {
+                body
+            };
+            handle_messages(stream, &cfg, body, transport.as_ref(), &relay_models);
+        }
+        _ => not_found_json(stream, path),
+    }
+    state.record(crate::control::log_entry(
+        "inference",
+        json!({
+            "mode": profile.mode.as_str(),
+            "method": method,
+            "path": path,
+            "ms": timer.elapsed_ms(),
+        }),
+    ));
+}
+
 #[cfg(test)]
 mod tests {
 

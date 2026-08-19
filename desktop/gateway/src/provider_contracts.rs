@@ -115,7 +115,7 @@ pub struct ProviderRuntimeContract {
     pub upstream_client_version: Option<String>,
 }
 
-fn catalog_digest() -> String {
+pub(crate) fn catalog_digest() -> String {
     format!(
         "{:x}",
         Sha256::digest(STATIC_PROVIDER_CONTRACTS_JSON.as_bytes())

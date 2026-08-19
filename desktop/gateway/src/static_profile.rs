@@ -393,6 +393,15 @@ fn fingerprint_text(digest: &mut Sha256, value: &str) {
     digest.update(value.as_bytes());
 }
 
+/// 由目录 JSON 计算指纹。控制面在生成目录时用它填 `catalog_fp`,
+/// 从而与解析侧的校验共用同一套算法(避免两处实现漂移)。
+pub fn fingerprint_for_catalog(catalog: &Value) -> String {
+    match serde_json::from_value::<WireCatalog>(catalog.clone()) {
+        Ok(parsed) => wire_catalog_fingerprint(&parsed),
+        Err(_) => String::new(),
+    }
+}
+
 fn wire_catalog_fingerprint(catalog: &WireCatalog) -> String {
     let mut digest = Sha256::new();
     digest.update(b"csswitch-static-catalog-fp-v1\0");
