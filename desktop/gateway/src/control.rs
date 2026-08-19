@@ -339,31 +339,46 @@ fn probe_models(request: &Request) -> Result<Value, String> {
         }
     };
 
-    let url = if base_url.ends_with("/v1") {
-        format!("{base_url}/models")
-    } else {
-        format!("{base_url}/v1/models")
-    };
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
-    let response = client
-        .get(&url)
-        .header("authorization", format!("Bearer {api_key}"))
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .map_err(|e| format!("请求 {url} 失败:{e}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .map_err(|e| format!("读取上游响应失败:{e}"))?;
-    let body: Value = serde_json::from_str(&text).map_err(|e| format!("上游返回不是 JSON:{e}"))?;
-    if !status.is_success() {
-        // 失败时把上游原文交回,不伪造一个空清单。
-        return Err(format!("上游 {}:{}", status.as_u16(), body));
+
+    let mut last_error = String::new();
+    let mut body = Value::Null;
+    for url in model_list_candidates(&base_url) {
+        let response = match client
+            .get(&url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("请求 {url} 失败:{error}");
+                continue;
+            }
+        };
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        if !status.is_success() {
+            // 保留上游原文,不伪造一个空清单。
+            let detail: String = text.chars().take(200).collect();
+            last_error = format!("{url} → 上游 {}:{detail}", status.as_u16());
+            continue;
+        }
+        match serde_json::from_str::<Value>(&text) {
+            Ok(parsed) => {
+                body = parsed;
+                break;
+            }
+            Err(error) => last_error = format!("{url} → 上游返回不是 JSON:{error}"),
+        }
+    }
+    if body.is_null() {
+        return Err(last_error);
     }
     let models: Vec<Value> = body
         .get("data")
@@ -382,6 +397,33 @@ fn probe_models(request: &Request) -> Result<Value, String> {
         })
         .unwrap_or_default();
     Ok(json!({"models": models}))
+}
+
+/// 模型清单的候选地址。Anthropic 兼容端点未必在自己的路径下提供 models
+/// (DeepSeek 的 `/anthropic/v1/models` 就是 404),需要回退到服务根域。
+fn model_list_candidates(base_url: &str) -> Vec<String> {
+    let base = base_url.trim_end_matches('/');
+    let mut candidates = Vec::new();
+    if base.ends_with("/v1") {
+        candidates.push(format!("{base}/models"));
+    } else {
+        candidates.push(format!("{base}/v1/models"));
+    }
+    if let Ok(parsed) = reqwest::Url::parse(base) {
+        if !parsed.path().trim_matches('/').is_empty() {
+            if let Some(host) = parsed.host_str() {
+                let port = parsed
+                    .port()
+                    .map(|port| format!(":{port}"))
+                    .unwrap_or_default();
+                let root = format!("{}://{host}{port}/v1/models", parsed.scheme());
+                if !candidates.contains(&root) {
+                    candidates.push(root);
+                }
+            }
+        }
+    }
+    candidates
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
@@ -497,6 +539,22 @@ mod tests {
         let text = payload.to_string();
         assert!(!text.contains("sk-super-secret-value"), "key 不得回显");
         assert_eq!(payload["has_api_key"], json!(true));
+    }
+
+    #[test]
+    fn model_list_falls_back_to_the_service_root() {
+        // 回归:DeepSeek 的 /anthropic/v1/models 是 404,清单在根域的 /v1/models。
+        assert_eq!(
+            model_list_candidates("https://api.deepseek.com/anthropic"),
+            vec![
+                "https://api.deepseek.com/anthropic/v1/models".to_string(),
+                "https://api.deepseek.com/v1/models".to_string(),
+            ]
+        );
+        assert_eq!(
+            model_list_candidates("https://api.kimi.com"),
+            vec!["https://api.kimi.com/v1/models".to_string()]
+        );
     }
 
     #[test]

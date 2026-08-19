@@ -39,8 +39,27 @@
 DSML shim。现在全部退役:上游要的只是"历史里有 thinking 块",占位块即可满足,
 不需要 CSSwitch 侧保存任何对话状态。
 
-## 未验证
+## 实测记录(2026-08-19)
 
-本渠道的补偿尚未用真实 DeepSeek key 做过端到端验收。历史问题
-BUG-083(DeepSeek Pro 多轮 thinking 400)在新路线下是否消失,需要按
-[真机验收清单](../../test/LIVE_ACCEPTANCE.md) 的 B、C 两节实测确认。
+用真实 key 在官方 Science 实例里跑通:干净会话 + 三轮独立的 Python 内核调用
+(生成随机序列 → 计算 GC → 找最高值),结果正确,**零 upstream_failure**。
+
+规则命中情况(网关日志):
+
+| 轮次 | 命中的规则 |
+| --- | --- |
+| 辅助调用(flash,带 tool_choice) | `provider.deepseek.tool-choice-disables-thinking` |
+| 首轮(msgs=3) | `tool.deepseek.web_search.server-tool-preserve` |
+| 后续多轮(msgs=5/7/9) | `provider.deepseek.tool-thinking-history-replay` + 上一条 |
+
+**BUG-083 关闭**:该缺陷是"DeepSeek Pro 多轮 thinking 返回 400",根因就是历史里
+缺 thinking 块。本轮多轮工具调用正是这个形状,补偿每轮命中,全程无 400。
+旧的落盘续写机制不需要恢复。
+
+模型清单不在 `/anthropic` 路径下(`/anthropic/v1/models` 返回 404 空体),
+在根域 `/v1/models`;控制台的模型探测会依次尝试这两个地址。
+
+## 仍未验证
+
+- `document` 块行为(历史记录称 DeepSeek 接受该块但答 `CANNOT_READ`,本轮未复测)。
+- 长会话下的孤儿工具配对与畸形 server tool 块修复:本轮未构造出这两种历史形态。
