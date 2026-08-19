@@ -124,36 +124,59 @@ Science 声明 web_search_20250305(server)
 模型行为观察：当 Science 的其余 24 个客户端工具同时可用时，模型有时会绕开 web_search 改用 `bash`
 等工具，甚至声称环境里没有 web_search。这是模型的选择而非链路故障，桥接在这种轮次保持空闲。
 
-### 3b. 2026-08-19 复测:429 未复现,但桥接仍然必需
+### 3b. 2026-08-19 复测:429 未复现,根因另有其人
 
 **429 部分**:32 次请求(k3 与 kimi-for-coding 各一轮,含"只声明 web_search"与
-"web_search + 24 个客户端工具"两种形态)**全部 200,零 429**。上游这条缺陷
-当前不复现——可能已修,也可能只是当时负载所致(原始报错是引擎过载,本就与负载相关)。
+"web_search + 24 个客户端工具"两种形态)**全部 200,零 429**。上游这条缺陷当前
+不复现——可能已修,也可能只是当时负载所致(原始报错是引擎过载,本就与负载相关)。
 
-**但桥接不能退役**,原因是另一条缺陷,本轮实测暴露:
+**但原生透传仍然会坏,原因是第二条缺陷。** 用实验开关
+`CSSWITCH_KIMI_WEB_SEARCH=native`(请求与响应两侧同时关闭桥接)在真实 Science
+会话里跑:第 1 轮搜索成功,第 2 轮(历史带上搜索结果)必然
+`400 tool_call_id  is not found`。
 
-用实验开关 `CSSWITCH_KIMI_WEB_SEARCH=native`(请求侧原样送 server tool、
-响应侧同步关闭剥离)在真实 Science 会话里跑:
+#### 根因:Kimi 自己生成了一对配不上的 id
 
-| 轮次 | 结果 |
+抓取 Kimi 的真实 SSE 输出,两个块的 id 字段是:
+
+| 块 | 字段 | 实际值 |
+| --- | --- | --- |
+| `server_tool_use` | `id` | `tool_lqvW0dv4wjstSjpitzUtPirD` |
+| `web_search_tool_result` | `tool_use_id` | `srvtoolu_da2ngroj5l2ab0irej60` |
+
+**两者完全不同**。把 Kimi 自己的输出原样回传,它自己拒收。
+
+对齐实验证实这就是全部原因:
+
+| 重放方式 | 结果 |
 | --- | --- |
-| 第 1 轮(msgs=2,发起搜索) | 200,上游 SSE 完整:`server_tool_use` + `web_search_tool_result` + 干净 `message_stop` |
-| 第 2 轮(msgs=4,历史带上搜索结果) | **400** `tool_call_id  is not found` |
+| 原样回传 | **400** `tool_call_id  is not found` |
+| 把 `web_search_tool_result.tool_use_id` 改成 `server_tool_use.id` | **200** |
+| 把 `server_tool_use.id` 改成 result 的 `tool_use_id` | **200** |
 
-`tool_call_id` 后是两个空格 —— **id 为空**。Kimi 的兼容层把
-`web_search_tool_result` 映射成 OpenAI tool 消息时要求 `tool_call_id`,
-而该块本身不携带 `tool_use_id`,于是配不上任何 tool_call。
+两个方向都能修好,说明上游只校验"这一对能否配上",不关心具体取值。
 
-后果与 `document` 块同构:**一次搜索让此后每一轮都失败**。
-所以桥接的价值不只是绕开 429,更在于**搜索证据以其它形态进入历史**,
-不会在下一轮把整个会话卡死。
+#### 两个被推翻的旧说法
 
-顺带确认上游流本身没问题:直连抓取 2163 行 SSE,生命周期完整、`stop_reason: end_turn`。
-问题只出现在**把结果送回去的那一轮**。
+1. ~~"两个空格说明 id 为空"~~ —— **错**。对照实验:普通工具用一个**非空但不匹配**的
+   `tool_use_id`,报错同样是 `tool_call_id  is not found`(仍是两个空格)。
+   该报错**从不插入具体 id**,双空格只是文案格式缺陷,不能当作 id 为空的证据。
+2. ~~"该块不携带 `tool_use_id`"~~ —— **错**。块携带了,只是与同一条消息里的
+   `server_tool_use.id` 对不上。
 
-> 排查笔记:首次实验只翻了请求侧策略,响应侧仍在剥离 server tool 块,
-> 导致 content block 索引出现空洞,Science 表现为无限重试。两侧必须同时切换。
-> 另有一次 `499` 是重启网关掐断了正在进行的流,不是上游行为。
+#### 关于"内部映射成 OpenAI 形态"
+
+这句原出自 cc-switch 的代码注释,本仓库此前沿用。现有的外部证据:
+报错字段名 `tool_call_id` 是 OpenAI 的(Anthropic 用 `tool_use_id`),
+且**普通工具的配对失败与 server tool 结果的配对失败返回完全相同的报错**,
+说明两者共用同一条内部校验路径。这与"统一映射成 OpenAI 形态"一致,
+但仍是**从外部行为推断的机制**,未经上游确认。
+
+#### 对桥接去留的影响
+
+`server_tool_use` 与 `web_search_tool_result` 的 id 对齐是一条约二十行的窄规则,
+理论上可以取代 920 行的桥接。前提是 429 确实已经消失——而它是负载相关的,
+一次复测不足以证明。**在真实使用中积累更多样本前,桥接保持默认。**
 
 ### 4. 不接受 Anthropic `document` 内容块
 
