@@ -1,0 +1,63 @@
+#!/bin/bash
+# CSSwitch:启动本地服务并打开控制台。
+#
+#   ./csswitch          启动(已在跑则只打开控制台)
+#   ./csswitch stop     停止
+#   ./csswitch status   看一眼当前模式
+#
+# 服务在前台运行,Ctrl-C 或控制台里的「退出服务」都能停掉它。
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+STATE="$HOME/.csswitch"
+PORT="${CSSWITCH_PORT:-8788}"
+CONSOLE="http://127.0.0.1:$PORT"
+mkdir -p "$STATE"
+
+running() { curl -sf --max-time 2 "$CONSOLE/control/status" >/dev/null 2>&1; }
+
+case "${1:-start}" in
+  stop)
+    if running; then
+      curl -sf --max-time 5 -X POST "$CONSOLE/control/quit" >/dev/null 2>&1
+      echo "已请求退出。"
+    else
+      echo "服务未在运行。"
+    fi
+    exit 0
+    ;;
+  status)
+    if running; then
+      curl -s --max-time 5 "$CONSOLE/control/status" \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); print("模式:",d["mode_label"],"| 控制台:",d["base_url"],"| Science:","运行中" if d["science"]["running"] else "未运行")'
+    else
+      echo "服务未在运行。"
+    fi
+    exit 0
+    ;;
+  start) ;;
+  *) echo "用法:$0 [start|stop|status]" >&2; exit 2 ;;
+esac
+
+if running; then
+  echo "服务已在运行,打开控制台。"
+  open "$CONSOLE/" 2>/dev/null || echo "$CONSOLE/"
+  exit 0
+fi
+
+# shellcheck source=test/_cargo_path.sh
+source "$ROOT/test/_cargo_path.sh"
+BIN="$ROOT/desktop/gateway/target/release/csswitch-gateway"
+if [ ! -x "$BIN" ]; then
+  ensure_rust_toolchain_on_path || { echo "找不到 cargo 工具链,且没有已构建的二进制" >&2; exit 1; }
+  echo "首次运行,正在构建…"
+  cargo build --release --manifest-path "$ROOT/desktop/gateway/Cargo.toml" || exit 1
+fi
+
+# 控制台在服务就绪后再开,避免打开一个空白页。
+( for _ in $(seq 1 50); do
+    running && { open "$CONSOLE/" 2>/dev/null || true; break; }
+    sleep 0.2
+  done ) &
+
+exec "$BIN" serve --port "$PORT"

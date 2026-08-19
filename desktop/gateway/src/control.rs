@@ -137,6 +137,16 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
         ("POST", "probe-models") => probe_models(request),
         ("POST", "science/start") => start_science(state),
         ("POST", "science/stop") => crate::science::stop().map(|_| json!({"ok": true})),
+        ("POST", "quit") => {
+            // 先把响应写回去再退,否则控制台只会看到连接被切断。
+            respond_json(stream, 200, json!({"ok": true, "message": "服务正在退出"}));
+            let _ = stream.flush();
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                std::process::exit(0);
+            });
+            return;
+        }
         ("GET", "science/url") => crate::science::login_url().map(|url| json!({"url": url})),
         _ => Err(format!("未知控制操作:{} {action}", request.method)),
     };

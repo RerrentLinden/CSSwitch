@@ -1,10 +1,14 @@
 # 测试与证据规则
 
-- 证据层必须分开：源码 / 单测、构建 artifact、临时安装副本、已安装 runtime、真实 provider、签名 / 公证 / Gatekeeper、公开 release。
-- 默认总入口是 `bash test/run_all.sh`；只有五层全部通过且没有环境阻塞，才可写 `release-ready green`。
-- 默认模式无失败但存在缺失依赖或需真机项目时，只能写 `current-env clean`，并列出 `ENV-BLOCKED` / `NEEDS-REAL-MACHINE`。
-- 文件复制、Science 发现、Agent attach、Skill load / trigger、领域功能执行、重启持久化是不同结论。
-- mock / loopback 不能写成 live provider；源码测试不能写成 installed runtime；本地 release 元数据不能写成公开发布。
-- 失败、未运行、环境阻塞、需人工判断不得记为通过。
-- 运行真机或已安装 runtime 测试前遵守[真机验收](../../docs/operations/real-machine-acceptance.md)的隔离护栏。
-- 报告命令、目标 commit / artifact、环境、退出码和脱敏证据；不要只记录历史 pass 数量。
+- 默认入口是 `bash test/run_all.sh`,三层:static(fmt + clippy 零告警)、
+  unit(cargo test)、loopback(起真实服务进程打真实 HTTP)。三层全绿才算门禁通过。
+- 三层全部离线。官方登录、真实 provider key、Science 工具轮次这些只能真机跑,
+  清单在 [test/LIVE_ACCEPTANCE.md](../../test/LIVE_ACCEPTANCE.md),结论要单独写。
+- 证据层不得混淆:单测 ≠ loopback ≠ 真机;mock 不能写成 live provider;
+  某条补偿在 A 端点实测通过,不等于 B 端点也通过——写清证据边界。
+- 失败、未运行、环境阻塞、需人工判断一律不得记为通过。缺工具链时 `run_all.sh`
+  以 env-blocked 退出,不能当成绿。
+- 报告要写:跑了什么命令、什么 commit、退出码、脱敏后的关键输出;
+  不要只报历史 pass 数量。
+- 测试的唯一目的是发现问题。镜像实现的测试、只测 mock 的测试、为凑覆盖率的测试一律不写;
+  写之前先说清它能抓住什么真实回归。

@@ -1,43 +1,56 @@
-#!/usr/bin/env bash
-# S0 分层验收门汇总器（保留老入口名，只汇总不承载测试细节）。
-# 用法：run_all.sh [--require-release-ready]
-#   两种总判定：
-#     current-env clean = 本环境无 fail（可有 env-blocked / needs-real-machine）
-#     release-ready green = 5 层均 pass 且无 env-blocked
-set -u
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-REQUIRE_RELEASE=0
-if [ "${1:-}" = "--require-release-ready" ]; then
-  REQUIRE_RELEASE=1
-elif [ "$#" -gt 0 ]; then
-  echo "用法: run_all.sh [--require-release-ready]" >&2
-  exit 64
+#!/bin/bash
+# CSSwitch 门禁:三层,全部离线可跑。
+#
+#   1 static   —— cargo fmt --check + clippy(零告警)
+#   2 unit     —— cargo test(补偿链、配置、目录、控制面)
+#   3 loopback —— 起真实服务进程,打真实 HTTP,校验路由与脱敏
+#
+# 真机验收(官方实例 + 真实 provider key)不在此处,见 test/LIVE_ACCEPTANCE.md。
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=_cargo_path.sh
+source "$ROOT/test/_cargo_path.sh"
+ensure_rust_toolchain_on_path || { echo "env-blocked: 找不到 cargo 工具链" >&2; exit 3; }
+
+MANIFEST="$ROOT/desktop/gateway/Cargo.toml"
+fail=0
+
+layer() {
+  local name="$1"; shift
+  echo "── $name ──"
+  if "$@"; then
+    echo "[PASS] $name"
+  else
+    echo "[FAIL] $name"
+    fail=1
+  fi
+  echo
+}
+
+static_layer() {
+  cargo fmt --manifest-path "$MANIFEST" --check || return 1
+  # clippy 的零告警门禁只看本仓库代码:传递依赖的 future-incompat 提示不计入。
+  local out
+  out="$(cargo clippy --manifest-path "$MANIFEST" --all-targets 2>&1)" || return 1
+  local n
+  n="$(printf '%s\n' "$out" | grep -cE '^(warning|error)(\[|:).*' | tr -d ' ')"
+  local ours
+  ours="$(printf '%s\n' "$out" | grep -E '^(warning|error)' | grep -v 'future version of Rust' | grep -cv '^note' | tr -d ' ')"
+  if [ "$ours" != "0" ]; then
+    printf '%s\n' "$out" | grep -E '^(warning|error)' | grep -v 'future version of Rust'
+    return 1
+  fi
+  return 0
+}
+
+layer "1 static  (fmt + clippy)" static_layer
+layer "2 unit    (cargo test)"   cargo test --manifest-path "$MANIFEST" --quiet
+layer "3 loopback(真实服务进程)" bash "$ROOT/test/run_loopback.sh"
+
+if [ "$fail" = "0" ]; then
+  echo "全部通过"
+else
+  echo "存在失败层" >&2
 fi
-LAYERS="offline loopback scripts rust frontend"
-# 注：本机 /bin/bash 是 3.2（macOS 系统自带，不支持 declare -A），
-# 用「STATUS_<layer>」这组固定命名的普通变量代替关联数组，行为等价。
-any_fail=0; not_release=0
-echo "== S0 分层验收门 =="
-for L in $LAYERS; do
-  line="$(bash "test/run-$L.sh" 2>&1 | tee /dev/stderr | grep -E '^S0_LAYER ' | tail -1)"
-  st="$(echo "$line" | awk '{print $3}')"
-  if [ -z "$st" ]; then st="fail"; line="S0_LAYER $L fail (缺少标记行)"; fi   # 无标记行 = 当 fail 处理（不静默）
-  eval "STATUS_$L=\"\$st\""
-  eval "DETAIL_$L=\"\$(echo \"\$line\" | cut -d' ' -f3-)\""
-  case "$st" in
-    fail) any_fail=1; not_release=1 ;;
-    pass) : ;;
-    *) not_release=1 ;;   # env-blocked / skipped / needs-real-machine 都不满足 release-ready
-  esac
-done
-echo "---- 汇总 ----"
-for L in $LAYERS; do
-  eval "detail=\"\$DETAIL_$L\""
-  printf '  %-9s %s\n' "$L" "$detail"
-done
-echo "----"
-if [ "$any_fail" -eq 0 ]; then echo "current-env clean: YES（本环境无 fail）"; else echo "current-env clean: NO（有 fail）"; fi
-if [ "$not_release" -eq 0 ]; then echo "release-ready green: YES（5 层均 pass、无 env-blocked）"; else echo "release-ready green: NO（有 env-blocked / fail，须在具备全部能力的机器复跑）"; fi
-if [ "$any_fail" -ne 0 ]; then exit 1; fi
-if [ "$REQUIRE_RELEASE" -eq 1 ] && [ "$not_release" -ne 0 ]; then exit 2; fi
-exit 0
+exit "$fail"

@@ -1,12 +1,37 @@
 # Science runtime 规则
 
-- Science executable、持久 data-dir、版本 runtime 资源、组织数据和监听进程是不同事实。
-- 新启动按“显式开发 override → 通过固定路径、本地身份与文件安全校验后生成的 updater executable 内容寻址 snapshot → 已安装 App executable → 隔离 cache one-shot”选择，并始终复用 CSSwitch 隔离 data-dir。
-- `SCIENCE_BIN` 仅是显式开发 override；无效时 fail closed。历史缓存绝不能隐式回退。
-- 只允许读取真实 `~/.claude-science` 下固定 executable；通过属主、权限、Mach-O、embedded identifier / Team ID 校验后，将同一次安全打开读取的字节原子提交到 CSSwitch 私有、只读、SHA-256 内容寻址 snapshot，并从 snapshot 执行。检测到候选但校验失败时不得静默回退旧 App。这些本地 metadata 不是官方来源的密码学证明。不得扫描、复制或读取其他账号、组织、配置、runtime 资源或凭证。CSSwitch 不下载或升级 Science，并保持 `--no-auto-update`。
-- Science 与 CSSwitch Gateway 均绑定 loopback；引入或暗示 `0.0.0.0` 需要单独的安全和产品决策。
-- 端口占用或 `status` 成功不能单独证明 runtime 身份；需结合 executable、选择时文件指纹、data-dir、监听 PID 和受管启动身份。选择后 executable 被替换必须 fail closed。
-- 停止成功必须以 sandbox 端口真实关闭为准，不能只信任 Science CLI 的 0 退出码。CLI 假成功时只允许终止停止前后均保持唯一监听且 canonical executable 精确匹配的 PID；身份变化时不得发送信号。
-- 已健康 daemon 不因版本探测或可选功能漂移而强制重启。
-- 外部 Skill route / connector 配置失败只降级该可选功能，不阻断普通 Science 启动。
-- 系统 SSH 默认关闭；一旦用户启用，真实 config 与 packaged wrapper 的安全校验属于 fail-closed 启动条件，不能当作 warning 略过。
+CSSwitch 接管的是**用户自己的官方 Science 实例**,不做数据隔离。以下都是硬约束,
+违反会直接伤到用户的真实实例与真实数据。
+
+## 启动
+
+- 只用用户自己安装的 Science(PATH / `~/.claude-science/bin` / `~/.local/bin`);
+  `CLAUDE_SCIENCE_BIN` 是显式开发 override,无效时 fail closed,不隐式回退别的候选。
+- 启动参数固定为 `serve --port 0 --detached --no-browser`,**禁止**追加:
+  - `--data-dir` / `--config`:会造出隔离实例,用户的对话从此分家;
+  - `--no-auto-update`:官方实例必须保留它自己的自动更新。
+- 只注入 `ANTHROPIC_BASE_URL`;启动前清空 `ANTHROPIC_MODEL` 系列与
+  `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,否则 Science 会绕过网关的模型目录
+  或带着旧凭证跑。
+- 不写、不读、不伪造任何 auth 状态。用户的登录是他自己的。
+
+## 边界
+
+- Science 与 CSSwitch 服务都绑 loopback;引入或暗示 `0.0.0.0` 需要单独的安全与产品决策。
+- 服务配置写 `~/.csswitch/service.v1.json`(0600)。**不得**使用
+  `~/.csswitch/config.json`——那是旧桌面端的文件,它会把不认识的 schema
+  当成自己的旧版本去迁移,结果清空自身 provider 列表(实测踩过)。
+- Science 只在启动时读 base_url,所以切换供应商必须重启 daemon;
+  切换前先校验渠道配置完整,别等到推理时才炸。
+
+## 端点面
+
+- Science 经 base_url 只调 `/v1/messages` 与 `/v1/models`(2026-08 实测)。
+  登录、会话存储、内核、Reviewer 都走 daemon 自身。
+- 其余路径显式 404。新版本 Science 若调用了没见过的端点,应当立刻可见,
+  而不是被一个假的成功响应掩盖。诊断用 `official-passthrough` 子命令枚举端点面。
+
+## 状态判定
+
+- `status` 子命令总是退出 0,靠解析输出判断是否在跑;不能只看退出码。
+- 已健康的 daemon 不因版本探测或可选功能漂移而强制重启。

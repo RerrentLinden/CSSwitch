@@ -32,8 +32,3 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
 url = "2"
 zeroize = "1"
 
-# 托盘常驻入口。仅 macOS 构建需要;服务本身不依赖它。
-[target.'cfg(target_os = "macos")'.dependencies]
-tray-icon = "0.19"
-tao = "0.30"
-muda = "0.15"

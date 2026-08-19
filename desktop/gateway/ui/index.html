@@ -101,6 +101,7 @@
       <button class="act" id="btn-start">启动 Science</button>
       <button class="act" id="btn-stop">停止</button>
       <button class="act" id="btn-open">打开 Science</button>
+      <button class="act" id="btn-quit" style="margin-left:auto">退出服务</button>
     </div>
     <div class="msg" id="mode-msg"></div>
   </section>
@@ -327,6 +328,18 @@ $('btn-open').onclick = async () => {
   } catch (error) {
     msg($('mode-msg'), '获取链接失败:' + error.message, 'err');
   }
+};
+
+$('btn-quit').onclick = async () => {
+  if (!confirm('退出 CSSwitch 服务?Science 会继续运行,但模型请求将无法送达。')) return;
+  try {
+    await api('quit', { method: 'POST' });
+  } catch (error) {
+    // 服务可能在响应写完后立刻退出,连接中断不算失败。
+  }
+  document.querySelector('.wrap').innerHTML =
+    '<div class="card"><h2>服务已退出</h2>' +
+    '<p class="sub">重新运行 <code>./csswitch</code> 即可再次启动。</p></div>';
 };
 
 $('btn-logs').onclick = async () => {
