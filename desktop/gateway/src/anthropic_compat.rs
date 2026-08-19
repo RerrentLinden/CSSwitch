@@ -17,6 +17,8 @@ const RULE_PROVIDER_KIMI_SPECIFIED_TOOL_CHOICE_DISABLES_THINKING: &str =
 const RULE_PROVIDER_KIMI_WEB_SEARCH_RESULT_PAIRING_REPAIR: &str =
     "provider.kimi.web-search-result-pairing-repair";
 const RULE_PROVIDER_KIMI_DOCUMENT_PLACEHOLDER: &str = "provider.kimi.document-block-placeholder";
+const RULE_PROVIDER_KIMI_SCIENCE_CONTEXT_TAIL_REORDER: &str =
+    "provider.kimi.science-context-tail-reorder";
 const MAX_RELAY_HISTORY_BLOCKS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +318,98 @@ fn classify_anthropic_server_tool(tool: &Value) -> Option<AnthropicServerToolKin
     Some(kind)
 }
 
+fn has_typed_web_search(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                classify_anthropic_server_tool(tool) == Some(AnthropicServerToolKind::WebSearch)
+            })
+        })
+}
+
+fn text_only_content(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return (!text.trim().is_empty()).then(|| text.to_string());
+    }
+    let blocks = content.as_array()?;
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            return None;
+        }
+        let part = block.get("text").and_then(Value::as_str)?;
+        text.push_str(part);
+        text.push('\n');
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn is_science_compute_snapshot_message(message: &Value) -> bool {
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let Some(text) = message.get("content").and_then(text_only_content) else {
+        return false;
+    };
+    let text = text.to_ascii_lowercase();
+    text.contains("compute snapshot")
+        && contains_ascii_word(&text, "cores")
+        && (contains_ascii_word(&text, "ram") || contains_gib_spec(&text))
+}
+
+fn contains_ascii_word(text: &str, word: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+fn contains_gib_spec(text: &str) -> bool {
+    let mut previous_was_size = false;
+    for token in text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        if (token == "gib" && previous_was_size)
+            || token
+                .strip_suffix("gib")
+                .is_some_and(|size| !size.is_empty() && size.bytes().all(|ch| ch.is_ascii_digit()))
+        {
+            return true;
+        }
+        previous_was_size = token.bytes().all(|ch| ch.is_ascii_digit());
+    }
+    false
+}
+
+/// Science 把本机 compute snapshot 作为第二条 user message 追加在真实问题之后。
+/// Kimi 原生搜索会把最后一条 user 当成搜索意图;仅在声明 typed web_search 且
+/// 尾部形状与 live A/B 证据完全一致时交换两条消息,上下文内容本身不变。
+fn reorder_science_context_before_user_intent(body: &mut Value, rule_ids: &mut Vec<String>) {
+    if !has_typed_web_search(body) {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let len = messages.len();
+    if len < 2
+        || messages[len - 2].get("role").and_then(Value::as_str) != Some("user")
+        || messages[len - 2]
+            .get("content")
+            .and_then(text_only_content)
+            .is_none()
+        || !is_science_compute_snapshot_message(&messages[len - 1])
+        || is_science_compute_snapshot_message(&messages[len - 2])
+    {
+        return;
+    }
+    messages.swap(len - 2, len - 1);
+    append_rule_id(rule_ids, RULE_PROVIDER_KIMI_SCIENCE_CONTEXT_TAIL_REORDER);
+}
+
 fn unsupported_server_tool_rule(policy: AnthropicServerToolPolicy) -> &'static str {
     match policy {
         AnthropicServerToolPolicy::Kimi => RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER,
@@ -554,7 +648,7 @@ pub fn debug_tool_skeleton(body: &Value) {
         }
     }
     if !out.is_empty() {
-        eprintln!("tool skeleton: {}", out.join(" | "));
+        crate::log_line!("tool skeleton: {}", out.join(" | "));
     }
 }
 
@@ -788,6 +882,7 @@ pub fn transform_relay_request_for_contract(
     let mut rule_ids = Vec::new();
     obj.insert("model".to_string(), Value::String(target_model.clone()));
     if flavor == RelayFlavor::Kimi {
+        reorder_science_context_before_user_intent(&mut body, &mut rule_ids);
         replace_kimi_document_blocks(&mut body, &mut rule_ids);
         debug_tool_skeleton(&body);
         repair_web_search_result_pairing(&mut body, &mut rule_ids);
@@ -899,9 +994,9 @@ mod tests {
         );
     }
 
-    /// Both Kimi templates resolve to one contract, so the open platform now
-    /// bridges web_search exactly as the coding endpoint does instead of
-    /// dropping the declaration.
+    /// Both Kimi templates resolve to one contract: the open platform and the
+    /// coding endpoint share the same compensations, and native web_search
+    /// server tools pass through to either upstream unchanged.
     fn kimi(body: Value) -> (Value, AnthropicMetadata) {
         transform_relay_request_for_contract(
             body,
@@ -922,6 +1017,127 @@ mod tests {
             Some("kimi-anthropic-relay"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn kimi_moves_science_compute_context_before_the_real_search_intent() {
+        // Live A/B 根因形状:Science 把本机上下文作为第二条 user 追加,
+        // Kimi 因此搜索了最后的机器规格而不是第一条 Rust 问题。
+        let intent = json!({"role": "user", "content": [
+            {"type": "text", "text": "联网查询 Rust 最新稳定版与发布日期"}
+        ]});
+        let context = json!({"role": "user", "content": [
+            {"type": "text", "text": "Compute Snapshot\nCPU: 10 cores\nRAM: 32GiB"}
+        ]});
+        let (mapped, metadata) = kimi(json!({
+            "messages": [intent.clone(), context.clone()],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }));
+
+        assert_eq!(mapped["messages"], json!([context, intent]));
+        assert!(metadata
+            .rule_ids
+            .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
+
+        // `GiB` 必须是带数字的容量规格；空格分隔的 `32 GiB` 同样命中。
+        let intent = json!({"role": "user", "content": "查询 Rust"});
+        let context = json!({
+            "role": "user",
+            "content": "Compute Snapshot\nCPU: 10 cores\nMemory: 32 GiB"
+        });
+        let (mapped, metadata) = kimi(json!({
+            "messages": [intent.clone(), context.clone()],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }));
+        assert_eq!(mapped["messages"], json!([context, intent]));
+        assert!(metadata
+            .rule_ids
+            .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
+    }
+
+    #[test]
+    fn science_context_reorder_does_not_escape_its_narrow_kimi_search_boundary() {
+        let typed_search = json!([{"type": "web_search_20250305", "name": "web_search"}]);
+        let context = json!({"role": "user", "content": [
+            {"type": "text", "text": "COMPUTE SNAPSHOT\n10 CORES\n32GIB RAM"}
+        ]});
+        let kimi_untouched = [
+            // 用户单独询问 compute snapshot:没有前一条真实意图,不交换。
+            json!({"messages": [context.clone()], "tools": typed_search.clone()}),
+            // 普通连续 user message 不凭角色形状猜测。
+            json!({"messages": [
+                {"role": "user", "content": "第一条"},
+                {"role": "user", "content": "第二条"}
+            ], "tools": typed_search.clone()}),
+            // 空白占位不算真实用户意图。
+            json!({"messages": [
+                {"role": "user", "content": "   "}, context.clone()
+            ], "tools": typed_search.clone()}),
+            // 单词子串不算 RAM 规格(`program` 含 "ram"),不得宽匹配。
+            json!({"messages": [
+                {"role": "user", "content": "Rust"},
+                {"role": "user", "content": "compute snapshot cores program"}
+            ], "tools": typed_search.clone()}),
+            // `cores` 也必须是独立词，裸 `GiB` 不是容量规格。
+            json!({"messages": [
+                {"role": "user", "content": "Rust"},
+                {"role": "user", "content": "compute snapshot hardcores GiB"}
+            ], "tools": typed_search.clone()}),
+            // 末尾混入非 text 块时不是 text-only synthetic context。
+            json!({"messages": [
+                {"role": "user", "content": "Rust"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Compute Snapshot 10 cores 32GiB RAM"},
+                    {"type": "image", "source": {"type": "base64", "data": "x"}}
+                ]}
+            ], "tools": typed_search.clone()}),
+            // 普通 client tool 不代表原生搜索轮。
+            json!({"messages": [
+                {"role": "user", "content": "Rust"}, context.clone()
+            ], "tools": [{"name": "web_search", "input_schema": {"type": "object"}}]}),
+            // 前一条 user 是工具结果时不能交换，否则会拆断 assistant/tool_result 配对。
+            json!({"messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "python", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                ]},
+                context.clone()
+            ], "tools": typed_search.clone()}),
+        ];
+        for body in kimi_untouched {
+            let before = body["messages"].clone();
+            let (mapped, metadata) = kimi(body);
+            assert_eq!(mapped["messages"], before);
+            assert!(!metadata
+                .rule_ids
+                .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
+        }
+
+        for (contract, model) in [
+            (Some("deepseek-native"), "deepseek-chat"),
+            (Some("generic-anthropic"), "other-model"),
+        ] {
+            let body = json!({
+                "messages": [
+                    {"role": "user", "content": "Rust"}, context.clone()
+                ],
+                "tools": typed_search.clone()
+            });
+            let before = body["messages"].clone();
+            let (mapped, metadata) = transform_relay_request_for_contract(
+                body,
+                model,
+                Some("upstream_default"),
+                contract,
+            )
+            .unwrap();
+            assert_eq!(mapped["messages"], before);
+            assert!(!metadata
+                .rule_ids
+                .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
+        }
     }
 
     #[test]

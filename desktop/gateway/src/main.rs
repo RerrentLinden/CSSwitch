@@ -5,7 +5,7 @@ fn main() {
     // 默认形态:单进程服务(网关 + 控制 API + WebUI)。
     if args.len() == 1 || args.get(1).map(String::as_str) == Some("serve") {
         if let Err(e) = csswitch_gateway::control::serve(port_arg(&args)) {
-            eprintln!("csswitch: {e}");
+            csswitch_gateway::log_line!("csswitch: {e}");
             std::process::exit(1);
         }
         return;
@@ -20,12 +20,12 @@ fn main() {
     match csswitch_gateway::config::GatewayConfig::from_env_args(args) {
         Ok(cfg) => {
             if let Err(e) = csswitch_gateway::server::serve(cfg) {
-                eprintln!("csswitch-gateway: {e}");
+                csswitch_gateway::log_line!("csswitch-gateway: {e}");
                 std::process::exit(1);
             }
         }
         Err(e) => {
-            eprintln!("csswitch-gateway: {e}");
+            csswitch_gateway::log_line!("csswitch-gateway: {e}");
             std::process::exit(2);
         }
     }

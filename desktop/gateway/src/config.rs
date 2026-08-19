@@ -73,7 +73,9 @@ pub fn resolve_relay_thinking(env_value: Option<&str>, contract_policy: &str) ->
         .map(str::to_string);
     match (env, contract) {
         (Some(env), Some(contract)) if env != contract => {
-            eprintln!("relay thinking policy overridden by env: contract={contract} env={env}");
+            crate::log_line!(
+                "relay thinking policy overridden by env: contract={contract} env={env}"
+            );
             Some(env)
         }
         (Some(env), _) => Some(env),

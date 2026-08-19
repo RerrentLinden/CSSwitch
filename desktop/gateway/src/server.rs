@@ -16,6 +16,7 @@ use crate::{
 use crate::kimi_search_noise::{
     RULE_PROVIDER_KIMI_EMPTY_SEARCH_PAIR_STRIP as RULE_PAIR_STRIP,
     RULE_PROVIDER_KIMI_SEARCH_NOISE_TEXT_STRIP as RULE_NOISE_STRIP,
+    RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT as RULE_PAIR_ADOPT,
 };
 
 struct RequestHead {
@@ -165,7 +166,7 @@ fn report_upstream_failure(
     operation: &'static str,
     error: &messages::UpstreamError,
 ) {
-    eprintln!("{}", messages::upstream_failure_metadata(operation, error));
+    crate::log_line!("{}", messages::upstream_failure_metadata(operation, error));
     api_error_json(stream, error.status, &error.detail);
 }
 
@@ -306,7 +307,24 @@ fn stream_strip_rules(stats: &kimi_search_noise::StripStats) -> String {
     if stats.pair_blocks > 0 {
         rules.push(RULE_PAIR_STRIP);
     }
-    rules.join(",")
+    if stats.adopted_pairs > 0 {
+        rules.push(RULE_PAIR_ADOPT);
+    }
+    if rules.is_empty() {
+        // 只有无钥对(仅记数、零改写)时,规则清单为空:净效果为零不记规则。
+        "-".to_string()
+    } else {
+        rules.join(",")
+    }
+}
+
+/// 剥离 / 采钥统计的日志尾部:`adopted=` 恒出现,`unkeyed=` 仅在非零时出现。
+fn strip_stats_suffix(stats: &kimi_search_noise::StripStats) -> String {
+    let mut suffix = format!(" adopted={}", stats.adopted_pairs);
+    if stats.unkeyed_pairs > 0 {
+        suffix.push_str(&format!(" unkeyed={}", stats.unkeyed_pairs));
+    }
+    suffix
 }
 
 fn stream_error_event(detail: &str) -> Vec<u8> {
@@ -658,7 +676,7 @@ where
     // 过滤器失败必须携带真实原因:既写日志也发给客户端,不得降级成
     // 无信息量的通用文案(2026-08-19 的诊断黑洞正是这么来的)。
     let filter_failure = |error: &str, emit: &mut F| {
-        eprintln!("relay stream filter error={error}");
+        crate::log_line!("relay stream filter error={error}");
         if emit(&stream_error_event(&format!(
             "CSSwitch response filter: {error}"
         )))
@@ -731,13 +749,14 @@ where
                         Err(error) => return filter_failure(&error, &mut emit),
                     }
                     let stats = filter.stats();
-                    if stats.total_blocks() > 0 {
-                        eprintln!(
-                            "relay stream rules={} noise={} pair={} bytes={}",
+                    if stats.any_activity() {
+                        crate::log_line!(
+                            "relay stream rules={} noise={} pair={} bytes={}{}",
                             stream_strip_rules(&stats),
                             stats.noise_blocks,
                             stats.pair_blocks,
-                            stats.bytes
+                            stats.bytes,
+                            strip_stats_suffix(&stats)
                         );
                     }
                 }
@@ -764,7 +783,7 @@ where
                                 if !terminal.is_empty() && emit(&terminal).is_err() {
                                     if let Some(rollback) = rollback {
                                         if rollback().is_err() {
-                                            eprintln!("thinking continuity rollback failed");
+                                            crate::log_line!("thinking continuity rollback failed");
                                         }
                                     }
                                     StreamTermination::DownstreamWriteError
@@ -925,7 +944,7 @@ fn log_relay_metadata(
     } else {
         metadata.rule_ids.join(",")
     };
-    eprintln!(
+    crate::log_line!(
         "POST /v1/messages relay target={} stream={} msgs={} thinking_type={} budget_tokens={:?} max_tokens={:?} server_tool_types={} dropped_server_tools={} rules={}",
         metadata.target_model,
         is_stream,
@@ -1028,20 +1047,22 @@ fn handle_messages(
                 if noise_filter.is_some() && resp.status == 200 {
                     if let Ok(mut body) = serde_json::from_slice::<Value>(&resp.body) {
                         let stats = kimi_search_noise::strip_nonstream_noise(&mut body);
-                        if stats.total_blocks() > 0 {
+                        if stats.any_activity() {
+                            crate::log_line!(
+                                "relay nonstream rules={} noise={} pair={} bytes={}{}",
+                                stream_strip_rules(&stats),
+                                stats.noise_blocks,
+                                stats.pair_blocks,
+                                stats.bytes,
+                                strip_stats_suffix(&stats)
+                            );
+                        }
+                        // 采钥即使零剥离也改写了 body,必须重序列化。
+                        if stats.rewrote_body() {
                             match serde_json::to_vec(&body) {
-                                Ok(stripped) => {
-                                    eprintln!(
-                                        "relay nonstream rules={} noise={} pair={} bytes={}",
-                                        stream_strip_rules(&stats),
-                                        stats.noise_blocks,
-                                        stats.pair_blocks,
-                                        stats.bytes
-                                    );
-                                    resp.body = stripped;
-                                }
+                                Ok(stripped) => resp.body = stripped,
                                 Err(error) => {
-                                    eprintln!(
+                                    crate::log_line!(
                                         "relay nonstream noise strip serialization failed: {error}"
                                     );
                                     api_error_json(
@@ -1257,8 +1278,28 @@ mod tests {
 
     use super::{
         forward_stream_body, relay_server_tool_types, relay_thinking_type, stream_error_event,
-        StreamTermination,
+        stream_strip_rules, strip_stats_suffix, StreamTermination,
     };
+
+    #[test]
+    fn kimi_search_adoption_rule_and_stats_are_logged_without_false_rules() {
+        let adopted = crate::kimi_search_noise::StripStats {
+            adopted_pairs: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            stream_strip_rules(&adopted),
+            crate::kimi_search_noise::RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT
+        );
+        assert_eq!(strip_stats_suffix(&adopted), " adopted=2");
+
+        let unkeyed = crate::kimi_search_noise::StripStats {
+            unkeyed_pairs: 1,
+            ..Default::default()
+        };
+        assert_eq!(stream_strip_rules(&unkeyed), "-");
+        assert_eq!(strip_stats_suffix(&unkeyed), " adopted=0 unkeyed=1");
+    }
 
     struct FailingReader;
 

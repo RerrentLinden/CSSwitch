@@ -48,10 +48,32 @@ fi
 # shellcheck source=test/_cargo_path.sh
 source "$ROOT/test/_cargo_path.sh"
 BIN="$ROOT/desktop/gateway/target/release/csswitch-gateway"
+GATEWAY="$ROOT/desktop/gateway"
+
+# 构建门:二进制缺失,或任一源码 / 清单比二进制新,都必须重建后再启动。
+# 曾经只在缺失时构建,「改完源码重启」静默等于「继续跑旧版」(2026-08-19 实锤)。
+SOURCES=(
+  "$GATEWAY/src"
+  "$GATEWAY/ui"
+  "$GATEWAY/Cargo.toml"
+  "$ROOT/catalog/provider-contracts.v1.json"
+)
+[ -f "$GATEWAY/Cargo.lock" ] && SOURCES+=("$GATEWAY/Cargo.lock")
+
+build_reason=""
 if [ ! -x "$BIN" ]; then
-  ensure_rust_toolchain_on_path || { echo "找不到 cargo 工具链,且没有已构建的二进制" >&2; exit 1; }
-  echo "首次运行,正在构建…"
-  cargo build --release --manifest-path "$ROOT/desktop/gateway/Cargo.toml" || exit 1
+  build_reason="首次运行,尚无二进制"
+elif [ -n "$(find "${SOURCES[@]}" -newer "$BIN" -print -quit 2>/dev/null)" ]; then
+  build_reason="源码比二进制新"
+fi
+
+if [ -n "$build_reason" ]; then
+  ensure_rust_toolchain_on_path || { echo "找不到 cargo 工具链,无法构建网关" >&2; exit 1; }
+  echo "$build_reason,正在构建…"
+  if ! cargo build --release --manifest-path "$GATEWAY/Cargo.toml"; then
+    echo "构建失败:不启动(也不会回退到旧二进制)。" >&2
+    exit 1
+  fi
 fi
 
 # 控制台在服务就绪后再开,避免打开一个空白页。

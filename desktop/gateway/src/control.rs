@@ -65,7 +65,8 @@ pub fn serve(port_override: Option<u16>) -> Result<(), String> {
     let state = Arc::new(AppState::new(profile, port));
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("无法监听 127.0.0.1:{port}:{e}"))?;
-    println!("CSSwitch 控制台: http://127.0.0.1:{port}/");
+    // 启动横幅同样落进 service.log,与其余日志行统一走带时间戳的格式。
+    crate::log_line!("CSSwitch 控制台: http://127.0.0.1:{port}/");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {

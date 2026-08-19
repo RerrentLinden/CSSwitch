@@ -1,6 +1,6 @@
 //! Kimi 搜索轮响应侧的噪声整形。
 //!
-//! 两条窄规则,证据均来自 2026-08-19 的隔离探测与真实会话
+//! 三条窄规则,证据均来自 2026-08-19 的隔离探测与真实会话
 //! (任务研究记录 2026-08-19-native-probe.md / 2026-08-19-live-evidence.md):
 //!
 //! 1. **噪声头剥离** `provider.kimi.search-noise-text-strip`
@@ -11,13 +11,23 @@
 //!
 //! 2. **空壳搜索对剥离** `provider.kimi.empty-search-pair-strip`
 //!    模型被告知无需搜索时,上游仍可能发出幻影对:`server_tool_use` 连 id 都
-//!    没有,紧跟 `content: []` 的 `web_search_tool_result`。该对经 Science 落盘
-//!    后成为无 id 孤儿结果块,此后每一轮都 400 `tool_call_id is not found`
-//!    (真实会话复现);UI 侧则渲染为一个空的 Server Tool 框。整对剥离。
-//!    带 id 的真实零结果搜索不受影响。
+//!    没有,紧跟 `content: []` 的 `web_search_tool_result`(同样无 tool_use_id)。
+//!    该对经 Science 落盘后成为无 id 孤儿结果块,此后每一轮都 400
+//!    `tool_call_id is not found`(真实会话复现);UI 侧则渲染为一个空的
+//!    Server Tool 框。整对剥离。判据收窄为**两半都无键且内容为空**
+//!    (与探测记录的幻影形态精确一致);带键的空结果是真实零结果搜索,走采钥保留。
+//!
+//! 3. **搜索对配对键采钥** `provider.kimi.search-pair-id-adopt`
+//!    真实搜索对的两半配对键恒不匹配:`server_tool_use.id` 为 `tool_…`,
+//!    `web_search_tool_result.tool_use_id` 为 `srvtoolu_…`(live 证据 D5)。
+//!    原样放行会让 Science 落盘时丢弃无法配对的 `server_tool_use`,查询词永久
+//!    丢失,此后每轮请求都依赖请求侧 pairing-repair 以空壳兜底。放行前把
+//!    `use.id` 改写为同对结果块的 `tool_use_id`(**只采用上游已有的键,
+//!    不发明新键**);result 侧无键而 use 侧有键时反向补齐。两半都无键的
+//!    非空对不归一,如实放行仅记数。采钥不改变块数与索引。
 //!
 //! 被吞的块不占用输出索引(后续块索引前移补洞);**未命中的流量保持字节级
-//! 零改写**。规则 ID 与吞块计数记入服务日志。
+//! 零改写**。规则 ID 与吞块 / 采钥计数记入服务日志。
 
 use serde_json::Value;
 
@@ -27,6 +37,7 @@ pub const RULE_PROVIDER_KIMI_SEARCH_NOISE_TEXT_STRIP: &str =
     "provider.kimi.search-noise-text-strip";
 pub const RULE_PROVIDER_KIMI_EMPTY_SEARCH_PAIR_STRIP: &str =
     "provider.kimi.empty-search-pair-strip";
+pub const RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT: &str = "provider.kimi.search-pair-id-adopt";
 
 /// 上游注入的噪声头前缀(实测恒定)。
 pub const NOISE_PREFIX: &str = "Search results for query:";
@@ -49,7 +60,8 @@ struct PendingText {
 
 /// 待判 `server_tool_use` 块:块结束后还要看下一个块才能拍板。
 struct PendingServerTool {
-    has_id: bool,
+    /// 块首帧携带的非空 id(采钥判定要比较键值,不只看有无)。
+    id: Option<String>,
     closed: bool,
 }
 
@@ -70,11 +82,25 @@ pub struct StripStats {
     pub noise_blocks: usize,
     pub pair_blocks: usize,
     pub bytes: usize,
+    /// 被采钥归一的搜索对数(每对计 1)。
+    pub adopted_pairs: usize,
+    /// 两半都无键但内容非空、如实放行的对数(仅记日志,不改写)。
+    pub unkeyed_pairs: usize,
 }
 
 impl StripStats {
     pub fn total_blocks(&self) -> usize {
         self.noise_blocks + self.pair_blocks
+    }
+
+    /// 是否有任何剥离 / 采钥 / 无钥对——决定要不要记日志。
+    pub fn any_activity(&self) -> bool {
+        self.total_blocks() > 0 || self.adopted_pairs > 0 || self.unkeyed_pairs > 0
+    }
+
+    /// 是否改写过响应内容——决定非流式要不要重序列化 body。
+    pub fn rewrote_body(&self) -> bool {
+        self.total_blocks() > 0 || self.adopted_pairs > 0
     }
 }
 
@@ -222,40 +248,73 @@ impl SearchNoiseFilter {
         sep: &[u8],
     ) -> Result<Vec<u8>, String> {
         let index = block_index(&obj)?;
-        // 已关闭的 server_tool_use 待判块:下一个块揭晓答案。
-        if let Some(pending) = self.pending.as_ref() {
-            if let PendingKind::ServerTool(server) = &pending.kind {
-                if server.closed {
-                    let block = obj.get("content_block").and_then(Value::as_object);
-                    let is_empty_result = block
-                        .and_then(|block| block.get("type"))
-                        .and_then(Value::as_str)
-                        == Some("web_search_tool_result")
-                        && block
-                            .and_then(|block| block.get("content"))
-                            .and_then(Value::as_array)
-                            .is_none_or(|content| content.is_empty());
-                    if !server.has_id && is_empty_result {
-                        // 空壳对:吞掉整对。
-                        let pending = self.pending.take().expect("checked above");
-                        let mut out = Vec::new();
-                        for held in pending.held {
-                            if held.belongs_to_block {
-                                self.stats.bytes += held.bytes.len();
-                            } else {
-                                out.extend_from_slice(&held.bytes);
-                            }
+        // 已关闭的 server_tool_use 待判块:下一个块揭晓配对。
+        let closed_server_use_id = match self.pending.as_ref() {
+            Some(Pending {
+                kind: PendingKind::ServerTool(server),
+                ..
+            }) if server.closed => Some(server.id.clone()),
+            _ => None,
+        };
+        if let Some(use_id) = closed_server_use_id {
+            let block = obj.get("content_block").and_then(Value::as_object);
+            let is_result = block
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                == Some("web_search_tool_result");
+            if is_result {
+                let result_key = block
+                    .and_then(|block| block.get("tool_use_id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                let content_empty = block
+                    .and_then(|block| block.get("content"))
+                    .and_then(Value::as_array)
+                    .is_none_or(|content| content.is_empty());
+                // 幻影对(两半都无键、内容为空,与探测形态精确一致):吞掉整对。
+                if use_id.is_none() && result_key.is_none() && content_empty {
+                    let pending = self.pending.take().expect("checked above");
+                    let mut out = Vec::new();
+                    for held in pending.held {
+                        if held.belongs_to_block {
+                            self.stats.bytes += held.bytes.len();
+                        } else {
+                            out.extend_from_slice(&held.bytes);
                         }
-                        self.count_swallowed_block(SwallowKind::Pair);
-                        self.stats.bytes += frame.len() + sep.len();
-                        self.swallowing = Some((index, SwallowKind::Pair));
-                        return Ok(out);
                     }
-                    let mut out = self.flush_pending();
-                    out.extend_from_slice(&self.start_new_block(index, event, obj, frame, sep)?);
+                    self.count_swallowed_block(SwallowKind::Pair);
+                    self.stats.bytes += frame.len() + sep.len();
+                    self.swallowing = Some((index, SwallowKind::Pair));
                     return Ok(out);
                 }
+                // 采钥:以 result 侧上游已有的键为准,把 use.id 归一成同一值。
+                if let Some(key) = result_key {
+                    if use_id.as_deref() != Some(key.as_str()) {
+                        let mut out = self.flush_pending_adopting(Some(&key));
+                        out.extend_from_slice(
+                            &self.start_new_block(index, event, obj, frame, sep)?,
+                        );
+                        self.stats.adopted_pairs += 1;
+                        return Ok(out);
+                    }
+                    // 已配对(id == key):零命中,原样放行。
+                } else if let Some(use_key) = use_id {
+                    // 反向采钥:use 有键、result 无键 → 结果块补上 use 侧的键。
+                    let mut out = self.flush_pending();
+                    out.extend_from_slice(
+                        &self.pass_result_start_with_key(index, event, obj, &use_key),
+                    );
+                    self.stats.adopted_pairs += 1;
+                    return Ok(out);
+                } else {
+                    // 两半都无键但内容非空:不发明配对键,如实放行,仅记数。
+                    self.stats.unkeyed_pairs += 1;
+                }
             }
+            let mut out = self.flush_pending();
+            out.extend_from_slice(&self.start_new_block(index, event, obj, frame, sep)?);
+            return Ok(out);
         }
         if self.pending.is_some() || self.swallowing.is_some() {
             return Err("Kimi noise strip saw overlapping content blocks".into());
@@ -292,16 +351,14 @@ impl SearchNoiseFilter {
                 Ok(self.decide_text())
             }
             Some("server_tool_use") => {
-                let has_id = block
+                let id = block
                     .and_then(|block| block.get("id"))
                     .and_then(Value::as_str)
-                    .is_some_and(|id| !id.is_empty());
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
                 self.pending = Some(Pending {
                     upstream_index: index,
-                    kind: PendingKind::ServerTool(PendingServerTool {
-                        has_id,
-                        closed: false,
-                    }),
+                    kind: PendingKind::ServerTool(PendingServerTool { id, closed: false }),
                     held: Vec::new(),
                     held_bytes: 0,
                 });
@@ -351,6 +408,12 @@ impl SearchNoiseFilter {
 
     /// 把未定块按"保留"放行:块首帧登记索引映射,已关闭的块最后清空敞开状态。
     fn flush_pending(&mut self) -> Vec<u8> {
+        self.flush_pending_adopting(None)
+    }
+
+    /// 同 [`Self::flush_pending`],但 `adopt_id` 非空时把块首帧的
+    /// `content_block.id` 采钥为该值后重渲(索引照常登记,不产生空洞)。
+    fn flush_pending_adopting(&mut self, adopt_id: Option<&str>) -> Vec<u8> {
         let Some(pending) = self.pending.take() else {
             return Vec::new();
         };
@@ -365,7 +428,8 @@ impl SearchNoiseFilter {
                 out.extend_from_slice(&held.bytes);
                 continue;
             }
-            if self.stripped_blocks == 0 {
+            let adopt_this_frame = adopt_id.is_some() && !block_started;
+            if self.stripped_blocks == 0 && !adopt_this_frame {
                 // 零命中路径:字节级零改写。
                 if !block_started {
                     block_started = true;
@@ -381,19 +445,31 @@ impl SearchNoiseFilter {
                 continue;
             };
             let (event, data) = event_and_data(&frame);
-            let Ok(obj) = serde_json::from_slice::<Value>(&data) else {
+            let Ok(mut obj) = serde_json::from_slice::<Value>(&data) else {
                 out.extend_from_slice(&held.bytes);
                 continue;
             };
             if !block_started {
                 block_started = true;
-                out.extend_from_slice(&self.pass_block_start(
-                    pending.upstream_index,
-                    event.as_deref(),
-                    obj,
-                    &frame,
-                    &sep,
-                ));
+                if let Some(key) = adopt_id {
+                    if let Some(block) = obj.get_mut("content_block").and_then(Value::as_object_mut)
+                    {
+                        block.insert("id".to_string(), Value::String(key.to_string()));
+                    }
+                    out.extend_from_slice(&self.render_block_start(
+                        pending.upstream_index,
+                        event.as_deref(),
+                        obj,
+                    ));
+                } else {
+                    out.extend_from_slice(&self.pass_block_start(
+                        pending.upstream_index,
+                        event.as_deref(),
+                        obj,
+                        &frame,
+                        &sep,
+                    ));
+                }
             } else {
                 out.extend_from_slice(&self.pass_indexed(
                     pending.upstream_index,
@@ -456,6 +532,38 @@ impl SearchNoiseFilter {
         self.rewrite_or_pass(output_index, upstream_index, event, obj, frame, sep)
     }
 
+    /// 块首帧强制重渲(索引照常登记):即使输出索引不变,也要携带改写后的字段。
+    fn render_block_start(
+        &mut self,
+        upstream_index: u64,
+        event: Option<&str>,
+        mut obj: Value,
+    ) -> Vec<u8> {
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        self.active_output_block = Some((upstream_index, output_index));
+        if output_index != upstream_index {
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("index".to_string(), Value::Number(output_index.into()));
+            }
+        }
+        render_sse(event, &obj)
+    }
+
+    /// 反向采钥:result 块首帧补上 use 侧的键后放行。
+    fn pass_result_start_with_key(
+        &mut self,
+        upstream_index: u64,
+        event: Option<&str>,
+        mut obj: Value,
+        key: &str,
+    ) -> Vec<u8> {
+        if let Some(block) = obj.get_mut("content_block").and_then(Value::as_object_mut) {
+            block.insert("tool_use_id".to_string(), Value::String(key.to_string()));
+        }
+        self.render_block_start(upstream_index, event, obj)
+    }
+
     fn pass_indexed(
         &mut self,
         upstream_index: u64,
@@ -502,7 +610,8 @@ fn split_held(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((frame, sep))
 }
 
-/// 非流式响应的同一对规则:删除噪声头 text 块与空壳搜索对。
+/// 非流式响应的同一套规则:删除噪声头 text 块与空壳搜索对,并对相邻搜索对
+/// 做与流式一致的配对键采钥。
 pub fn strip_nonstream_noise(response: &mut Value) -> StripStats {
     let mut stats = StripStats::default();
     let Some(content) = response.get_mut("content").and_then(Value::as_array_mut) else {
@@ -511,7 +620,7 @@ pub fn strip_nonstream_noise(response: &mut Value) -> StripStats {
     let mut kept: Vec<Value> = Vec::with_capacity(content.len());
     let drained = std::mem::take(content);
     let mut iter = drained.into_iter().peekable();
-    while let Some(block) = iter.next() {
+    while let Some(mut block) = iter.next() {
         let block_type = block.get("type").and_then(Value::as_str);
         if block_type == Some("text") {
             let is_noise = block
@@ -529,20 +638,54 @@ pub fn strip_nonstream_noise(response: &mut Value) -> StripStats {
             }
         }
         if block_type == Some("server_tool_use") {
-            let has_id = block
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.is_empty());
-            let next_is_empty_result = iter.peek().is_some_and(|next| {
+            let next_is_result = iter.peek().is_some_and(|next| {
                 next.get("type").and_then(Value::as_str) == Some("web_search_tool_result")
-                    && next
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .is_none_or(|content| content.is_empty())
             });
-            if !has_id && next_is_empty_result {
-                iter.next();
-                stats.pair_blocks += 2;
+            if next_is_result {
+                let mut result = iter.next().expect("peeked above");
+                let use_id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                let result_key = result
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                let content_empty = result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_none_or(|content| content.is_empty());
+                match (use_id, result_key) {
+                    // 幻影对(两半都无键、内容为空):整对剥离。
+                    (None, None) if content_empty => {
+                        stats.pair_blocks += 2;
+                        continue;
+                    }
+                    // 采钥:以 result 侧上游已有的键为准。
+                    (use_id, Some(key)) if use_id.as_deref() != Some(key.as_str()) => {
+                        if let Some(map) = block.as_object_mut() {
+                            map.insert("id".to_string(), Value::String(key));
+                        }
+                        stats.adopted_pairs += 1;
+                    }
+                    // 反向采钥:use 有键、result 无键。
+                    (Some(use_key), None) => {
+                        if let Some(map) = result.as_object_mut() {
+                            map.insert("tool_use_id".to_string(), Value::String(use_key));
+                        }
+                        stats.adopted_pairs += 1;
+                    }
+                    // 两半都无键但内容非空:不发明配对键,仅记数。
+                    (None, None) => {
+                        stats.unkeyed_pairs += 1;
+                    }
+                    // 已配对(id == key):零改写。
+                    _ => {}
+                }
+                kept.push(block);
+                kept.push(result);
                 continue;
             }
         }
@@ -688,21 +831,27 @@ mod tests {
             ]
         );
         assert_eq!(content[3]["text"], "真正的回答");
+        // 探测 1b 的真实形态两半键恒不匹配(tool_… vs srvtoolu_…),
+        // 采钥后必须以 result 侧的键配成一对,Science 才能落盘保住查询词。
+        assert_eq!(content[0]["id"], "srvtoolu_x");
+        assert_eq!(content[1]["tool_use_id"], "srvtoolu_x");
         assert_eq!(filter.stats().noise_blocks, 1);
         assert_eq!(filter.stats().pair_blocks, 0);
+        assert_eq!(filter.stats().adopted_pairs, 1);
         assert!(filter.stats().bytes > 0);
     }
 
     #[test]
     fn strips_the_dangling_trailing_noise_header() {
         // 探测 4(K2.7)形态:结尾悬挂噪声头,没有答案文本。
+        // 搜索对用已配对的键,让本测试只盯噪声头剥离。
         let frames = vec![
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Search results for query: q1"}}),
             json!({"type":"content_block_stop","index":0}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"tool_a","name":"web_search"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_a","name":"web_search"}}),
             json!({"type":"content_block_stop","index":1}),
-            json!({"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_a","content":[{"type":"web_search_result","url":"https://example.test","title":"t"}]}}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_a","content":[{"type":"web_search_result","url":"https://example.test","title":"t"}]}}),
             json!({"type":"content_block_stop","index":2}),
             json!({"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}),
             json!({"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"Search results for query: q2 下一轮"}}),
@@ -740,13 +889,13 @@ mod tests {
     }
 
     #[test]
-    fn keeps_a_real_zero_result_search_that_carries_an_id() {
-        // 带 id 的零结果搜索是真实事件,不剥。
+    fn keeps_a_matched_zero_result_search_byte_identical() {
+        // 已配对(id == tool_use_id)的真实零结果搜索:零命中,字节级原样。
         let frames = vec![
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"tool_real","name":"web_search"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_same","name":"web_search"}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"nothing\"}"}}),
             json!({"type":"content_block_stop","index":0}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_real","content":[]}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_same","content":[]}}),
             json!({"type":"content_block_stop","index":1}),
             json!({"type":"message_stop"}),
         ];
@@ -754,7 +903,100 @@ mod tests {
         let mut filter = SearchNoiseFilter::new();
         let mut out = filter.feed(&input).unwrap();
         out.extend_from_slice(&filter.finalize().unwrap());
-        assert_eq!(out, input, "id-carrying pairs must pass byte identical");
+        assert_eq!(out, input, "matched pairs must pass byte identical");
+        assert_eq!(filter.stats().total_blocks(), 0);
+        assert_eq!(filter.stats().adopted_pairs, 0);
+        assert_eq!(filter.stats().unkeyed_pairs, 0);
+    }
+
+    #[test]
+    fn stream_adoption_rewrites_an_idless_use_to_the_result_key() {
+        // D5 采钥主路径:use 半无 id,result 半带 srvtoolu 键。
+        // 期望输出可精确构造:preserve_order 下新插入的 id 追加在
+        // content_block 末尾,其余帧字节不变、索引不变。
+        let input_frames = vec![
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_k","content":[{"type":"web_search_result","url":"https://example.test","title":"t"}]}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut expected_frames = input_frames.clone();
+        expected_frames[0] = json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search","id":"srvtoolu_k"}});
+        let mut filter = SearchNoiseFilter::new();
+        let mut out = filter.feed(&sse(&input_frames)).unwrap();
+        out.extend_from_slice(&filter.finalize().unwrap());
+        assert_eq!(out, sse(&expected_frames));
+        assert_eq!(filter.stats().adopted_pairs, 1);
+        assert_eq!(filter.stats().unkeyed_pairs, 0);
+        assert_eq!(filter.stats().total_blocks(), 0);
+    }
+
+    #[test]
+    fn stream_adoption_backfills_a_keyless_result_from_the_use_id() {
+        // 反向采钥:use 有键、result 无键 → result 补上 use 侧的键。
+        let input_frames = vec![
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"tool_u","name":"web_search"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"https://example.test","title":"t"}]}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut expected_frames = input_frames.clone();
+        expected_frames[2] = json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"https://example.test","title":"t"}],"tool_use_id":"tool_u"}});
+        let mut filter = SearchNoiseFilter::new();
+        let mut out = filter.feed(&sse(&input_frames)).unwrap();
+        out.extend_from_slice(&filter.finalize().unwrap());
+        assert_eq!(out, sse(&expected_frames));
+        assert_eq!(filter.stats().adopted_pairs, 1);
+        assert_eq!(filter.stats().total_blocks(), 0);
+    }
+
+    #[test]
+    fn a_keyed_empty_result_pair_is_adopted_not_stripped() {
+        // 收窄回归防线:带 srvtoolu 键的空结果是真实零结果搜索。
+        // 旧判据(无 use.id + 空 content,不看 result 键)会把它整对剥掉。
+        let frames = vec![
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_z","content":[]}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut filter = SearchNoiseFilter::new();
+        let mut out = filter.feed(&sse(&frames)).unwrap();
+        out.extend_from_slice(&filter.finalize().unwrap());
+        let (content, _) = reconstruct(&out);
+        let kinds: Vec<&str> = content
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["server_tool_use", "web_search_tool_result"]);
+        assert_eq!(content[0]["id"], "srvtoolu_z");
+        assert_eq!(content[1]["tool_use_id"], "srvtoolu_z");
+        assert_eq!(filter.stats().pair_blocks, 0);
+        assert_eq!(filter.stats().adopted_pairs, 1);
+    }
+
+    #[test]
+    fn an_unkeyed_pair_with_content_passes_byte_identical() {
+        // 两半都无键但内容非空:不发明配对键,如实放行,仅记数。
+        let frames = vec![
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"https://example.test","title":"t"}]}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_stop"}),
+        ];
+        let input = sse(&frames);
+        let mut filter = SearchNoiseFilter::new();
+        let mut out = filter.feed(&input).unwrap();
+        out.extend_from_slice(&filter.finalize().unwrap());
+        assert_eq!(out, input, "unkeyed pairs must not get invented keys");
+        assert_eq!(filter.stats().unkeyed_pairs, 1);
+        assert_eq!(filter.stats().adopted_pairs, 0);
         assert_eq!(filter.stats().total_blocks(), 0);
     }
 
@@ -811,8 +1053,12 @@ mod tests {
             .collect();
         assert_eq!(kinds, ["server_tool_use", "web_search_tool_result", "text"]);
         assert_eq!(content[2]["text"], "答案");
+        // 采钥与剥离叠加:被保留的真实对在索引前移的同时完成配对键归一。
+        assert_eq!(content[0]["id"], "srv_a");
+        assert_eq!(content[1]["tool_use_id"], "srv_a");
         assert_eq!(filter.stats().noise_blocks, 1);
         assert_eq!(filter.stats().pair_blocks, 2);
+        assert_eq!(filter.stats().adopted_pairs, 1);
     }
 
     #[test]
@@ -932,12 +1178,13 @@ mod tests {
 
     #[test]
     fn nonstream_strip_removes_noise_blocks_and_phantom_pairs_only() {
+        // 搜索对用已配对的键,让本测试只盯剥离行为。
         let mut response = json!({
             "id": "msg_3",
             "content": [
                 {"type": "text", "text": "Search results for query: q"},
-                {"type": "server_tool_use", "id": "tool_a", "name": "web_search", "input": {}},
-                {"type": "web_search_tool_result", "tool_use_id": "srv_a", "content": [{"type": "web_search_result", "url": "https://example.test"}]},
+                {"type": "server_tool_use", "id": "srvtoolu_a", "name": "web_search", "input": {}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_a", "content": [{"type": "web_search_result", "url": "https://example.test"}]},
                 {"type": "server_tool_use", "name": "web_search"},
                 {"type": "web_search_tool_result", "content": []},
                 {"type": "text", "text": "真正的回答"},
@@ -947,6 +1194,7 @@ mod tests {
         let stats = strip_nonstream_noise(&mut response);
         assert_eq!(stats.noise_blocks, 1);
         assert_eq!(stats.pair_blocks, 2);
+        assert_eq!(stats.adopted_pairs, 0);
         let kinds: Vec<&str> = response["content"]
             .as_array()
             .unwrap()
@@ -956,12 +1204,64 @@ mod tests {
         assert_eq!(kinds, ["server_tool_use", "web_search_tool_result", "text"]);
 
         let mut untouched = json!({"content": [
-            {"type": "server_tool_use", "id": "tool_b", "name": "web_search", "input": {}},
-            {"type": "web_search_tool_result", "tool_use_id": "srv_b", "content": []},
+            {"type": "server_tool_use", "id": "srvtoolu_b", "name": "web_search", "input": {}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_b", "content": []},
             {"type": "text", "text": "平常"},
         ]});
         let before = untouched.clone();
-        assert_eq!(strip_nonstream_noise(&mut untouched).total_blocks(), 0);
+        let untouched_stats = strip_nonstream_noise(&mut untouched);
+        assert_eq!(untouched_stats.total_blocks(), 0);
+        assert!(!untouched_stats.any_activity());
         assert_eq!(untouched, before);
+    }
+
+    #[test]
+    fn nonstream_adoption_follows_the_same_matrix() {
+        let mut response = json!({
+            "id": "msg_4",
+            "content": [
+                // 采钥:use 无 id + result 带键。
+                {"type": "server_tool_use", "name": "web_search", "input": {"query": "a"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_a", "content": [{"type": "web_search_result", "url": "https://example.test"}]},
+                // 采钥:use 与 result 都有键但不匹配(真实 D5 形态)。
+                {"type": "server_tool_use", "id": "tool_e", "name": "web_search", "input": {"query": "e"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_e", "content": [{"type": "web_search_result", "url": "https://example.test"}]},
+                // 反向采钥:use 有键 + result 无键。
+                {"type": "server_tool_use", "id": "tool_b", "name": "web_search", "input": {"query": "b"}},
+                {"type": "web_search_tool_result", "content": [{"type": "web_search_result", "url": "https://example.test"}]},
+                // 带键空结果:采钥保留,不当幻影剥(收窄回归防线)。
+                {"type": "server_tool_use", "name": "web_search", "input": {"query": "c"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_c", "content": []},
+                // 幻影对:两半都无键且内容为空 → 剥离。
+                {"type": "server_tool_use", "name": "web_search"},
+                {"type": "web_search_tool_result", "content": []},
+                // 两半都无键但内容非空 → 如实放行,仅记数。
+                {"type": "server_tool_use", "name": "web_search", "input": {"query": "d"}},
+                {"type": "web_search_tool_result", "content": [{"type": "web_search_result", "url": "https://example.test"}]},
+                {"type": "text", "text": "回答"},
+            ],
+            "stop_reason": "end_turn",
+        });
+        let stats = strip_nonstream_noise(&mut response);
+        assert_eq!(stats.adopted_pairs, 4);
+        assert_eq!(stats.unkeyed_pairs, 1);
+        assert_eq!(stats.pair_blocks, 2);
+        assert_eq!(stats.noise_blocks, 0);
+        assert!(stats.any_activity());
+        assert!(stats.rewrote_body());
+        let content = response["content"].as_array().unwrap();
+        assert_eq!(content.len(), 11);
+        assert_eq!(content[0]["id"], "srvtoolu_a");
+        assert_eq!(content[1]["tool_use_id"], "srvtoolu_a");
+        assert_eq!(content[2]["id"], "srvtoolu_e");
+        assert_eq!(content[3]["tool_use_id"], "srvtoolu_e");
+        assert_eq!(content[4]["id"], "tool_b");
+        assert_eq!(content[5]["tool_use_id"], "tool_b");
+        assert_eq!(content[6]["id"], "srvtoolu_c");
+        assert_eq!(content[7]["tool_use_id"], "srvtoolu_c");
+        // 无钥对不得被发明键。
+        assert!(content[8].get("id").is_none());
+        assert!(content[9].get("tool_use_id").is_none());
+        assert_eq!(content[10]["text"], "回答");
     }
 }
