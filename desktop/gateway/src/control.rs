@@ -261,11 +261,27 @@ fn switch_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String
     }
 
     // Science 只在启动时读 base_url,所以切换必须重启 daemon。
-    let restarted = if crate::science::status()
+    // 重启会打断进行中的会话(Science 侧标记为 "interrupted by a restart"),
+    // 因此有活跃会话时必须显式确认,不能默默切。
+    let science = crate::science::status();
+    let running = science
         .get("running")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let active = science
+        .pointer("/detail/daemon/active_conversations")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let forced = payload
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if running && active > 0 && !forced {
+        return Err(format!(
+            "有 {active} 个会话正在进行,切换会重启 Science 并打断它们。确认后重试。"
+        ));
+    }
+    let restarted = if running {
         crate::science::stop()?;
         std::thread::sleep(Duration::from_millis(600));
         crate::science::start(&format!("http://127.0.0.1:{}", state.port))?;

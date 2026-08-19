@@ -234,13 +234,13 @@ async function refresh() {
   renderScience();
 }
 
-async function switchMode(mode) {
+async function switchMode(mode, force) {
   if (mode === state.mode) return;
   try {
     const result = await api('switch', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify(force ? { mode, force: true } : { mode }),
     });
     scienceUrl = result.url || null;
     msg($('mode-msg'), result.science_restarted
@@ -248,6 +248,11 @@ async function switchMode(mode) {
       : `已切换到${result.mode_label}。启动 Science 后生效。`);
     await refresh();
   } catch (error) {
+    // 有会话在跑时服务会要求确认,而不是默默打断它们。
+    if (!force && /会话正在进行/.test(error.message)) {
+      if (confirm(error.message + '\n\n仍要切换吗?')) return switchMode(mode, true);
+      return;
+    }
     msg($('mode-msg'), '切换失败:' + error.message, 'err');
   }
 }
