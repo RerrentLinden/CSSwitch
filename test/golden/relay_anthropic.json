@@ -2,7 +2,7 @@
   "force_mapped": {
     "max_tokens": 1000000,
     "messages": [],
-    "model": "MiniMax-M2"
+    "model": "k3"
   },
   "force_request": {
     "max_tokens": 1000000,
@@ -12,7 +12,7 @@
   "force_rule_ids": [
     "provider.relay.force-model-shell"
   ],
-  "force_target_model": "MiniMax-M2",
+  "force_target_model": "k3",
   "kimi_mapped": {
     "max_tokens": 2048,
     "messages": [],
