@@ -59,6 +59,26 @@ DSML shim。现在全部退役:上游要的只是"历史里有 thinking 块",占
 模型清单不在 `/anthropic` 路径下(`/anthropic/v1/models` 返回 404 空体),
 在根域 `/v1/models`;控制台的模型探测会依次尝试这两个地址。
 
+## 长对话复测(2026-08-19)
+
+同一会话追加到 **31 条消息**(多轮 Python 内核 + PubMed MCP connector 调用),
+`provider.deepseek.tool-thinking-history-replay` 在 13 次请求里命中 9 次
+(其余 4 次是首轮或无 tool_use 的辅助调用,本就不需要补),**零 upstream_failure**。
+历史里的 thinking 块没有随对话变长而丢失。
+
+## thinking / effort 的处理边界
+
+不是"丢弃 thinking 配置"。经网关实测的行为矩阵:
+
+| 入站请求 | 出站到上游 | 命中规则 |
+| --- | --- | --- |
+| `enabled` + `budget_tokens` + `reasoning_effort` | **原样透传,零改动** | 无 |
+| `auto` | 改写为 `adaptive` | `thinking-auto-adaptive` |
+| `disabled` + effort | 保持 `disabled`,剥掉 effort | `thinking-disabled-strips-effort` |
+| 任意非 none 的 `tool_choice` | 置 `disabled` 并剥 effort | `tool-choice-disables-thinking` |
+
+只有上游会拒收的组合才被改写;能过的原样送。
+
 ## 仍未验证
 
 - `document` 块行为(历史记录称 DeepSeek 接受该块但答 `CANNOT_READ`,本轮未复测)。

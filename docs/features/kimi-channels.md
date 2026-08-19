@@ -36,13 +36,24 @@ Kimi 走一个 provider contract（`kimi-anthropic-relay`），默认地址
 
 ### 1. 非标准 `thinking: {"type":"auto"}` 导致静默不思考
 
-Claude Science 发送非标准的 `auto`。`k3` 系列不认识该取值，返回 200 但**不含任何 thinking 块**；
-而省略该字段时四个模型都正常思考。
+Claude Science 发送非标准的 `auto`。**上游不报错**,只是不思考——这正是它危险的地方:
+Science 侧看不出任何异常,表现只是"这个模型怎么变笨了"。
 
-补偿：删除 `auto` / `adaptive`，交还上游默认。标准的 `enabled` / `disabled` 原样透传。
+2026-08-19 直连复测(同一问题,只改 thinking 字段,看返回的内容块):
+
+| 模型 | 省略字段 | `auto` | `adaptive` | `enabled` |
+| --- | --- | --- | --- | --- |
+| `k3` | thinking+text,105 字 | **只有 text,0 字** | thinking+text,**4 字** | thinking+text,67 字 |
+| `kimi-for-coding` | thinking+text,126 字 | thinking+text,104 字 | thinking+text,107 字 | thinking+text,172 字 |
+
+缺陷**只在 K3 上**:`auto` 让它彻底不思考,`adaptive` 也几乎不思考(4 字对 105 字)。
+K2.7 两种取值都正常。
+
+补偿:删除 `auto` / `adaptive` 两个取值,交还上游默认(省略字段时 K3 正常思考)。
+标准的 `enabled` / `disabled` 连同 `budget_tokens` 原样透传,effort 类字段一概不碰。
 规则 `provider.kimi.thinking-upstream-default`。
 
-**不引入** thinking 续写机制：实测该端点接受 thinking 块被剥离的历史（含带 `tool_use` 的消息），
+**不引入** thinking 续写机制:实测该端点接受 thinking 块被剥离的历史(含带 `tool_use` 的消息),
 DeepSeek 的链断裂 400 问题不适用于此渠道。
 
 ### 2. 指定工具型 `tool_choice` 与默认思考冲突

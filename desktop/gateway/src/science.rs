@@ -4,9 +4,10 @@
 //! 用户自己的真实登录 —— CSSwitch 只在启动时注入 `ANTHROPIC_BASE_URL`
 //! 把推理指向本机网关,别的一概不碰。
 //!
-//! 三条硬约束(经实测确认,违反会伤到用户的真实实例):
+//! 硬约束(经实测确认,违反会伤到用户的真实实例或改变它的行为):
 //! - 不传 `--data-dir` / `--config`:那会造出隔离实例,对话从此分家;
 //! - 不传 `--no-auto-update`:官方实例必须保留自身的自动更新;
+//! - 不传 `--port`:用 Science 自己的默认端口,地址才稳定可收藏;
 //! - 不写、不读、不伪造任何 auth 状态。
 
 use std::path::PathBuf;
@@ -132,7 +133,9 @@ pub fn start(proxy_base_url: &str) -> Result<(), String> {
     let output = run(
         &bin,
         // 不带 --data-dir / --config / --no-auto-update:见模块文档的三条硬约束。
-        &["serve", "--port", "0", "--detached", "--no-browser"],
+        // 也不带 --port:让 Science 用它自己的默认端口,用户手动启动是什么端口,
+        // 经 CSSwitch 启动就还是什么端口(随机端口会让控制台地址每次都变)。
+        &["serve", "--detached", "--no-browser"],
         &[("ANTHROPIC_BASE_URL", proxy_base_url.to_string())],
     )?;
     if output.status.success() {
