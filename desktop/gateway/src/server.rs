@@ -10,7 +10,7 @@ use crate::auth::{strip_path_secret, AuthResult};
 use crate::config::GatewayConfig;
 use crate::{
     anthropic_compat::{self, AnthropicMetadata},
-    connect, kimi_coding_search, messages, models,
+    connect, messages, models,
 };
 
 struct RequestHead {
@@ -25,11 +25,6 @@ impl RequestHead {
     }
 }
 
-enum StreamFilter {
-    Kimi(anthropic_compat::KimiServerToolFilter),
-    KimiCodingSearch(kimi_coding_search::WebSearchBridge),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTermination {
     NormalEof,
@@ -37,41 +32,6 @@ enum StreamTermination {
     UpstreamReadError,
     ProtocolError,
     DownstreamWriteError,
-}
-
-impl StreamFilter {
-    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
-        match self {
-            StreamFilter::Kimi(filter) => filter.feed(chunk),
-            StreamFilter::KimiCodingSearch(bridge) => bridge.feed(chunk),
-        }
-    }
-
-    fn finalize(&mut self) -> Result<Vec<u8>, String> {
-        match self {
-            StreamFilter::Kimi(filter) => filter.finalize(),
-            StreamFilter::KimiCodingSearch(bridge) => bridge.finalize(),
-        }
-    }
-
-    fn log_stats(&self) {
-        match self {
-            StreamFilter::Kimi(filter) if filter.dropped() > 0 => {
-                eprintln!(
-                    "relay stream rules=tool.kimi.unsupported-server-tool-filter dropped={}",
-                    filter.dropped()
-                );
-            }
-            StreamFilter::KimiCodingSearch(bridge) if bridge.swallowed_blocks() > 0 => {
-                eprintln!(
-                    "relay stream rules=tool.kimi.web_search.client-tool-bridge bridged={} queries={}",
-                    bridge.swallowed_blocks(),
-                    bridge.queries().len()
-                );
-            }
-            _ => {}
-        }
-    }
 }
 
 fn read_head(stream: &mut TcpStream) -> Result<RequestHead, String> {
@@ -347,26 +307,15 @@ fn stream_error_event(detail: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn forward_stream_body<R, F>(
-    upstream: &mut R,
-    first: &[u8],
-    filter: &mut Option<StreamFilter>,
-    emit: F,
-) -> StreamTermination
+fn forward_stream_body<R, F>(upstream: &mut R, first: &[u8], emit: F) -> StreamTermination
 where
     R: Read,
     F: FnMut(&[u8]) -> std::io::Result<()>,
 {
     let mut success_rollback = None;
-    forward_stream_body_with_capture(
-        upstream,
-        first,
-        filter,
-        None,
-        &mut success_rollback,
-        emit,
-        |_| Ok(None),
-    )
+    forward_stream_body_with_capture(upstream, first, None, &mut success_rollback, emit, |_| {
+        Ok(None)
+    })
 }
 
 type StreamRollback = Box<dyn FnOnce() -> Result<(), String>>;
@@ -666,7 +615,6 @@ fn append_block_text(
 fn forward_stream_body_with_capture<R, F, C>(
     upstream: &mut R,
     first: &[u8],
-    filter: &mut Option<StreamFilter>,
     mut collector: Option<&mut AnthropicStreamMessageCollector>,
     success_rollback: &mut Option<StreamRollback>,
     mut emit: F,
@@ -678,14 +626,6 @@ where
     C: FnMut(Option<Value>) -> Result<Option<StreamRollback>, String>,
 {
     let mut validator = crate::anthropic_sse::Validator::default();
-
-    let filter_error = |emit: &mut F| {
-        if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
-            StreamTermination::DownstreamWriteError
-        } else {
-            StreamTermination::ProtocolError
-        }
-    };
 
     let process = |chunk: &[u8],
                    validator: &mut crate::anthropic_sse::Validator,
@@ -718,14 +658,7 @@ where
             .then_some(StreamTermination::UpstreamTerminalError)
     };
 
-    let first = match filter.as_mut() {
-        Some(filter) => match filter.feed(first) {
-            Ok(chunk) => chunk,
-            Err(_) => return filter_error(&mut emit),
-        },
-        None => first.to_vec(),
-    };
-    if let Some(termination) = process(&first, &mut validator, &mut collector, &mut emit) {
+    if let Some(termination) = process(first, &mut validator, &mut collector, &mut emit) {
         return termination;
     }
 
@@ -733,17 +666,6 @@ where
     loop {
         match upstream.read(&mut buf) {
             Ok(0) => {
-                if let Some(filter) = filter.as_mut() {
-                    let tail = match filter.finalize() {
-                        Ok(tail) => tail,
-                        Err(_) => return filter_error(&mut emit),
-                    };
-                    if let Some(termination) =
-                        process(&tail, &mut validator, &mut collector, &mut emit)
-                    {
-                        return termination;
-                    }
-                }
                 return match validator.finish() {
                     Ok(terminal) => {
                         let message = match collector.take() {
@@ -797,16 +719,8 @@ where
                 };
             }
             Ok(n) => {
-                let chunk = if let Some(filter) = filter.as_mut() {
-                    match filter.feed(&buf[..n]) {
-                        Ok(chunk) => chunk,
-                        Err(_) => return filter_error(&mut emit),
-                    }
-                } else {
-                    buf[..n].to_vec()
-                };
                 if let Some(termination) =
-                    process(&chunk, &mut validator, &mut collector, &mut emit)
+                    process(&buf[..n], &mut validator, &mut collector, &mut emit)
                 {
                     return termination;
                 }
@@ -821,32 +735,11 @@ where
     }
 }
 
-/// Non-streaming counterpart: returns the rewritten body when a search ran.
-fn resolve_bridged_web_search_nonstream(
-    cfg: &GatewayConfig,
-    transport: Option<&messages::AnthropicTransport>,
-    original: &Value,
-    body: &[u8],
-) -> Result<Option<Vec<u8>>, String> {
-    let first = serde_json::from_slice::<Value>(body)
-        .map_err(|_| "relay response is not valid JSON".to_string())?;
-    let queries = kimi_coding_search::nonstream_queries(&first);
-    if queries.is_empty() {
-        return Ok(None);
-    }
-    let follow_up = kimi_coding_search::run_follow_up(cfg, transport, original, &queries)?;
-    let merged = kimi_coding_search::merge_nonstream(&first, &follow_up)?;
-    serde_json::to_vec(&merged)
-        .map(Some)
-        .map_err(|error| format!("web search bridge response is invalid: {error}"))
-}
-
 fn handle_stream(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
     body: Vec<u8>,
     transport: Option<&messages::AnthropicTransport>,
-    mut filter: Option<StreamFilter>,
 ) {
     let mut upstream = match messages::open_stream(cfg, body, transport) {
         Ok(upstream) => upstream,
@@ -864,15 +757,11 @@ fn handle_stream(
     {
         return;
     }
-    let termination = forward_stream_body(&mut upstream.response, &[], &mut filter, |chunk| {
+    let termination = forward_stream_body(&mut upstream.response, &[], |chunk| {
         write_chunk(stream, chunk)
     });
     match termination {
-        StreamTermination::NormalEof => {
-            if let Some(filter) = filter.as_ref() {
-                filter.log_stats();
-            }
-        }
+        StreamTermination::NormalEof => {}
         StreamTermination::UpstreamTerminalError
         | StreamTermination::UpstreamReadError
         | StreamTermination::ProtocolError => {}
@@ -1035,9 +924,6 @@ fn handle_messages(
             .map(Vec::len)
             .unwrap_or(0);
         log_relay_metadata(&metadata, &transformed, is_stream, message_count);
-        // The bridge follow-up replays this exact request with the real server
-        // tool, so keep it before the body is serialised away.
-        let bridge_request = metadata.web_search_bridged.then(|| transformed.clone());
         let transformed = match serde_json::to_vec(&transformed) {
             Ok(body) => body,
             Err(e) => {
@@ -1046,56 +932,11 @@ fn handle_messages(
             }
         };
         if is_stream {
-            let filter = if let Some(original) = bridge_request.clone() {
-                // The filter owns everything it needs so the follow-up can run
-                // inline, keeping the splice inside the validated SSE stream.
-                let search_cfg = cfg.clone();
-                let search_transport = anthropic_transport.cloned();
-                Some(StreamFilter::KimiCodingSearch(
-                    kimi_coding_search::WebSearchBridge::new(Box::new(move |queries| {
-                        kimi_coding_search::run_follow_up(
-                            &search_cfg,
-                            search_transport.as_ref(),
-                            &original,
-                            queries,
-                        )
-                    })),
-                ))
-            } else {
-                metadata
-                    .flavor
-                    .filters_server_tool_blocks()
-                    .then(|| StreamFilter::Kimi(anthropic_compat::KimiServerToolFilter::new()))
-            };
-            handle_stream(stream, cfg, transformed, anthropic_transport, filter);
+            handle_stream(stream, cfg, transformed, anthropic_transport);
             return;
         }
         match messages::post_nonstream(cfg, transformed, anthropic_transport) {
-            Ok(mut resp) => {
-                if metadata.flavor.filters_server_tool_blocks() {
-                    resp.body = match anthropic_compat::filter_kimi_nonstream_response(&resp.body) {
-                        Ok(body) => body,
-                        Err(error) => {
-                            api_error_json(stream, 502, &error);
-                            return;
-                        }
-                    };
-                }
-                if let Some(original) = bridge_request.as_ref() {
-                    match resolve_bridged_web_search_nonstream(
-                        cfg,
-                        anthropic_transport,
-                        original,
-                        &resp.body,
-                    ) {
-                        Ok(Some(body)) => resp.body = body,
-                        Ok(None) => {}
-                        Err(error) => {
-                            api_error_json(stream, 502, &error);
-                            return;
-                        }
-                    }
-                }
+            Ok(resp) => {
                 write_response(
                     stream,
                     resp.status,
@@ -1404,10 +1245,9 @@ mod tests {
         )
         .as_bytes();
         let mut upstream = FailingReader;
-        let mut filter = None;
         let mut output = Vec::new();
 
-        let termination = forward_stream_body(&mut upstream, first, &mut filter, |chunk| {
+        let termination = forward_stream_body(&mut upstream, first, |chunk| {
             output.extend_from_slice(chunk);
             Ok(())
         });
@@ -1421,9 +1261,8 @@ mod tests {
     fn kimi_native_anthropic_sse_preserves_server_tool_lifecycle_verbatim() {
         let first = complete_kimi_envelope();
         let mut upstream = Cursor::new(Vec::<u8>::new());
-        let mut filter = None;
         let mut output = Vec::new();
-        let termination = forward_stream_body(&mut upstream, &first, &mut filter, |chunk| {
+        let termination = forward_stream_body(&mut upstream, &first, |chunk| {
             output.extend_from_slice(chunk);
             Ok(())
         });
@@ -1445,9 +1284,8 @@ mod tests {
     fn downstream_write_error_stops_before_more_upstream_reads() {
         let first = kimi_complete_then_partial();
         let mut upstream = CountingEofReader { reads: 0 };
-        let mut filter = None;
 
-        let termination = forward_stream_body(&mut upstream, &first, &mut filter, |_chunk| {
+        let termination = forward_stream_body(&mut upstream, &first, |_chunk| {
             Err(Error::new(ErrorKind::BrokenPipe, "mock client closed"))
         });
 

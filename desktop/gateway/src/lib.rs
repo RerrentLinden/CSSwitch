@@ -5,7 +5,6 @@ pub mod config;
 pub mod connect;
 pub mod control;
 pub mod deepseek_compat;
-pub(crate) mod kimi_coding_search;
 pub mod messages;
 pub mod models;
 pub mod official_passthrough;

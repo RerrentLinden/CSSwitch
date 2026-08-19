@@ -167,29 +167,35 @@
       ]
     },
     {
-      "id": "tool.kimi.web_search.client-tool-bridge",
+      "id": "provider.kimi.web-search-result-id-align",
+      "scope": "provider",
+      "match": {
+        "provider": "relay",
+        "provider_contract": "kimi-anthropic-relay",
+        "tool_type_family": "web_search_*"
+      },
+      "status": "active",
+      "action": "align_web_search_result_tool_use_id",
+      "reason": "Kimi 自己发出的 server_tool_use.id(tool_…)与 web_search_tool_result.tool_use_id(srvtoolu_…)不是同一个值;把它自己的输出原样回传会被 400 tool_call_id  is not found 拒收,一次搜索让此后每轮都失败。按块顺序绑到前面最近的 server_tool_use 即可。",
+      "evidence": "2026-08-19 真机:原样回传 400;两个 id 任一方向对齐后 200。",
+      "tests": [
+        "desktop/gateway/Cargo.toml::lib::anthropic_compat::tests::kimi_aligns_the_mismatched_web_search_result_id"
+      ]
+    },
+    {
+      "id": "tool.kimi.web_search.server-tool-preserve",
       "scope": "tool",
       "match": {
         "provider": "relay",
         "provider_contract": "kimi-anthropic-relay",
         "tool_type_family": "web_search_*"
       },
-      "status": "limited",
-      "action": "normalize",
-      "reason": "Kimi for Coding does execute web_search_20250305 server-side, but it answers 429 rate_limit_error 'The engine is currently overloaded' whenever the tool is declared and the model then decides not to search. Live probes reproduce this 9/9 with max_tokens, turn count, system prompt, client tools, max_uses, tool_choice and prompt complexity all ruled out; DeepSeek's Anthropic endpoint has no such defect. Claude Science declares this tool on every request as the first of its 25 tools, so a captured session failed 100% of turns. CSSwitch therefore replaces the typed server declaration with a same-named client tool, which never trips the defect. A resulting tool_use is the model's own request to search: the gateway swallows it — Science declared web_search as a server tool and owns no local executor — replays the turn upstream with the real server tool, and splices the returned server_tool_use and web_search_tool_result blocks into the same message so Science renders them natively. The splice happens inside the filtered SSE stream because the gateway withholds message_stop until a clean EOF. A failing follow-up surfaces as a terminal SSE error rather than invented assistant content. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
-      "evidence": [
-        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        ".trellis/tasks/archive/2026-08/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
-        "desktop/gateway/src/kimi_coding_search.rs",
-        "desktop/gateway/src/anthropic_compat.rs"
-      ],
+      "status": "active",
+      "action": "preserve_server_tool",
+      "reason": "上游原生支持 web_search_20250305。历史上因'声明却未搜索必 429'改用客户端工具桥接,2026-08-19 复测 32 次未复现该 429,桥接退役,声明原样透传。",
+      "evidence": "2026-08-19 真机:k3 与 kimi-for-coding 各一轮,含 24 客户端工具形态,全部 200。",
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_swaps_server_web_search_for_the_client_tool_bridge",
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_bridge_does_not_duplicate_an_existing_client_web_search",
-        "desktop/gateway/src/kimi_search.rs::tests::the_search_is_spliced_into_the_same_message_before_message_stop",
-        "desktop/gateway/src/kimi_search.rs::tests::bridge_tool_use_is_swallowed_and_its_query_captured",
-        "desktop/gateway/src/kimi_search.rs::tests::a_failing_follow_up_surfaces_instead_of_inventing_an_answer",
-        "desktop/gateway/src/kimi_search.rs::tests::nonstream_merge_drops_the_bridge_call_and_appends_real_evidence"
+        "desktop/gateway/Cargo.toml::lib::anthropic_compat::tests::kimi_now_preserves_the_server_web_search_declaration"
       ]
     },
     {
