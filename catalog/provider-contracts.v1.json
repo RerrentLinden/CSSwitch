@@ -66,7 +66,7 @@
       "thinking_policy": "upstream_default",
       "timeouts": {
         "connect_ms": 10000,
-        "total_ms": 30000,
+        "total_ms": 180000,
         "read_idle_ms": 300000
       },
       "cache": {

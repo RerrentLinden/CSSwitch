@@ -10,8 +10,10 @@ use crate::auth::{strip_path_secret, AuthResult};
 use crate::config::GatewayConfig;
 use crate::{
     anthropic_compat::{self, AnthropicMetadata},
-    connect, messages, models,
+    connect, kimi_search_noise, messages, models,
 };
+
+use crate::kimi_search_noise::RULE_PROVIDER_KIMI_SEARCH_NOISE_TEXT_STRIP as RULE_SEARCH_NOISE;
 
 struct RequestHead {
     method: String,
@@ -307,15 +309,26 @@ fn stream_error_event(detail: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn forward_stream_body<R, F>(upstream: &mut R, first: &[u8], emit: F) -> StreamTermination
+fn forward_stream_body<R, F>(
+    upstream: &mut R,
+    first: &[u8],
+    filter: Option<kimi_search_noise::SearchNoiseFilter>,
+    emit: F,
+) -> StreamTermination
 where
     R: Read,
     F: FnMut(&[u8]) -> std::io::Result<()>,
 {
     let mut success_rollback = None;
-    forward_stream_body_with_capture(upstream, first, None, &mut success_rollback, emit, |_| {
-        Ok(None)
-    })
+    forward_stream_body_with_capture(
+        upstream,
+        first,
+        filter,
+        None,
+        &mut success_rollback,
+        emit,
+        |_| Ok(None),
+    )
 }
 
 type StreamRollback = Box<dyn FnOnce() -> Result<(), String>>;
@@ -615,6 +628,7 @@ fn append_block_text(
 fn forward_stream_body_with_capture<R, F, C>(
     upstream: &mut R,
     first: &[u8],
+    mut filter: Option<kimi_search_noise::SearchNoiseFilter>,
     mut collector: Option<&mut AnthropicStreamMessageCollector>,
     success_rollback: &mut Option<StreamRollback>,
     mut emit: F,
@@ -626,6 +640,21 @@ where
     C: FnMut(Option<Value>) -> Result<Option<StreamRollback>, String>,
 {
     let mut validator = crate::anthropic_sse::Validator::default();
+
+    // 过滤器失败必须携带真实原因:既写日志也发给客户端,不得降级成
+    // 无信息量的通用文案(2026-08-19 的诊断黑洞正是这么来的)。
+    let filter_failure = |error: &str, emit: &mut F| {
+        eprintln!("relay stream filter error rules={RULE_SEARCH_NOISE} error={error}");
+        if emit(&stream_error_event(&format!(
+            "CSSwitch response filter: {error}"
+        )))
+        .is_err()
+        {
+            StreamTermination::DownstreamWriteError
+        } else {
+            StreamTermination::ProtocolError
+        }
+    };
 
     let process = |chunk: &[u8],
                    validator: &mut crate::anthropic_sse::Validator,
@@ -658,7 +687,15 @@ where
             .then_some(StreamTermination::UpstreamTerminalError)
     };
 
-    if let Some(termination) = process(first, &mut validator, &mut collector, &mut emit) {
+    let first_chunk = if let Some(filter) = filter.as_mut() {
+        match filter.feed(first) {
+            Ok(chunk) => chunk,
+            Err(error) => return filter_failure(&error, &mut emit),
+        }
+    } else {
+        first.to_vec()
+    };
+    if let Some(termination) = process(&first_chunk, &mut validator, &mut collector, &mut emit) {
         return termination;
     }
 
@@ -666,6 +703,27 @@ where
     loop {
         match upstream.read(&mut buf) {
             Ok(0) => {
+                if let Some(filter) = filter.as_mut() {
+                    match filter.finalize() {
+                        Ok(tail) => {
+                            if !tail.is_empty() {
+                                if let Some(termination) =
+                                    process(&tail, &mut validator, &mut collector, &mut emit)
+                                {
+                                    return termination;
+                                }
+                            }
+                        }
+                        Err(error) => return filter_failure(&error, &mut emit),
+                    }
+                    if filter.stripped_blocks() > 0 {
+                        eprintln!(
+                            "relay stream rules={RULE_SEARCH_NOISE} stripped={} bytes={}",
+                            filter.stripped_blocks(),
+                            filter.stripped_bytes()
+                        );
+                    }
+                }
                 return match validator.finish() {
                     Ok(terminal) => {
                         let message = match collector.take() {
@@ -719,8 +777,16 @@ where
                 };
             }
             Ok(n) => {
+                let chunk = if let Some(filter) = filter.as_mut() {
+                    match filter.feed(&buf[..n]) {
+                        Ok(chunk) => chunk,
+                        Err(error) => return filter_failure(&error, &mut emit),
+                    }
+                } else {
+                    buf[..n].to_vec()
+                };
                 if let Some(termination) =
-                    process(&buf[..n], &mut validator, &mut collector, &mut emit)
+                    process(&chunk, &mut validator, &mut collector, &mut emit)
                 {
                     return termination;
                 }
@@ -740,6 +806,7 @@ fn handle_stream(
     cfg: &GatewayConfig,
     body: Vec<u8>,
     transport: Option<&messages::AnthropicTransport>,
+    filter: Option<kimi_search_noise::SearchNoiseFilter>,
 ) {
     let mut upstream = match messages::open_stream(cfg, body, transport) {
         Ok(upstream) => upstream,
@@ -757,7 +824,7 @@ fn handle_stream(
     {
         return;
     }
-    let termination = forward_stream_body(&mut upstream.response, &[], |chunk| {
+    let termination = forward_stream_body(&mut upstream.response, &[], filter, |chunk| {
         write_chunk(stream, chunk)
     });
     match termination {
@@ -931,12 +998,42 @@ fn handle_messages(
                 return;
             }
         };
+        // 噪声头剥离只针对 Kimi:上游往搜索轮注入 `Search results for query:`
+        // 文本块(证据见任务研究记录);DeepSeek 与 Generic 流量不经过过滤器。
+        let noise_filter = (metadata.flavor == anthropic_compat::RelayFlavor::Kimi)
+            .then(kimi_search_noise::SearchNoiseFilter::new);
         if is_stream {
-            handle_stream(stream, cfg, transformed, anthropic_transport);
+            handle_stream(stream, cfg, transformed, anthropic_transport, noise_filter);
             return;
         }
         match messages::post_nonstream(cfg, transformed, anthropic_transport) {
-            Ok(resp) => {
+            Ok(mut resp) => {
+                if noise_filter.is_some() && resp.status == 200 {
+                    if let Ok(mut body) = serde_json::from_slice::<Value>(&resp.body) {
+                        let (blocks, bytes) = kimi_search_noise::strip_nonstream_noise(&mut body);
+                        if blocks > 0 {
+                            match serde_json::to_vec(&body) {
+                                Ok(stripped) => {
+                                    eprintln!(
+                                        "relay nonstream rules={RULE_SEARCH_NOISE} stripped={blocks} bytes={bytes}"
+                                    );
+                                    resp.body = stripped;
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "relay nonstream rules={RULE_SEARCH_NOISE} serialization failed: {error}"
+                                    );
+                                    api_error_json(
+                                        stream,
+                                        502,
+                                        "CSSwitch response filter: stripped body serialization failed",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 write_response(
                     stream,
                     resp.status,
@@ -1247,7 +1344,7 @@ mod tests {
         let mut upstream = FailingReader;
         let mut output = Vec::new();
 
-        let termination = forward_stream_body(&mut upstream, first, |chunk| {
+        let termination = forward_stream_body(&mut upstream, first, None, |chunk| {
             output.extend_from_slice(chunk);
             Ok(())
         });
@@ -1262,7 +1359,7 @@ mod tests {
         let first = complete_kimi_envelope();
         let mut upstream = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
-        let termination = forward_stream_body(&mut upstream, &first, |chunk| {
+        let termination = forward_stream_body(&mut upstream, &first, None, |chunk| {
             output.extend_from_slice(chunk);
             Ok(())
         });
@@ -1285,7 +1382,7 @@ mod tests {
         let first = kimi_complete_then_partial();
         let mut upstream = CountingEofReader { reads: 0 };
 
-        let termination = forward_stream_body(&mut upstream, &first, |_chunk| {
+        let termination = forward_stream_body(&mut upstream, &first, None, |_chunk| {
             Err(Error::new(ErrorKind::BrokenPipe, "mock client closed"))
         });
 
