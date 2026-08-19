@@ -25,7 +25,7 @@
 | 规则 | 上游行为 | 处理 |
 | --- | --- | --- |
 | `provider.deepseek.thinking-auto-adaptive` | 请求体反序列化只认 `adaptive`/`enabled`/`disabled`,Claude Science 发的非标准 `auto` 直接 400 | 改写为 `adaptive`(语义最近) |
-| `provider.deepseek.tool-choice-disables-thinking` | 思考开启时拒收任何非 `none` 的 tool_choice | 保留 tool_choice(Science 的抽取请求依赖结构化输出),放弃这一轮思考,并剥掉 effort |
+| `provider.deepseek.specified-tool-choice-disables-thinking` | 思考开启时拒收**指定工具型** tool_choice(`{"type":"tool","name":…}`) | 保留 tool_choice(Science 的抽取请求依赖结构化输出),放弃这一轮思考,并剥掉 effort |
 | `provider.deepseek.thinking-disabled-strips-effort` | `thinking: disabled` 与 effort 参数互斥,同时出现 400 | 尊重客户端的 disabled,剥掉冲突的 effort |
 | `provider.deepseek.tool-thinking-history-replay` | 要求带 `tool_use` 的历史助手轮回传 thinking,客户端常剥掉 → `must be passed back` 400 | 无状态补齐:缺失插占位块,`redacted_thinking` 转普通 thinking,去掉过不了校验的 signature |
 | `provider.deepseek.malformed-server-tool-block-repair` | 严格反序列化拒收缺 `tool_use_id` 的 `web_search_tool_result`(Science daemon 会把这种块落盘进历史) | 能抽文本就降级成文本,否则丢弃。**结构完好的 server tool 块保留**——DeepSeek 原生执行 web_search,降级会教模型模仿扁平化的伪工具调用 |
@@ -48,7 +48,7 @@ DSML shim。现在全部退役:上游要的只是"历史里有 thinking 块",占
 
 | 轮次 | 命中的规则 |
 | --- | --- |
-| 辅助调用(flash,带 tool_choice) | `provider.deepseek.tool-choice-disables-thinking` |
+| 辅助调用(flash,带指定工具型 tool_choice) | `provider.deepseek.specified-tool-choice-disables-thinking` |
 | 首轮(msgs=3) | `tool.deepseek.web_search.server-tool-preserve` |
 | 后续多轮(msgs=5/7/9) | `provider.deepseek.tool-thinking-history-replay` + 上一条 |
 
@@ -75,9 +75,21 @@ DSML shim。现在全部退役:上游要的只是"历史里有 thinking 块",占
 | `enabled` + `budget_tokens` + `reasoning_effort` | **原样透传,零改动** | 无 |
 | `auto` | 改写为 `adaptive` | `thinking-auto-adaptive` |
 | `disabled` + effort | 保持 `disabled`,剥掉 effort | `thinking-disabled-strips-effort` |
-| 任意非 none 的 `tool_choice` | 置 `disabled` 并剥 effort | `tool-choice-disables-thinking` |
+| `tool_choice` 为 `{"type":"tool",…}` | 置 `disabled` 并剥 effort | `specified-tool-choice-disables-thinking` |
+| `tool_choice` 为 auto / any / none | **不动**,thinking 照常 | 无 |
 
 只有上游会拒收的组合才被改写;能过的原样送。
+
+tool_choice 的边界是实测出来的(2026-08-19,thinking enabled 与 adaptive 各测一轮):
+
+| tool_choice | 上游响应 |
+| --- | --- |
+| 不带 / `auto` / `any` | 200,`['thinking','tool_use']` —— 思考与工具调用并存 |
+| `{"type":"tool","name":…}` | **400** Thinking mode does not support this tool_choice |
+| `none` | 200,`['thinking','text']` |
+
+所以补偿只针对指定工具型这一种。早期实现照搬了"任何非 none 都禁思考"的判据,
+那会在最普通的 auto 形态上白白关掉推理——已收窄。
 
 ## 仍未验证
 

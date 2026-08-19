@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 pub const RULE_THINKING_AUTO_ADAPTIVE: &str = "provider.deepseek.thinking-auto-adaptive";
 pub const RULE_TOOL_CHOICE_DISABLES_THINKING: &str =
-    "provider.deepseek.tool-choice-disables-thinking";
+    "provider.deepseek.specified-tool-choice-disables-thinking";
 pub const RULE_THINKING_DISABLED_STRIPS_EFFORT: &str =
     "provider.deepseek.thinking-disabled-strips-effort";
 pub const RULE_TOOL_THINKING_HISTORY_REPLAY: &str =
@@ -80,9 +80,14 @@ fn normalize_thinking_auto(body: &mut Value, rule_ids: &mut Vec<String>) {
     append_rule(rule_ids, RULE_THINKING_AUTO_ADAPTIVE);
 }
 
-/// 上游在思考开启时拒收任何非 `none` 的 tool_choice
-/// ("Thinking mode does not support this tool_choice")。
-/// Science 的辅助抽取请求依赖强制工具拿结构化输出,因此保留 tool_choice、放弃这一轮思考。
+/// 上游在思考开启时拒收**指定工具型**的 tool_choice
+/// (`{"type":"tool","name":…}` → 400 "Thinking mode does not support this
+/// tool_choice")。Science 的辅助抽取请求依赖强制指定工具拿结构化输出,
+/// 因此保留 tool_choice、放弃这一轮思考。
+///
+/// 2026-08-19 实测边界:`auto`、`any`、`none` 以及不带该字段的请求在
+/// thinking enabled / adaptive 下都返回 200 且照常输出 thinking 块,
+/// 因此**只对 `tool` 这一种形态补偿**——对 auto/any 也关思考是白白牺牲推理质量。
 fn disable_thinking_for_tool_choice(body: &mut Value, rule_ids: &mut Vec<String>) {
     if !has_thinking_incompatible_tool_choice(body) {
         return;
@@ -99,16 +104,11 @@ fn disable_thinking_for_tool_choice(body: &mut Value, rule_ids: &mut Vec<String>
 }
 
 fn has_thinking_incompatible_tool_choice(body: &Value) -> bool {
-    match body.get("tool_choice") {
-        None | Some(Value::Null) => false,
-        Some(Value::String(value)) => value != "none",
-        Some(Value::Object(obj)) => obj
-            .get("type")
-            .and_then(Value::as_str)
-            .map(|kind| kind != "none")
-            .unwrap_or(true),
-        Some(_) => true,
-    }
+    body.get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        == Some("tool")
 }
 
 /// `thinking: disabled` 与 effort 参数在上游互斥,同时出现返回 400
@@ -481,38 +481,46 @@ mod tests {
     }
 
     #[test]
-    fn any_non_none_tool_choice_disables_thinking_and_strips_effort() {
+    fn specified_tool_choice_disables_thinking_and_strips_effort() {
+        let (body, rules) = normalize(
+            json!({
+                "thinking": {"type": "auto"},
+                "tool_choice": {"type": "tool", "name": "classify"},
+                "reasoning_effort": "high",
+                "output_config": {"effort": "high"},
+                "messages": []
+            }),
+            "deepseek-v4-pro",
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("output_config").is_none());
+        assert!(rules.contains(&RULE_TOOL_CHOICE_DISABLES_THINKING.to_string()));
+    }
+
+    #[test]
+    fn only_the_specified_form_costs_thinking() {
+        // 实测:auto / any / none 在 thinking 开启时都返回 200 且带 thinking 块,
+        // 对它们补偿等于白白关掉推理。
         for choice in [
-            json!({"type": "tool", "name": "classify"}),
-            json!({"type": "any"}),
             json!({"type": "auto"}),
-            json!("any"),
+            json!({"type": "any"}),
+            json!({"type": "none"}),
         ] {
             let (body, rules) = normalize(
                 json!({
-                    "thinking": {"type": "auto"},
-                    "tool_choice": choice,
-                    "reasoning_effort": "high",
-                    "output_config": {"effort": "high"},
+                    "thinking": {"type": "enabled", "budget_tokens": 1024},
+                    "tool_choice": choice.clone(),
                     "messages": []
                 }),
                 "deepseek-v4-pro",
             );
-            assert_eq!(body["thinking"], json!({"type": "disabled"}));
-            assert!(body.get("reasoning_effort").is_none());
-            assert!(body.get("output_config").is_none());
-            assert!(rules.contains(&RULE_TOOL_CHOICE_DISABLES_THINKING.to_string()));
+            assert_eq!(
+                body["thinking"]["type"], "enabled",
+                "tool_choice {choice} 不该牺牲思考"
+            );
+            assert!(!rules.contains(&RULE_TOOL_CHOICE_DISABLES_THINKING.to_string()));
         }
-    }
-
-    #[test]
-    fn tool_choice_none_keeps_thinking() {
-        let (body, rules) = normalize(
-            json!({"thinking": {"type": "enabled"}, "tool_choice": {"type": "none"}, "messages": []}),
-            "deepseek-v4-pro",
-        );
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert!(!rules.contains(&RULE_TOOL_CHOICE_DISABLES_THINKING.to_string()));
     }
 
     #[test]
