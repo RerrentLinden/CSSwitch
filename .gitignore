@@ -1,11 +1,14 @@
-# 沙箱运行时（大文件、克隆资产、可能含新登录凭证）
-.sandbox/
+# 构建产物
+target/
+**/target/
+dist/
+build/
 
-# 运行产物
-proxy/proxy.log
-proxy/proxy.stdout
+# 运行产物与本地临时文件
 *.pyc
 __pycache__/
+scratchpad/
+.seed
 
 # 绝不入库任何密钥
 *.env
@@ -13,76 +16,23 @@ __pycache__/
 *secret*
 *token*
 
-# Rust / Tauri 构建产物
-target/
-**/target/
-
-# 前端依赖与构建产物（Tauri / py2app）
-node_modules/
-dist/
-build/
-
-# macOS 与工作区杂物
+# macOS 杂物
 .DS_Store
+
+# 本机工具的会话配置
+.claude/
 .superpowers/
 
-# 本地开发工作流文档（brainstorm→spec→plan），不上传公开仓库
-docs/superpowers/
-
-# Local version comparison binaries; never commit.
-.science-binaries/
-
-# Local scratch files and runtime intermediates.
-scratchpad/
-
-# Local Claude Code session config.
-.claude/
-
-# Local agent workflow state and generated helpers.
+# Trellis:只入库项目知识(规范、工作流定义)。
+# 任务目录含调研草稿与逐日 journal,属个人执行痕迹;
+# agents/scripts 与 .agents/skills 是 trellis 工具的生成物,由 trellis update 维护。
+/.trellis/tasks/
+/.trellis/workspace/
+/.trellis/agents/
+/.trellis/scripts/
 /.agents/skills/
 /.codex/
-/.trellis/
 
-# Local seed files.
-.seed
-
-# Private project knowledge and reverse-engineering records. Keep these local.
-# CLAUDE.md is intentionally tracked as a compatibility pointer to AGENTS.md.
-desktop/README.md
-findings/
-scripts/daily-maintenance.prompt.md
-scripts/com.csswitch.maintenance.plist
-scripts/daily-maintenance.sh
-scripts/install-maintenance.sh
-scripts/launch-science-sandbox.sh
-scripts/make-virtual-oauth.mjs
-test/A3_INSTALLED_APP_MANUAL_TEST.md
-test/decrypt-oauth.mjs
-test/test_make_virtual_oauth.mjs
-docs/*
-!docs/README.md
-!docs/architecture/
-!docs/architecture/**
-!docs/operations/
-!docs/operations/**
-!docs/features/
-!docs/features/**
-!docs/evidence/
-!docs/evidence/**
-!docs/audits/
-!docs/audits/**
-!docs/EXTERNAL_SKILL_INSTALL.md
-!docs/assets/
-!docs/assets/**
-!docs/ARCHITECTURE.md
-!docs/SCIENCE_RUNTIME.md
-!docs/DEVELOPMENT.md
-!docs/RELEASE.md
-!docs/references/
-!docs/references/**
-!docs/upgrade-and-rollback.md
-!docs/release-evidence-v0.4.2.md
-
-# Temporary Agent handoffs are local execution residue. Track only their policy.
+# Agent 临时交接是本地执行残留,只跟踪其策略说明
 .agents/handoffs/*
 !.agents/handoffs/README.md

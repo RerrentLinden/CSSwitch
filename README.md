@@ -54,13 +54,12 @@ CSSwitch 服务  ── /v1/messages、/v1/models  按当前模式路由
 - **Kimi**:非标准 `thinking: auto` 剥离(K3 收到它会静默不思考)、
   指定型 `tool_choice` 与思考冲突时禁思考、`document` 块换署名占位文本、
   声明 web_search 却未搜索时的 429 用客户端工具桥接绕开。
-- **DeepSeek**:`thinking auto` → `adaptive`、tool_choice 与思考互斥、
+- **DeepSeek**:`thinking auto` → `adaptive`、指定型 `tool_choice` 与思考互斥、
   thinking disabled 与 effort 互斥、带 tool_use 的历史补 thinking 块、
   畸形 server tool 块修复、孤儿工具配对按计数补齐。
-  语义借鉴自 [cc-switch](https://github.com/farion1231/cc-switch)(MIT)及
-  biociao 的 fork,按本仓库的规则体系重写。
 
-补偿策略来自 provider contract,不靠环境变量传递。
+补偿策略来自 provider contract,不靠环境变量传递。每条补偿的上游成因与实测证据
+见 [Kimi 渠道](docs/features/kimi-channels.md) 与 [DeepSeek 渠道](docs/features/deepseek-channel.md)。
 
 ## 开发
 
@@ -71,3 +70,23 @@ bash test/run_all.sh     # 三层门禁:fmt+clippy / 单测 / 真实服务进程
 真机验收(官方登录、真实 provider key、工具轮次)见 [test/LIVE_ACCEPTANCE.md](test/LIVE_ACCEPTANCE.md)。
 
 架构与开发约定见 [docs/](docs/README.md);Agent 规则见 [AGENTS.md](AGENTS.md)。
+
+## 致谢与开源协议
+
+本项目基于 MIT 协议开源,并站在两条独立的上游工作之上。
+
+**[SuperJJ007/CSSwitch](https://github.com/SuperJJ007/CSswitch)**(MIT)——
+本仓库的直接上游。Kimi 渠道的四条兼容补偿在那里成形,包括
+`thinking: auto` 让 K3 静默不思考的发现、`document` 块的署名占位方案,
+以及 web_search 429 的客户端工具桥接(`kimi_coding_search.rs`,至今仍在使用)。
+本轮精简重构删除了它的沙箱隔离与外部 Skill 机制,但这些补偿与其真机证据被完整保留。
+
+**[farion1231/cc-switch](https://github.com/farion1231/cc-switch)**(MIT,© 2025 Jason Young)
+及其 fork **[biociao/cc-switch](https://github.com/biociao/cc-switch)** ——
+DeepSeek 官方 `/anthropic` 路线的六条 normalizer 语义来自这里
+(见 biociao 为 Claude Science 提交的
+[PR #6211](https://github.com/farion1231/cc-switch/pull/6211));
+本仓库按自己的规则体系(规则 ID + 端点门控 + 单测)重写,并在实测后收窄了
+其中过宽的判据。相关文件保留了原始版权声明。
+
+三个仓库同为 MIT 协议,彼此兼容。若你在此基础上继续开发,请一并保留上述署名。
