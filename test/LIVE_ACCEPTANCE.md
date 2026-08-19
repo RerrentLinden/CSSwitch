@@ -36,6 +36,8 @@ daemon 控制逻辑后跑一遍。
 | Kimi K3:回答里完全没有 thinking 块 | `provider.kimi.thinking-upstream-default` | K3 会话应能看到思考过程 |
 | Kimi:带 PDF 附件后此轮及以后全部 400 | `provider.kimi.document-block-placeholder` | 该轮继续,且模型说明附件未送达 |
 | Kimi:搜索过一轮之后全部 400 `tool_call_id  is not found` | `provider.kimi.web-search-result-pairing-repair` | **必须在全新会话里测**:第 1 轮联网搜索,第 2 轮追问。搜索轮正常不够,要看下一轮不报错。诊断用 `CSSWITCH_DEBUG_TOOL_SKELETON=1` 看历史骨架 |
+| Kimi:回答开头/结尾出现 `Search results for query:` 文本 | `provider.kimi.search-noise-text-strip` | 联网搜索轮的助手内容里**不得出现**该文本头;日志应见 `noise=N` 命中 |
+| Kimi:不搜索的轮次出现空 Server Tool 框并让后续轮 400 | `provider.kimi.empty-search-pair-strip` | 在有过搜索的会话里发一轮"不用搜索"的问题:落盘助手消息不得含无 id 搜索块,后续轮不得 400。注意:**有搜索历史的下一轮**出现的空 Server Tool 框是 Science 自己的存盘占位(`results persisted`),属平台行为,不算失败 |
 | DeepSeek:多轮 thinking 后 400(旧 BUG-083) | `provider.deepseek.tool-thinking-history-replay` | 连续多轮带工具的对话不报错。2026-08-19 已实测通过 |
 | DeepSeek:`thinking auto` 被拒 | `provider.deepseek.thinking-auto-adaptive` | 首轮即可正常 |
 

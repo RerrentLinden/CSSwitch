@@ -94,12 +94,14 @@ flowchart TD
     TC -->|是| TCF[thinking 置 disabled]
     TC -->|否| TH{thinking 是 auto 或 adaptive?}
     TH -->|是| THF[删掉整个字段]
-    TH -->|否| TOOLS{声明了 web_search?}
+    TH -->|否| TOOLS[web_search 声明原样保留]
     TCF --> TOOLS
     THF --> TOOLS
-    TOOLS -->|是| WS[换成同名客户端工具并桥接]
-    TOOLS -->|否| OUT[发往上游]
-    WS --> OUT
+    TOOLS --> OUT[发往上游]
+    OUT --> RESP[上游响应]
+    RESP --> NOISE[剥 Search results for query 噪声头]
+    NOISE --> PAIR[剥无 id 的幻影空搜索对]
+    PAIR --> CLIENT[回给 Science]
 ```
 
 ### 1. `thinking: auto` 让 K3 静默不思考
@@ -153,7 +155,14 @@ Science 落盘时只留结果块、丢掉请求块,而 Kimi 要求这一对能�
 (另一种形态:两块都在,但 Kimi 自己发的两个 id 本就不同。)
 
 修复是让这一对配得上:孤儿结果块前面补一个同 id 的 `server_tool_use`;
-id 不匹配就对齐到最近的那个。规则 `provider.kimi.web-search-result-pairing-repair`。
+id 不匹配就对齐到最近的那个;**连 id 都没有的孤儿**(幻影空搜索对落盘的产物)
+空内容直接删、有内容合成配对键。规则 `provider.kimi.web-search-result-pairing-repair`。
 选补块而非丢块,是为了保住这一轮的搜索证据。
+
+响应侧还有两条剥离(`kimi_search_noise.rs`):上游注入的
+`Search results for query:` 噪声头 text 块,以及"无 id `server_tool_use` +
+空内容结果块"的幻影对——后者正是无 id 孤儿的源头。被吞的块不占输出索引,
+未命中流量字节级零改写。上游成因、危害与真机证据见
+[Kimi 渠道 §3b/§3c](features/kimi-channels.md)。
 
 

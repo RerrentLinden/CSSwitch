@@ -1,6 +1,6 @@
 # 当前已知问题与证据缺口
 
-最后整理：2026-07-28。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
+最后整理：2026-08-19。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
 
 ## v0.8.2 已发布后的边界
 
@@ -34,21 +34,23 @@
 
 ## Kimi 渠道（开放平台 / for Coding）
 
-- 两个渠道共用 provider contract `kimi-anthropic-relay` 与同一套补偿；差异只有默认地址与模型预设。**以下各条的实测证据全部来自 `api.kimi.com/coding`，开放平台按用户判定沿用、未独立实测。**
-- 开放平台原有的一批只服务它的处理已全部移除：`?beta=true` 查询参数、强制注入的 `anthropic-beta: claude-code-20250219`、伪装成 `claude-cli/*` 的 User-Agent、强制 `x-app: cli`、失败历史尾巴清理、thinking 强制 `enabled` 与思考续写存储。**若开放平台实际依赖 beta 标识或 claude-cli 身份放行，表现将是请求被拒或能力降级**；恢复实现见 git 历史。
+最后更新：2026-08-19（web_search 桥接退役、原生透传落地当日）。
 
-- 上游对"声明了 `web_search_20250305` 但本轮模型未实际搜索"的请求返回 429 `rate_limit_error`，DeepSeek 同条件无此缺陷。补偿为客户端工具桥接：换成同名客户端工具，模型主动调用时 gateway 用真 server 工具补发一次并把搜索块拼回同一条消息。已在真实 Science 验证原生 web_search 渲染。详见[渠道文档](../../docs/features/kimi-channels.md)。
-- 该端点还存在与 web_search 无关的偶发 429（一次无工具基础请求也曾 429）。任何把 429 解释为"本轮没搜索"的策略都不可靠。
-- 上游搜索轮的块序为 `text, server_tool_use, web_search_tool_result, thinking, text`，thinking 不在首块，与 Anthropic 规范和 DeepSeek 的表现都不同。经桥接改写后已在真实 Science 中验证渲染正常（原生 Web Search 组件、结果列表与来源链接齐全）。
-- 已验证 `kimi-for-coding`、`kimi-for-coding-highspeed`、`k3`、`k3-256k` 四个模型的 thinking 与 `tool_choice` 行为；图片、视频输入、原生流式结构化输出未验证。
-- gateway 链路已用真实 Science（隔离实例）+ 真实订阅 key 端到端验证：纯文本轮、多轮 Python 工具调用循环、Reviewer 与 Notebook 均正常，Science 内部的 `create_work_item` 与 `verdict` 两类强制工具调用也都通过。桌面端 UI 入口已交付并在浏览器 mock 模式可视化验收（服务商网格、默认值预填、创建入列、编辑回读、深色主题）；**安装版 artifact 的端到端验收未执行**，UI 与真实后端合并后的链路未在打包版本中走过一遍。
-- `400 relay history ends with unresolved tool calls`：当客户端工具调用在等待用户授权（如 `request_network_access`）时，Science 仍会继续发起推理，历史以未解决的 `tool_use` 结尾，被 relay 通路的 `validate_relay_tool_history` 拒绝。该校验对所有 relay contract 无差别生效，非本渠道特有（实测中由安装版应用的 custom-anthropic 通路产生）。桥接落地后模型不再被迫改用 `request_network_access`，触达概率下降，但该通用问题本身仍未修复。
-- 上游不实现 Anthropic `document` 内容块：四种 source 形态与一个不存在的块类型返回完全相同的 `Invalid request Error`，属解析器未知块分支而非格式问题。该块留在历史里会让此后每轮都失败（真实会话 27 条消息成功、29 条失败）。**该块是 Science 平台 PDF 视觉通道的载荷**（`read_file(pages=[…])` → `queued_for_vision` + `[System] Attached file` + `document`），因此**该平台路径在本渠道确实不可用**。CSSwitch 替换为署名占位文本以保住该轮。读 PDF 仍可行：Agent 自行渲染页面为 `image` 块传入，上游接受，已在真实会话验证。DeepSeek 接受该块但带与不带附件都回 `CANNOT_READ`，故这不是相对同类渠道的倒退；`image` 块不受影响。
-- 占位文本必须署名来源：实测中模型引用未署名占位文本后被追问出处，把一个正确结论当作自己编造的撤回了。
-- 桥接的搜索轮会多一次上游往返；模型在 Science 全量工具集下有时会绕开 web_search 改用 `bash`，此时桥接保持空闲。搜索结果块的顺序为 `server_tool_use, web_search_tool_result` 紧随首轮已流出的前言之后，与上游原生顺序不同但 Science 渲染正常。
+- 两个渠道共用 provider contract `kimi-anthropic-relay` 与同一套补偿；差异只有默认地址与模型预设。**实测证据全部来自 `api.kimi.com/coding`，开放平台按用户判定沿用、未独立实测。**
+- 开放平台原有的一批只服务它的处理已全部移除（`?beta=true`、强制 `anthropic-beta`、伪装 `claude-cli/*` UA、强制 `x-app: cli`、失败历史尾巴清理、thinking 强制 `enabled` 与思考续写存储）。**若开放平台实际依赖这些标识放行，表现将是请求被拒或能力降级**；恢复实现见 git 历史。
+- **web_search 客户端工具桥已退役**（2026-08-19 第二次尝试，成功）：429 缺陷复测 32+2 次未再复现；`web_search_20250305` 原样透传，配套四条窄规则（请求侧配对修复、响应侧噪声头剥离与幻影空搜索对剥离、`server-tool-preserve`）。上游成因、逐条证据与本轮真机验收见[渠道文档](../../docs/features/kimi-channels.md)。桥接完整实现保留在 git 历史（提交 `1bdbbbd` 之前）以备 429 复发。
+- 退役后的已知边界：
+  - 上游搜索轮**每轮**注入 `Search results for query:` 噪声头，不搜索的轮次**常发**无 id 幻影空搜索对——两条剥离规则是常态命中而非偶发补丁，日志 `noise=/pair=` 可见。
+  - 幻影对在剥离规则落地前已落盘的历史，靠请求侧配对修复的无 id 分支救活（实测 Resume 后 400 → 200）；未经修复版本 gateway 的存量会话首轮可能仍撞一次 400。
+  - 有搜索历史的下一轮，Science 会把上轮结果存盘并渲染一个**输出为空的 Server Tool 折叠框**（`[System] … results persisted`）。这是 Science 平台自己的历史压缩行为，与渠道无关，不是缺陷。
+  - nonstream 搜索轮实测 29.5–40s，合同 `total_ms` 已从 30s 上调至 180s；流式 read_idle 维持 300s。
+  - 该端点仍存在与 web_search 无关的偶发 429；任何把 429 解释为特定语义的策略都不可靠。
+- `400 relay history ends with unresolved tool calls`：当客户端工具调用在等待用户授权（如 `request_network_access`）时，Science 仍会继续发起推理，历史以未解决的 `tool_use` 结尾，被 relay 通路的 `validate_relay_tool_history` 拒绝。该校验对所有 relay contract 无差别生效，非本渠道特有。桥接退役后模型不再被迫改用 `request_network_access`，触达概率进一步下降，但该通用问题本身仍未修复。
+- 上游不实现 Anthropic `document` 内容块（控制组判定为解析器未知块分支）。该块是 Science 平台 PDF 视觉通道的载荷，故**该平台路径在本渠道不可用**；CSSwitch 替换为署名占位文本保住该轮。读 PDF 仍可行：Agent 渲染页面为 `image` 块传入。占位文本必须署名来源（未署名时模型曾把正确结论当编造撤回）。
+- 已验证 `kimi-for-coding`、`k3` 的原生搜索、多轮、工具循环与混合轮（2026-08-19 内置浏览器驱动真实 Science）；`kimi-for-coding-highspeed`、`k3-256k` 按同契约沿用未单测；图片、视频输入、原生流式结构化输出未验证。
+- 真机验收细节与逐条判据见 [test/LIVE_ACCEPTANCE.md](../../test/LIVE_ACCEPTANCE.md)；本轮修复的任务证据在 `.trellis/tasks/08-19-kimi-search-hang/`。
 
 ## 测试
 
 - 真机验收矩阵描述应执行的场景，不表示最终 v0.8.2 DMG 已逐项全部执行。每次验收必须绑定 exact artifact，并把通过、失败、环境阻塞与未执行分开记录。
-- 门禁总入口 `test/run_all.sh` 为五层聚合器（见 [testing.md](../../docs/operations/testing.md)），无第三方 Python 依赖、不要求 worktree 干净；`env-blocked` 计入 `current-env clean` 但阻断 `release-ready green`，报告时不得把两者混写。
-- rust 层的 ignored 测试基线为 33（全部带显式理由的 Acceptance-boundary / 真机 E2E），偏离基线需人工审读，见 testing.md。
+- 门禁总入口 `test/run_all.sh` 为三层聚合器（static / unit / loopback，见脚本头注释），全部离线可跑；找不到工具链输出 `env-blocked` 并以退出码 3 阻断。旧记录中的"五层聚合器 + testing.md + ignored 基线 33"来自 fork 前仓库，本仓库不适用（2026-08-19 实测：三层、无 testing.md、0 ignored）。

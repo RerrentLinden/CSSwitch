@@ -112,21 +112,69 @@ m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
 | 结果块孤立(无 `server_tool_use`) | 在它前面补一个同 id 的 `server_tool_use` | 400 → **200** |
 | 两块都在但 id 不匹配 | 把结果块的 id 改成前面最近的 `server_tool_use.id` | 400 → **200** |
 | 已经配得上 | 不动,也不记规则 | — |
-| 连 `tool_use_id` 都没有 | 不瞎编 | — |
+| 连 `tool_use_id` 都没有,且内容为空 | 整块删除(零证据损失) | 真实会话 400 → **200** |
+| 连 `tool_use_id` 都没有,但有内容 | 合成确定性配对键补上两半 | 单测锁定 |
 
 选择补块而不是丢块:丢掉结果块同样能过(实测 200),但会丢失这一轮的搜索证据。
+无 id 孤儿是上游"幻影空搜索"(见 §3c)经 Science 落盘后的产物,留着它每一轮都 400;
+配对键只是相关性标记——上游自己发的两半 id 本来也对不上,合成键并不比原状更假。
 
 #### 净结果
 
-删除 920 行桥接 + 响应侧剥离过滤器 + 13 个相关测试,换成一条约六十行的窄规则。
+删除 920 行桥接 + 响应侧剥离过滤器 + 13 个相关测试。
 `web_search_20250305` 现在原样透传给上游(规则
 `tool.kimi.web_search.server-tool-preserve`),Science 按原生 web_search 渲染。
 
-真机验收:全新会话连续多轮联网搜索,历史推进到 5 条消息,修复规则命中,
-**零 upstream_failure**。
-
+> 第一次退役(2026-08-19 上午)在这里就收手了,真机验收 16 轮零报错,
+> 功能却是废的——助手内容里反复出现空的 `Search results for query:` 头,
+> 模型自检认为工具不可用,当场回滚。教训:**验一条补偿能否退役,要验功能,
+> 不能只验报错**。当天傍晚的隔离探测把"功能废"拆成了三个可修的窄毛病
+> (下两节),才完成第二次、真正的退役。
+>
 > 若 429 卷土重来(它是负载相关的),桥接的完整实现保留在 git 历史里,
 > 提交 `1bdbbbd` 之前的 `desktop/gateway/src/kimi_coding_search.rs`。
+
+### 3b. 搜索轮的噪声头(响应侧剥离)
+
+上游对声明了原生 web_search 的轮次,会在搜索前注入一个独立 text 块,内容恒为
+`Search results for query: <查询词>`,与紧随其后的 `server_tool_use.input.query`
+完全重复;K2.7 还会在 turn 末尾再发一个**悬挂噪声头**(宣布下一次搜索却直接
+`end_turn`,后面没有答案)——这就是第一次退役时看到的"冒号后面是空的"与
+"回答为空"。三次隔离探测三发三中,形态确定。
+
+补偿:规则 `provider.kimi.search-noise-text-strip`
+(`desktop/gateway/src/kimi_search_noise.rs`),流式与非流式都把该 text 块整块剥掉。
+流式实现按块缓冲到凑满前缀即拍板;被吞的块不占输出索引(Science 要求 index
+连续无空洞);**未命中的流量字节级零改写**。真实 K3/K2.7 会话中每个搜索轮均命中
+(日志 `noise=1`),剥后回答开头即正文。
+
+### 3c. 幻影空搜索对(响应侧剥离 + 请求侧修复)
+
+模型被告知"无需搜索"时,上游仍常发一对空壳:`server_tool_use` **连 id 都没有**、
+无 input,紧跟 `content: []` 的 `web_search_tool_result`(同样无 tool_use_id)。
+真实会话与探测中,不搜索的轮次几乎每轮都带这一对。
+
+危害有两层:Science 把它渲染成一个空的 Server Tool 框;落盘后只剩无 id 的孤儿
+结果块,**此后每一轮都 400 `tool_call_id is not found`**(真实会话第 3 轮当场复现,
+Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id 孤儿"一行的来源)。
+
+补偿:响应侧规则 `provider.kimi.empty-search-pair-strip` 把"无 id 的
+`server_tool_use` + 空内容结果块"整对剥掉,幻影对从此进不了历史;请求侧
+`web-search-result-pairing-repair` 的无 id 分支负责救活修复落地前已中毒的历史
+(实测同一会话 Resume 后 400 → 200)。**带 id 的真实零结果搜索不受影响**,原样透传。
+
+> 另:搜索轮的下一轮里,Science 会把上一轮的搜索结果存盘瘦身,并在 user 消息里
+> 附一段 `[System] Prior-turn server_tool(…) — results persisted.` 说明,UI 渲染成
+> 一个输出为空的 Server Tool 折叠框。**这是 Science 平台自己的历史压缩行为**,
+> 与渠道无关(官方渠道同样出现),CSSwitch 不改写它。
+
+#### 本轮真机验收(2026-08-19,内置浏览器驱动真实 Science + 真实订阅 key)
+
+同一 K3 会话连续 6 轮:原生搜索(组件渲染、来源齐全、开头无噪声)→ 凭历史追问
+(配对修复命中)→ 中毒历史 Resume 后再搜索(400 → 200)→ 无需搜索轮(幻影对
+剥离命中、落盘干净)→ 搜索历史 + python 工具循环(3 次 LLM 调用零失败,这正是
+当初 502 死循环的形态)→ 搜索 + 工具混合轮。K2.7 新起一轮原生搜索,正常回答。
+全程 `upstream_failure` 仅出现在修复落地前的中毒历史上。
 
 ### 4. 不接受 Anthropic `document` 内容块
 
