@@ -37,8 +37,13 @@ const STRIP_REQUEST_HEADERS: &[&str] = &[
 
 /// 响应侧剥离:连接语义由本端重建(保留 content-length,整体以
 /// `connection: close` + 读到 EOF 定界,SSE 不缓冲)。
-const STRIP_RESPONSE_HEADERS: &[&str] =
-    &["connection", "keep-alive", "transfer-encoding", "trailer", "upgrade"];
+const STRIP_RESPONSE_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "trailer",
+    "upgrade",
+];
 
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -120,7 +125,12 @@ fn handle_connection(
     let head = match read_request_head(&mut stream) {
         Ok(head) => head,
         Err(e) => {
-            write_plain(&mut stream, 400, "Bad Request", &format!("passthrough: {e}"));
+            write_plain(
+                &mut stream,
+                400,
+                "Bad Request",
+                &format!("passthrough: {e}"),
+            );
             return;
         }
     };
@@ -135,19 +145,43 @@ fn handle_connection(
     let body = match read_request_body(&mut stream, &head.headers) {
         Ok(body) => body,
         Err(e) => {
-            write_plain(&mut stream, 400, "Bad Request", &format!("passthrough: {e}"));
-            log.write(&head.method, &head.target, 400, started.elapsed(), false, 0, 0, Some("bad_request_body"));
+            write_plain(
+                &mut stream,
+                400,
+                "Bad Request",
+                &format!("passthrough: {e}"),
+            );
+            log.write(
+                &head.method,
+                &head.target,
+                400,
+                started.elapsed(),
+                false,
+                0,
+                0,
+                Some("bad_request_body"),
+            );
             return;
         }
     };
     if !head.target.starts_with('/') {
-        write_plain(&mut stream, 400, "Bad Request", "passthrough: 仅支持 origin-form 请求目标");
+        write_plain(
+            &mut stream,
+            400,
+            "Bad Request",
+            "passthrough: 仅支持 origin-form 请求目标",
+        );
         return;
     }
     let method = match reqwest::Method::from_bytes(head.method.as_bytes()) {
         Ok(method) => method,
         Err(_) => {
-            write_plain(&mut stream, 400, "Bad Request", "passthrough: 非法 HTTP 方法");
+            write_plain(
+                &mut stream,
+                400,
+                "Bad Request",
+                "passthrough: 非法 HTTP 方法",
+            );
             return;
         }
     };
@@ -163,8 +197,22 @@ fn handle_connection(
     }
     match request.body(body).send() {
         Err(e) => {
-            write_plain(&mut stream, 502, "Bad Gateway", &format!("passthrough upstream error: {e}"));
-            log.write(&head.method, &head.target, 502, started.elapsed(), false, req_bytes, 0, Some("upstream_error"));
+            write_plain(
+                &mut stream,
+                502,
+                "Bad Gateway",
+                &format!("passthrough upstream error: {e}"),
+            );
+            log.write(
+                &head.method,
+                &head.target,
+                502,
+                started.elapsed(),
+                false,
+                req_bytes,
+                0,
+                Some("upstream_error"),
+            );
         }
         Ok(mut resp) => {
             let status = resp.status();
@@ -273,7 +321,10 @@ fn read_request_head<R: Read>(stream: &mut R) -> Result<RequestHead, String> {
     })
 }
 
-fn read_request_body<R: Read>(stream: &mut R, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
+fn read_request_body<R: Read>(
+    stream: &mut R,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>, String> {
     if header_value(headers, "transfer-encoding")
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false)
@@ -399,7 +450,9 @@ impl EndpointLog {
         resp_bytes: u64,
         note: Option<&str>,
     ) {
-        let line = build_log_line(method, target, status, elapsed, sse, req_bytes, resp_bytes, note);
+        let line = build_log_line(
+            method, target, status, elapsed, sse, req_bytes, resp_bytes, note,
+        );
         if let Ok(mut file) = self.file.lock() {
             let _ = writeln!(file, "{line}");
             let _ = file.flush();

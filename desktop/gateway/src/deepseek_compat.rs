@@ -227,9 +227,14 @@ fn repair_malformed_server_tool_blocks(body: &mut Value, rule_ids: &mut Vec<Stri
         };
         let mut rewritten = Vec::with_capacity(content.len());
         for block in std::mem::take(content) {
-            let kind = block.get("type").and_then(Value::as_str).unwrap_or_default();
+            let kind = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let malformed = match kind {
-                "web_search_tool_result" | "web_fetch_tool_result" | "code_execution_tool_result" => {
+                "web_search_tool_result"
+                | "web_fetch_tool_result"
+                | "code_execution_tool_result" => {
                     block.get("tool_use_id").and_then(Value::as_str).is_none()
                 }
                 "server_tool_use" => block.get("id").and_then(Value::as_str).is_none(),
@@ -370,7 +375,10 @@ fn repair_orphan_tool_pairing(body: &mut Value, rule_ids: &mut Vec<String>) {
             std::collections::HashSet::new()
         };
 
-        let Some(content) = messages[index].get_mut("content").and_then(Value::as_array_mut) else {
+        let Some(content) = messages[index]
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+        else {
             continue;
         };
         let mut message_changed = false;
@@ -405,9 +413,7 @@ fn repair_orphan_tool_pairing(body: &mut Value, rule_ids: &mut Vec<String>) {
     }
 }
 
-fn tool_use_counts(
-    message: &Value,
-) -> (std::collections::HashMap<String, usize>, Vec<String>) {
+fn tool_use_counts(message: &Value) -> (std::collections::HashMap<String, usize>, Vec<String>) {
     let mut counts = std::collections::HashMap::new();
     let mut order = Vec::new();
     if let Some(blocks) = message.get("content").and_then(Value::as_array) {
@@ -569,7 +575,10 @@ mod tests {
             }]}),
             "deepseek-v4-pro",
         );
-        assert_eq!(body["messages"][0]["content"][0]["thinking"], "real reasoning");
+        assert_eq!(
+            body["messages"][0]["content"][0]["thinking"],
+            "real reasoning"
+        );
         assert!(body["messages"][0]["content"][0].get("signature").is_none());
     }
 
@@ -634,7 +643,13 @@ mod tests {
         );
         let results = body["messages"][1]["content"].as_array().unwrap();
         assert_eq!(results.len(), 3);
-        assert_eq!(results.iter().filter(|b| b["is_error"] == json!(true)).count(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|b| b["is_error"] == json!(true))
+                .count(),
+            2
+        );
         assert!(rules.contains(&RULE_ORPHAN_TOOL_PAIRING_REPAIR.to_string()));
     }
 
@@ -683,7 +698,10 @@ mod tests {
             "deepseek-v4-flash",
         );
         assert_eq!(body["max_tokens"], 32_768);
-        let (body, _) = normalize(json!({"max_tokens": 500, "messages": []}), "deepseek-v4-pro");
+        let (body, _) = normalize(
+            json!({"max_tokens": 500, "messages": []}),
+            "deepseek-v4-pro",
+        );
         assert_eq!(body["max_tokens"], 500);
     }
 }

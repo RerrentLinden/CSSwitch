@@ -1,36 +1,7 @@
 fn main() {
-    let args_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if args_os.get(1).and_then(|arg| arg.to_str()) == Some("codex-auth") {
-        let codex_args = args_os[2..]
-            .iter()
-            .map(|arg| arg.to_str().map(str::to_string))
-            .collect::<Option<Vec<_>>>();
-        let args = codex_args.unwrap_or_else(|| vec!["invalid".into(), "invalid".into()]);
-        if let Some(exit_code) = csswitch_gateway::codex_auth::run_streaming_cli(&args) {
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            return;
-        }
-        let run = csswitch_gateway::codex_auth::run_cli(&args);
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout().lock(), "{}", run.json);
-        if run.exit_code != 0 {
-            std::process::exit(run.exit_code);
-        }
-        return;
-    }
-    let args: Vec<String> = args_os
-        .into_iter()
+    let args: Vec<String> = std::env::args_os()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    if args.get(1).map(String::as_str) == Some("skill-install-mcp") {
-        if let Err(e) = csswitch_gateway::skill_install::run_mcp(&args[2..]) {
-            eprintln!("csswitch-gateway skill installer: {e}");
-            std::process::exit(1);
-        }
-        return;
-    }
     if args.get(1).map(String::as_str) == Some("official-passthrough") {
         if let Err(e) = csswitch_gateway::official_passthrough::run_cli(&args[2..]) {
             eprintln!("csswitch-gateway official-passthrough: {e}");

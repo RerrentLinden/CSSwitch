@@ -15,33 +15,12 @@ pub struct GatewayConfig {
     /// Non-Codex profiles receive a validated, non-sensitive selector snapshot.
     pub static_model_resolver: Option<crate::static_profile::StaticProfileResolver>,
     pub shim_mode: String,
-    /// CSSwitch-owned auth state root. Present only for Codex; OAuth secrets
-    /// themselves remain in CSSwitch private auth files.
-    pub codex_state_root: Option<std::path::PathBuf>,
-    pub(crate) codex_contract: Option<crate::provider_contracts::CodexRuntimeContract>,
-    /// Encrypted Anthropic thinking continuity state. Formal managed Kimi and
-    /// DeepSeek launches require it; scratch and unrelated providers leave it disabled.
-    pub(crate) reasoning_store: Option<std::sync::Arc<crate::reasoning_state::ReasoningStore>>,
-    /// Opaque per-spawn identity supplied by the Tauri process manager.
+    /// Opaque per-spawn identity supplied by the process manager.
     /// Standalone invocations may leave it empty, but managed launches always set it.
     pub launch_id: String,
-    /// CSSwitch-managed Science data-dir used only by the authenticated local
-    /// external-Skill install endpoint. Standalone gateways leave it unset.
-    pub skill_data_dir: Option<std::path::PathBuf>,
-    pub skill_bridge_dir: Option<std::path::PathBuf>,
-    /// Per-proxy HMAC key for the user-confirmed Skill filesystem bridge.
-    /// It is supplied only through the child environment and is never returned
-    /// from Gateway health or inference responses.
-    pub skill_bridge_token: Option<String>,
-    /// Verified Science runtime identity used by the local Skill attach control
-    /// plane. A gateway without this context still serves inference traffic but
-    /// does not install Skills.
-    pub science_host_context: Option<csswitch_skill_install_core::ScienceHostContext>,
 }
 
 pub const GATEWAY_INTENT_ENV: &str = "CSSWITCH_GATEWAY_INTENT";
-pub const REASONING_STATE_DIR_ENV: &str = "CSSWITCH_REASONING_STATE_DIR";
-pub const REASONING_PROFILE_SCOPE_ENV: &str = "CSSWITCH_REASONING_PROFILE_SCOPE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayIntent {
@@ -71,38 +50,16 @@ impl GatewayIntent {
 
 pub const UPSTREAM_UA: &str = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)";
 pub const DEFAULT_UPSTREAM_URL: &str = "https://api.deepseek.com/anthropic/v1/messages";
-pub const DEFAULT_QWEN_UPSTREAM_URL: &str =
-    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-pub const DEFAULT_CODEX_UPSTREAM_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 pub const DEEPSEEK_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-8", "DeepSeek V4 Pro"),
     ("claude-haiku-4-5", "DeepSeek V4 Flash"),
 ];
 
-pub const QWEN_MODELS: &[(&str, &str)] = &[
-    ("qwen3.7-max", "Qwen 3.7 Max"),
-    ("qwen-plus-latest", "Qwen Plus Latest"),
-    ("qwen-turbo", "Qwen Turbo"),
-];
-
-pub fn shim_mode(raw: Option<&str>) -> &'static str {
-    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "detect" => "detect",
-        "rewrite" => "rewrite",
-        _ => "off",
-    }
-}
-
-/// Canonical DSML mode shared by config parsing and runtime identity.
-/// Only DeepSeek is DSML-capable; every other provider is fail-safe `off`,
-/// even when the parent environment contains a stale or polluted value.
-pub fn canonical_shim_mode(provider: &str, raw: Option<&str>) -> &'static str {
-    if provider == "deepseek" {
-        shim_mode(raw)
-    } else {
-        "off"
-    }
+/// DSML shim 已随 DeepSeek 的 OpenAI 格式路径一起退役;保留函数是为了让
+/// 残留的环境变量显式归零,而不是被当成有效配置。
+pub fn canonical_shim_mode(_provider: &str, _raw: Option<&str>) -> &'static str {
+    "off"
 }
 
 /// thinking 策略解析:契约声明为准,环境变量作为显式 override(会记一行日志,
@@ -116,9 +73,7 @@ pub fn resolve_relay_thinking(env_value: Option<&str>, contract_policy: &str) ->
         .map(str::to_string);
     match (env, contract) {
         (Some(env), Some(contract)) if env != contract => {
-            eprintln!(
-                "relay thinking policy overridden by env: contract={contract} env={env}"
-            );
+            eprintln!("relay thinking policy overridden by env: contract={contract} env={env}");
             Some(env)
         }
         (Some(env), _) => Some(env),
@@ -127,11 +82,7 @@ pub fn resolve_relay_thinking(env_value: Option<&str>, contract_policy: &str) ->
 }
 
 pub fn provider_supported(provider: &str, shim: &str) -> bool {
-    match provider {
-        "deepseek" => matches!(shim, "off" | "detect" | "rewrite"),
-        "qwen" | "openai-custom" | "openai-responses" | "relay" | "codex" => shim == "off",
-        _ => false,
-    }
+    matches!(provider, "deepseek" | "relay") && shim == "off"
 }
 
 pub fn normalize_openai_base(base: &str) -> String {
@@ -246,46 +197,13 @@ fn upstream_url_for(
     default_upstream: String,
     override_raw: Option<String>,
 ) -> String {
-    if matches!(provider, "deepseek" | "qwen") {
+    if provider == "deepseek" {
         override_raw
             .filter(|v| !v.trim().is_empty())
             .unwrap_or(default_upstream)
     } else {
         default_upstream
     }
-}
-
-fn contract_requires_reasoning_continuity(contract_id: &str) -> bool {
-    matches!(contract_id, "deepseek-native")
-}
-
-fn reasoning_state_path(
-    managed_launch: bool,
-    intent: GatewayIntent,
-    contract_id: &str,
-    raw: Option<std::ffi::OsString>,
-) -> Result<Option<std::path::PathBuf>, String> {
-    if !managed_launch
-        || intent != GatewayIntent::Formal
-        || !contract_requires_reasoning_continuity(contract_id)
-    {
-        return Ok(None);
-    }
-    let path = raw.map(std::path::PathBuf::from).ok_or_else(|| {
-        format!("formal managed {contract_id} gateway 缺少 {REASONING_STATE_DIR_ENV}")
-    })?;
-    if !path.is_absolute()
-        || path == std::path::Path::new("/")
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        return Err(format!("{REASONING_STATE_DIR_ENV} 必须是安全的绝对目录"));
-    }
-    Ok(Some(path))
 }
 
 impl GatewayConfig {
@@ -321,7 +239,7 @@ impl GatewayConfig {
         );
         if !provider_supported(&provider, shim) {
             return Err(format!(
-                "只支持 deepseek + shim off/detect/rewrite 或 qwen/openai-custom/openai-responses/relay/codex + shim off（provider={provider}, shim={shim}）"
+                "只支持 deepseek 与 relay 两个 adapter（provider={provider}, shim={shim}）"
             ));
         }
 
@@ -383,10 +301,6 @@ impl GatewayConfig {
                 );
             }
             inference
-        } else if provider == "qwen" {
-            DEFAULT_QWEN_UPSTREAM_URL.to_string()
-        } else if provider == "codex" {
-            DEFAULT_CODEX_UPSTREAM_URL.to_string()
         } else {
             DEFAULT_UPSTREAM_URL.to_string()
         };
@@ -408,116 +322,26 @@ impl GatewayConfig {
                 "managed gateway launch requires an exact provider contract identity".into(),
             );
         }
-        let codex_state_root = if provider == "codex" {
-            Some(
-                std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .filter(|path| path.is_absolute())
-                    .ok_or("codex provider 需要绝对 HOME")?
-                    .join(crate::codex_auth::CODEX_STATE_DIR_NAME),
-            )
-        } else {
-            None
-        };
-        let codex_contract = if provider == "codex" {
-            Some(crate::provider_contracts::codex_contract_from_runtime(
-                &provider_contract,
-            )?)
-        } else {
-            None
-        };
-        let skill_data_dir = std::env::var_os("CSSWITCH_SKILL_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_absolute());
-        let skill_bridge_dir = std::env::var_os("CSSWITCH_SKILL_BRIDGE_DIR")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_absolute());
-        let skill_bridge_token =
-            std::env::var("CSSWITCH_SKILL_BRIDGE_TOKEN")
-                .ok()
-                .filter(|value| {
-                    value.len() == 64
-                        && value.chars().all(|character| character.is_ascii_hexdigit())
-                });
-        let science_host_context = std::env::var("CSSWITCH_SCIENCE_HOST_CONTEXT")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                serde_json::from_str::<csswitch_skill_install_core::ScienceHostContext>(&value)
-                    .map_err(|_| "CSSWITCH_SCIENCE_HOST_CONTEXT 不是合法的 Science host context")
-            })
-            .transpose()?;
-        if science_host_context
-            .as_ref()
-            .zip(skill_data_dir.as_ref())
-            .is_some_and(|(context, data_dir)| &context.data_dir != data_dir)
-        {
-            return Err("Science host context 与 Skill data-dir 不一致".into());
-        }
         let static_model_resolver = std::env::var(crate::static_profile::ENV_NAME)
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(|value| crate::static_profile::StaticProfileResolver::from_json(&value))
             .transpose()?;
         let intent = GatewayIntent::from_env()?;
-        if provider == "codex" {
-            if static_model_resolver.is_some() {
-                return Err("Codex 禁止注入静态模型目录".into());
-            }
-        } else {
-            match intent {
-                GatewayIntent::Formal | GatewayIntent::ScratchMessage => {
-                    let resolver = static_model_resolver.as_ref().ok_or_else(|| {
-                        format!("{provider} 缺少 {}", crate::static_profile::ENV_NAME)
-                    })?;
-                    if resolver.adapter() != provider {
-                        return Err("静态模型目录 adapter 与 gateway provider 不一致".into());
-                    }
+        match intent {
+            GatewayIntent::Formal | GatewayIntent::ScratchMessage => {
+                let resolver = static_model_resolver.as_ref().ok_or_else(|| {
+                    format!("{provider} 缺少 {}", crate::static_profile::ENV_NAME)
+                })?;
+                if resolver.adapter() != provider {
+                    return Err("静态模型目录 adapter 与 gateway provider 不一致".into());
                 }
-                GatewayIntent::ScratchModels if static_model_resolver.is_some() => {
-                    return Err("scratch-models 禁止注入静态模型目录".into());
-                }
-                GatewayIntent::ScratchModels => {}
             }
+            GatewayIntent::ScratchModels if static_model_resolver.is_some() => {
+                return Err("scratch-models 禁止注入静态模型目录".into());
+            }
+            GatewayIntent::ScratchModels => {}
         }
-        let reasoning_store = reasoning_state_path(
-            managed_launch_id,
-            intent,
-            &provider_contract.contract_id,
-            std::env::var_os(REASONING_STATE_DIR_ENV),
-        )?
-        .map(|state_dir| {
-            let credential = api_key
-                .as_deref()
-                .ok_or("thinking continuity credential is unavailable")?;
-            let profile_scope = std::env::var(REASONING_PROFILE_SCOPE_ENV)
-                .ok()
-                .filter(|value| {
-                    value.len() == 64
-                        && value
-                            .bytes()
-                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                })
-                .ok_or("thinking continuity profile scope is unavailable")?;
-            let catalog_fp = static_model_resolver
-                .as_ref()
-                .ok_or("thinking continuity model catalog is unavailable")?
-                .catalog_fp();
-            let profile_scope = format!(
-                "profile={profile_scope};provider-catalog={};model-catalog={catalog_fp}",
-                provider_contract.catalog_digest,
-            );
-            crate::reasoning_state::ReasoningStore::open(
-                &state_dir,
-                credential,
-                &provider_contract.contract_id,
-                &upstream_url,
-                &profile_scope,
-            )
-            .map(std::sync::Arc::new)
-            .map_err(|error| format!("thinking continuity store unavailable: {error}"))
-        })
-        .transpose()?;
         Ok(Self {
             provider,
             port: port.ok_or("--port 必填")?,
@@ -530,14 +354,7 @@ impl GatewayConfig {
             intent,
             static_model_resolver,
             shim_mode: shim.to_string(),
-            codex_state_root,
-            codex_contract,
-            reasoning_store,
             launch_id,
-            skill_data_dir,
-            skill_bridge_dir,
-            skill_bridge_token,
-            science_host_context,
         })
     }
 }
@@ -545,55 +362,20 @@ impl GatewayConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_shim_mode, joined_endpoints, normalize_openai_base, openai_endpoint,
-        provider_supported, reasoning_state_path, shim_mode, upstream_url_for, GatewayIntent,
+        joined_endpoints, normalize_openai_base, openai_endpoint, provider_supported,
+        upstream_url_for,
     };
     use crate::provider_contracts::EndpointJoin;
 
     #[test]
-    fn shim_mode_parses_deepseek_off_contract() {
-        assert_eq!(shim_mode(None), "off");
-        assert_eq!(shim_mode(Some("Detect")), "detect");
-        assert_eq!(shim_mode(Some(" Rewrite ")), "rewrite");
-        assert_eq!(shim_mode(Some("bad")), "off");
-    }
-
-    #[test]
-    fn canonical_shim_mode_is_deepseek_only_and_fail_safe() {
-        for (raw, expected) in [
-            (None, "off"),
-            (Some(" DETECT "), "detect"),
-            (Some(" Rewrite "), "rewrite"),
-            (Some("unknown"), "off"),
-        ] {
-            assert_eq!(canonical_shim_mode("deepseek", raw), expected);
-        }
-        for provider in [
-            "qwen",
-            "openai-custom",
-            "openai-responses",
-            "relay",
-            "codex",
-            "unknown",
-        ] {
-            assert_eq!(canonical_shim_mode(provider, Some(" Rewrite ")), "off");
-            assert_eq!(canonical_shim_mode(provider, Some("DETECT")), "off");
-        }
-    }
-
-    #[test]
     fn provider_support_matrix_accepts_only_canonical_shims() {
         assert!(provider_supported("deepseek", "off"));
-        assert!(provider_supported("deepseek", "detect"));
-        assert!(provider_supported("deepseek", "rewrite"));
-        assert!(provider_supported("qwen", "off"));
-        assert!(!provider_supported("qwen", "detect"));
-        assert!(provider_supported("openai-custom", "off"));
-        assert!(provider_supported("openai-responses", "off"));
+        assert!(!provider_supported("deepseek", "rewrite"));
         assert!(provider_supported("relay", "off"));
         assert!(!provider_supported("relay", "rewrite"));
-        assert!(provider_supported("codex", "off"));
-        assert!(!provider_supported("codex", "rewrite"));
+        for retired in ["qwen", "openai-custom", "openai-responses", "codex"] {
+            assert!(!provider_supported(retired, "off"), "{retired} 已退役");
+        }
     }
 
     #[test]
@@ -620,54 +402,6 @@ mod tests {
             super::resolve_relay_thinking(Some("enabled"), ""),
             Some("enabled".to_string())
         );
-    }
-
-    #[test]
-    fn reasoning_state_is_required_only_for_exact_formal_managed_anthropic_contracts() {
-        let contract = "deepseek-native";
-        assert!(reasoning_state_path(true, GatewayIntent::Formal, contract, None).is_err());
-        assert!(reasoning_state_path(
-            true,
-            GatewayIntent::Formal,
-            contract,
-            Some("relative/state".into())
-        )
-        .is_err());
-        assert!(reasoning_state_path(
-            true,
-            GatewayIntent::Formal,
-            contract,
-            Some("/private/tmp/../unsafe".into())
-        )
-        .is_err());
-        assert_eq!(
-            reasoning_state_path(
-                true,
-                GatewayIntent::Formal,
-                contract,
-                Some("/private/tmp/csswitch-reasoning-test".into())
-            )
-            .unwrap(),
-            Some(std::path::PathBuf::from(
-                "/private/tmp/csswitch-reasoning-test"
-            ))
-        );
-        assert_eq!(
-            reasoning_state_path(true, GatewayIntent::ScratchMessage, contract, None).unwrap(),
-            None
-        );
-        assert_eq!(
-            reasoning_state_path(false, GatewayIntent::Formal, contract, None).unwrap(),
-            None
-        );
-        // Kimi retired its thinking-continuity store together with the forced
-        // `enabled` rewrite, so it now behaves like any other relay.
-        for contract in ["anthropic-relay", "kimi-anthropic-relay"] {
-            assert_eq!(
-                reasoning_state_path(true, GatewayIntent::Formal, contract, None).unwrap(),
-                None
-            );
-        }
     }
 
     #[test]
@@ -778,37 +512,10 @@ mod tests {
             ),
             "http://127.0.0.1:1/poison"
         );
-        assert_eq!(
-            upstream_url_for("qwen", "https://default/qwen".to_string(), poison.clone()),
-            "http://127.0.0.1:1/poison"
-        );
-        assert_eq!(
-            upstream_url_for(
-                "openai-custom",
-                "http://candidate/v1/chat/completions".to_string(),
-                poison.clone()
-            ),
-            "http://candidate/v1/chat/completions"
-        );
-        assert_eq!(
-            upstream_url_for(
-                "openai-responses",
-                "http://candidate/v1/responses".to_string(),
-                poison.clone()
-            ),
-            "http://candidate/v1/responses"
-        );
+        // relay 的上游由契约 + base_url 决定,环境变量不得越过它。
         assert_eq!(
             upstream_url_for("relay", "http://candidate/v1/messages".to_string(), poison),
             "http://candidate/v1/messages"
-        );
-        assert_eq!(
-            upstream_url_for(
-                "codex",
-                super::DEFAULT_CODEX_UPSTREAM_URL.to_string(),
-                Some("http://127.0.0.1:1/poison".to_string())
-            ),
-            super::DEFAULT_CODEX_UPSTREAM_URL
         );
     }
 }

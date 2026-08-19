@@ -41,7 +41,11 @@ pub(crate) fn upstream_failure_metadata(operation: &'static str, error: &Upstrea
 /// 供应商兼容缺陷。仅在上游真的回了 HTTP 状态时输出——传输层失败的 detail 里
 /// 可能带 URL 与 query 凭证,那条路径保持不打印。
 fn upstream_error_diagnostic(error: &UpstreamError) -> Option<String> {
-    if std::env::var("CSSWITCH_DEBUG_UPSTREAM_ERROR").ok().as_deref() != Some("1") {
+    if std::env::var("CSSWITCH_DEBUG_UPSTREAM_ERROR")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         return None;
     }
     error.upstream_status?;
@@ -955,14 +959,7 @@ mod tests {
             intent: crate::config::GatewayIntent::Formal,
             static_model_resolver: None,
             shim_mode: "off".to_string(),
-            codex_state_root: None,
-            codex_contract: None,
-            reasoning_store: None,
             launch_id: "timeout-test".to_string(),
-            skill_data_dir: None,
-            skill_bridge_dir: None,
-            skill_bridge_token: None,
-            science_host_context: None,
         }
     }
 

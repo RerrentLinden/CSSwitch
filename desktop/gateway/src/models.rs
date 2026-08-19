@@ -2,7 +2,7 @@ use std::sync::RwLock;
 
 use serde_json::{json, Value};
 
-use crate::config::{DEEPSEEK_MODELS, QWEN_MODELS};
+use crate::config::DEEPSEEK_MODELS;
 
 const CREATED_AT: &str = "2026-01-01T00:00:00Z";
 
@@ -15,7 +15,6 @@ fn display_token(token: &str) -> String {
         "kimi" => "Kimi".into(),
         "minimax" => "MiniMax".into(),
         "mimo" => "MiMo".into(),
-        "qwen" => "Qwen".into(),
         _ => {
             let mut chars = token.chars();
             match chars.next() {
@@ -105,10 +104,6 @@ impl RelayModelCache {
 
 pub fn deepseek_models_response() -> Value {
     static_models_response(DEEPSEEK_MODELS)
-}
-
-pub fn qwen_models_response() -> Value {
-    static_models_response(QWEN_MODELS)
 }
 
 pub fn force_shell_response(model: &str) -> Value {
@@ -201,7 +196,7 @@ fn static_models_response(models: &[(&str, &str)]) -> Value {
 mod tests {
     use super::{
         deepseek_models_response, force_shell_response, normalize_live_models,
-        normalize_live_models_response, qwen_models_response, RelayModelCache,
+        normalize_live_models_response, RelayModelCache,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -214,15 +209,6 @@ mod tests {
         assert_eq!(v["data"][0]["display_name"], "DeepSeek V4 Pro");
         assert_eq!(v["first_id"], "claude-opus-4-8");
         assert_eq!(v["last_id"], "claude-haiku-4-5");
-    }
-
-    #[test]
-    fn models_body_matches_qwen_static_contract() {
-        let v = qwen_models_response();
-        assert_eq!(v["data"][0]["id"], "qwen3.7-max");
-        assert_eq!(v["data"][0]["display_name"], "Qwen 3.7 Max");
-        assert_eq!(v["first_id"], "qwen3.7-max");
-        assert_eq!(v["last_id"], "qwen-turbo");
     }
 
     #[test]
