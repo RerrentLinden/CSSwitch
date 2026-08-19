@@ -62,8 +62,12 @@ impl RelayFlavor {
 
     /// Server-tool blocks must be stripped from Kimi responses: the upstream
     /// cannot receive them back without breaking a later turn.
+    ///
+    /// 实验开关 `CSSWITCH_KIMI_WEB_SEARCH=native` 一并关闭响应侧剥离——请求侧
+    /// 原样送出 server tool 时,响应侧再剥离会在 content block 索引上留下空洞,
+    /// 客户端拿到的是残缺的流。两侧必须同时切换。
     pub fn filters_server_tool_blocks(self) -> bool {
-        matches!(self, Self::Kimi)
+        matches!(self, Self::Kimi) && !kimi_web_search_native()
     }
 }
 
@@ -1106,6 +1110,11 @@ fn replace_kimi_document_blocks(body: &mut Value, rule_ids: &mut Vec<String>) ->
     replaced
 }
 
+/// 实验开关,见 `filter_relay_server_tools`。默认关闭。
+fn kimi_web_search_native() -> bool {
+    std::env::var("CSSWITCH_KIMI_WEB_SEARCH").ok().as_deref() == Some("native")
+}
+
 fn filter_relay_server_tools(
     body: &mut Value,
     flavor: RelayFlavor,
@@ -1113,6 +1122,10 @@ fn filter_relay_server_tools(
 ) -> ServerToolOutcome {
     normalize_relay_tools(body, rule_ids);
     let policy = match flavor {
+        // 实验开关:`CSSWITCH_KIMI_WEB_SEARCH=native` 让 Kimi 也走"原样保留"策略,
+        // 用于验证上游的 429 缺陷是否已修复、桥接是否还有存在必要。
+        // 默认仍是桥接——退役它需要真实会话证据,不能只凭一次探测。
+        RelayFlavor::Kimi if kimi_web_search_native() => AnthropicServerToolPolicy::DeepSeek,
         RelayFlavor::Kimi => AnthropicServerToolPolicy::Kimi,
         RelayFlavor::DeepSeek => AnthropicServerToolPolicy::DeepSeek,
         RelayFlavor::Generic => return ServerToolOutcome::default(),

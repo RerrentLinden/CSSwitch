@@ -124,6 +124,37 @@ Science 声明 web_search_20250305(server)
 模型行为观察：当 Science 的其余 24 个客户端工具同时可用时，模型有时会绕开 web_search 改用 `bash`
 等工具，甚至声称环境里没有 web_search。这是模型的选择而非链路故障，桥接在这种轮次保持空闲。
 
+### 3b. 2026-08-19 复测:429 未复现,但桥接仍然必需
+
+**429 部分**:32 次请求(k3 与 kimi-for-coding 各一轮,含"只声明 web_search"与
+"web_search + 24 个客户端工具"两种形态)**全部 200,零 429**。上游这条缺陷
+当前不复现——可能已修,也可能只是当时负载所致(原始报错是引擎过载,本就与负载相关)。
+
+**但桥接不能退役**,原因是另一条缺陷,本轮实测暴露:
+
+用实验开关 `CSSWITCH_KIMI_WEB_SEARCH=native`(请求侧原样送 server tool、
+响应侧同步关闭剥离)在真实 Science 会话里跑:
+
+| 轮次 | 结果 |
+| --- | --- |
+| 第 1 轮(msgs=2,发起搜索) | 200,上游 SSE 完整:`server_tool_use` + `web_search_tool_result` + 干净 `message_stop` |
+| 第 2 轮(msgs=4,历史带上搜索结果) | **400** `tool_call_id  is not found` |
+
+`tool_call_id` 后是两个空格 —— **id 为空**。Kimi 的兼容层把
+`web_search_tool_result` 映射成 OpenAI tool 消息时要求 `tool_call_id`,
+而该块本身不携带 `tool_use_id`,于是配不上任何 tool_call。
+
+后果与 `document` 块同构:**一次搜索让此后每一轮都失败**。
+所以桥接的价值不只是绕开 429,更在于**搜索证据以其它形态进入历史**,
+不会在下一轮把整个会话卡死。
+
+顺带确认上游流本身没问题:直连抓取 2163 行 SSE,生命周期完整、`stop_reason: end_turn`。
+问题只出现在**把结果送回去的那一轮**。
+
+> 排查笔记:首次实验只翻了请求侧策略,响应侧仍在剥离 server tool 块,
+> 导致 content block 索引出现空洞,Science 表现为无限重试。两侧必须同时切换。
+> 另有一次 `499` 是重启网关掐断了正在进行的流,不是上游行为。
+
 ### 4. 不接受 Anthropic `document` 内容块
 
 上游的 Anthropic 兼容层没有实现 `document` 块。实测四种 source 形态全部失败且报文一致
