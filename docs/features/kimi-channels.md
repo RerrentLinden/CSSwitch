@@ -1,58 +1,38 @@
-# Kimi 渠道（开放平台 / for Coding）
+# Kimi 渠道
 
-CSSwitch 提供两个 Kimi 渠道：开放平台 `https://api.moonshot.cn/anthropic` 与订阅制编码端点
-`https://api.kimi.com/coding`。两者**共用同一个 provider contract 与同一套兼容补偿**，
-差异只有默认地址和模型预设清单，而这两项都在 template 层。
+Kimi 走一个 provider contract（`kimi-anthropic-relay`），默认地址
+`https://api.kimi.com/coding`，可在控制台改成开放平台或其它区域端点；
+模型清单由用户在四个槽里自己填，所以换端点不需要改代码。
 
-> **证据边界**：下述四条补偿的实测证据全部来自 `api.kimi.com/coding`。
-> 开放平台按用户判定沿用同一套补偿，**未独立实测**。若开放平台的行为与此处描述不符，
+> **证据边界**：补偿的实测证据来自 `api.kimi.com/coding`，2026-08-19 在 K3 上复测。
+> K2.7 系列与开放平台按用户判定沿用同一套补偿，**未独立实测**。若行为不符，
 > 表现应为可见错误而非静默降级。
 
-## 后端契约（已交付）
+## 后端契约
 
 | 项 | 值 |
 | --- | --- |
-| template id | `kimi`（开放平台） / `kimi-coding`（编码端点） |
-| provider contract | `kimi-anthropic-relay`（两者共用） |
+| provider contract | `kimi-anthropic-relay` |
 | adapter / transport | `relay` / `anthropic_messages` |
 | 鉴权 | `bearer` |
-| 端点拼接 | `anthropic_v1`（base + `/v1/messages`） |
-| 默认 base_url | `https://api.moonshot.cn/anthropic` / `https://api.kimi.com/coding`（均可编辑） |
-| 模型发现 | `anthropic_models_or_manual` |
-| thinking policy | `upstream_default` |
-| 模型预设 id | `kimi` / `kimi-coding` |
+| 端点拼接 | `anthropic_v1`(base + `/v1/messages`) |
+| 默认 base_url | `https://api.kimi.com/coding`(可编辑) |
+| thinking policy | `upstream_default`(由契约声明,不靠环境变量) |
 
-编码端点的模型预设（来自实测 `/v1/models`）：
+默认预填的模型槽(来自实测 `/v1/models`,均可在控制台改):
 
-| upstream_model | display_name | context | 角色绑定 |
-| --- | --- | --- | --- |
-| `kimi-for-coding` | K2.7 Coding | 262k | opus / sonnet，默认 |
-| `kimi-for-coding-highspeed` | K2.7 Coding Highspeed | 262k | haiku |
-| `k3` | K3 | 1M | fable |
-| `k3-256k` | K3-256k | 262k | — |
-
-## 开放平台曾经独有、现已移除的处理
-
-开放平台早期各自演化出一套只服务它的改动。用户判定这些属于过度补偿，本轮全部移除，
-两个渠道自此走同一条代码路径：
-
-| 移除项 | 原行为 | 现行为 |
+| 槽 | upstream_model | 显示名 |
 | --- | --- | --- |
-| `?beta=true` 查询参数 | 无条件追加到上游 URL | 不再追加 |
-| `anthropic-beta` 头 | 强制注入 `claude-code-20250219` | 只透传 Science 的入站值 |
-| User-Agent | 强制改写为 `claude-cli/…`，并丢弃非 `claude-cli/` 的入站 UA | 透传入站值 |
-| `x-app` 头 | 强制为 `cli` | 透传入站值 |
-| 失败历史尾巴清理 | 删除历史里的空 assistant 占位块 | 不再处理 |
-| thinking 强制 `enabled` | 任意取值改写为 `enabled` + budget | 交给上游默认（见下节 1） |
-| thinking 续写存储 | 落盘保存 / 恢复 thinking 块 | 已退役，仅 DeepSeek 保留 |
+| 默认(均衡) | `k3-256k` | Kimi K3 256k |
+| 高质量 | `k3` | Kimi K3 |
+| 快速 | `kimi-for-coding` | Kimi K2.7 |
+| Fable | 留空 | 继承默认槽 |
 
-前四项是 Claude Code 客户端身份伪装。**如需恢复，实现完整保留在 git 历史中**，
-不在代码里留注释掉的死代码。
+端点当前提供:`kimi-for-coding`、`kimi-for-coding-highspeed`、`k3`、`k3-256k`。
 
 ## 上游缺陷与已实施的补偿
 
-四条都由 `api.kimi.com/coding` 的真实 live 请求确认，并各自绑定 capability 规则与单测。
-两个渠道共用这些补偿。
+四条都由 `api.kimi.com/coding` 的真实 live 请求确认，各自绑定规则 ID 与单测。
 
 ### 1. 非标准 `thinking: {"type":"auto"}` 导致静默不思考
 
@@ -76,7 +56,12 @@ Science 的工作项分类器（`create_work_item`）正是这个形状，每建
 （分类器依赖拿到结构化输出）。`any` 与 `auto` 上游无此问题，不做任何补偿。
 规则 `provider.kimi.specified-tool-choice-disables-thinking`。
 
-### 3. 声明 web_search 但未搜索时返回 429
+### 3. 声明 web_search 但未搜索时返回 429(**观察期**)
+
+> 2026-08-19 复测:连续两次"声明 web_search 但模型未搜索"均返回 200,**未复现 429**。
+> 上游可能已修。桥接代码与规则保留待观察;若 K3 日常使用持续无 429,可退役该桥。
+> 下面是当初的原始记录。
+
 
 上游确实原生支持 `web_search_20250305`，但只要声明了该工具而模型本轮**没有实际发起搜索**，
 就返回 `429 rate_limit_error: "The engine is currently overloaded"`。
@@ -163,24 +148,8 @@ Agent 可以自己把页面渲染成图像再作为 `image` 块传入，上游�
 
 `image` 块不受影响，上游可正常接受。
 
-## 桌面端 UI
+## 控制台
 
-已交付，`desktop/src/main.js`：
-
-- **模型连接页入口** —— 「新建配置 → 选择服务商」网格中以「Kimi for Coding」出现，分类 `国内`，
-  紧邻 Kimi（Moonshot）。真实后端由 `templates.rs` 的 `list_templates` 驱动；
-  预览/mock 模式另有一份 `MOCK_TEMPLATES` 条目需同步，两者已一致。
-- **图标** —— 复用 Kimi 品牌图标。`modelFamilyKey()` 中为 `kimi-coding` 加了显式映射，
-  不再依赖 base_url 正则兜底。
-- **兼容性提示** —— 模板 `compatibility_notice` 在新建与编辑表单的模型配置说明行后呈现，
-  文案说明 429 缺陷**以及桥接已让联网搜索可用**，避免被误读成能力缺失。
-  两个 Kimi 模板共用同一份文案常量 `KIMI_COMPATIBILITY_NOTICE`。
-- **模型预设** —— 四个模型按 `catalog/model-presets.v1.json` 预填到默认 / 高质量 / 快速 / Fable 四槽。
-  预览模式的通用规则会把最后一个模型当作 haiku，与真实预设不符，因此加了
-  `MOCK_ROLE_BINDING_OVERRIDES` 使预览与真实目录一致。
-- **base_url** —— 默认 `https://api.kimi.com/coding`，可编辑。
-
-已在浏览器 mock 模式下可视化验收：服务商网格、默认值预填、四槽模型、创建后入列与图标、
-编辑视图回读、深色主题，均正常。
-
-不需要在前端重复实现的：contract、鉴权、模型发现、thinking 与工具策略都由后端契约决定。
+模型配置在 WebUI 的「渠道配置 → Kimi」里:base_url、API Key、四个模型槽
+(默认必填,其余留空继承默认)、「获取可用模型」直接向上游拉清单。
+显示名就是 Science 模型菜单里看到的名字。
