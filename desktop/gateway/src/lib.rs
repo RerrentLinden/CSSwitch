@@ -14,3 +14,5 @@ pub(crate) mod provider_contracts;
 pub mod science;
 pub mod server;
 pub mod static_profile;
+#[cfg(target_os = "macos")]
+pub mod tray;
