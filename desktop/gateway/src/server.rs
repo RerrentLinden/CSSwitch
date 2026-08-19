@@ -13,7 +13,10 @@ use crate::{
     connect, kimi_search_noise, messages, models,
 };
 
-use crate::kimi_search_noise::RULE_PROVIDER_KIMI_SEARCH_NOISE_TEXT_STRIP as RULE_SEARCH_NOISE;
+use crate::kimi_search_noise::{
+    RULE_PROVIDER_KIMI_EMPTY_SEARCH_PAIR_STRIP as RULE_PAIR_STRIP,
+    RULE_PROVIDER_KIMI_SEARCH_NOISE_TEXT_STRIP as RULE_NOISE_STRIP,
+};
 
 struct RequestHead {
     method: String,
@@ -293,6 +296,17 @@ fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> std::io::Result<()> {
     stream.write_all(chunk)?;
     stream.write_all(b"\r\n")?;
     stream.flush()
+}
+
+fn stream_strip_rules(stats: &kimi_search_noise::StripStats) -> String {
+    let mut rules = Vec::new();
+    if stats.noise_blocks > 0 {
+        rules.push(RULE_NOISE_STRIP);
+    }
+    if stats.pair_blocks > 0 {
+        rules.push(RULE_PAIR_STRIP);
+    }
+    rules.join(",")
 }
 
 fn stream_error_event(detail: &str) -> Vec<u8> {
@@ -644,7 +658,7 @@ where
     // 过滤器失败必须携带真实原因:既写日志也发给客户端,不得降级成
     // 无信息量的通用文案(2026-08-19 的诊断黑洞正是这么来的)。
     let filter_failure = |error: &str, emit: &mut F| {
-        eprintln!("relay stream filter error rules={RULE_SEARCH_NOISE} error={error}");
+        eprintln!("relay stream filter error={error}");
         if emit(&stream_error_event(&format!(
             "CSSwitch response filter: {error}"
         )))
@@ -716,11 +730,14 @@ where
                         }
                         Err(error) => return filter_failure(&error, &mut emit),
                     }
-                    if filter.stripped_blocks() > 0 {
+                    let stats = filter.stats();
+                    if stats.total_blocks() > 0 {
                         eprintln!(
-                            "relay stream rules={RULE_SEARCH_NOISE} stripped={} bytes={}",
-                            filter.stripped_blocks(),
-                            filter.stripped_bytes()
+                            "relay stream rules={} noise={} pair={} bytes={}",
+                            stream_strip_rules(&stats),
+                            stats.noise_blocks,
+                            stats.pair_blocks,
+                            stats.bytes
                         );
                     }
                 }
@@ -1010,18 +1027,22 @@ fn handle_messages(
             Ok(mut resp) => {
                 if noise_filter.is_some() && resp.status == 200 {
                     if let Ok(mut body) = serde_json::from_slice::<Value>(&resp.body) {
-                        let (blocks, bytes) = kimi_search_noise::strip_nonstream_noise(&mut body);
-                        if blocks > 0 {
+                        let stats = kimi_search_noise::strip_nonstream_noise(&mut body);
+                        if stats.total_blocks() > 0 {
                             match serde_json::to_vec(&body) {
                                 Ok(stripped) => {
                                     eprintln!(
-                                        "relay nonstream rules={RULE_SEARCH_NOISE} stripped={blocks} bytes={bytes}"
+                                        "relay nonstream rules={} noise={} pair={} bytes={}",
+                                        stream_strip_rules(&stats),
+                                        stats.noise_blocks,
+                                        stats.pair_blocks,
+                                        stats.bytes
                                     );
                                     resp.body = stripped;
                                 }
                                 Err(error) => {
                                     eprintln!(
-                                        "relay nonstream rules={RULE_SEARCH_NOISE} serialization failed: {error}"
+                                        "relay nonstream noise strip serialization failed: {error}"
                                     );
                                     api_error_json(
                                         stream,

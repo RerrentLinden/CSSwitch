@@ -563,6 +563,7 @@ fn repair_web_search_result_pairing(body: &mut Value, rule_ids: &mut Vec<String>
         return;
     };
     let mut changed = false;
+    let mut synthesized = 0usize;
     for message in messages.iter_mut() {
         let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
@@ -598,19 +599,44 @@ fn repair_web_search_result_pairing(body: &mut Value, rule_ids: &mut Vec<String>
                             rebuilt.push(fixed);
                         }
                         // 完全没有 server_tool_use:补一个同 id 的,保住搜索证据。
-                        None => {
-                            let Some(id) = current else {
+                        None => match current {
+                            Some(id) => {
+                                rebuilt.push(json!({
+                                    "type": "server_tool_use",
+                                    "id": id,
+                                    "name": "web_search",
+                                    "input": {},
+                                }));
                                 rebuilt.push(block.clone());
-                                continue;
-                            };
-                            rebuilt.push(json!({
-                                "type": "server_tool_use",
-                                "id": id,
-                                "name": "web_search",
-                                "input": {},
-                            }));
-                            rebuilt.push(block.clone());
-                        }
+                            }
+                            // 连 tool_use_id 都没有的孤儿结果块。上游的幻影空搜索
+                            // (无 id 空壳对)经 Science 落盘后正是这个形态,留在
+                            // 历史里每一轮都 400 "tool_call_id is not found"
+                            // (2026-08-19 真实会话复现)。空内容直接删,零证据损失;
+                            // 有内容则合成配对键保住证据——键只是相关性标记,
+                            // 上游自己的两半 id 本来也对不上。
+                            None => {
+                                let empty = block
+                                    .get("content")
+                                    .and_then(Value::as_array)
+                                    .is_none_or(|content| content.is_empty());
+                                if empty {
+                                    changed = true;
+                                    continue;
+                                }
+                                synthesized += 1;
+                                let id = format!("srvtoolu_csswitch_repair_{synthesized}");
+                                rebuilt.push(json!({
+                                    "type": "server_tool_use",
+                                    "id": id.clone(),
+                                    "name": "web_search",
+                                    "input": {},
+                                }));
+                                let mut fixed = block.clone();
+                                fixed["tool_use_id"] = Value::String(id);
+                                rebuilt.push(fixed);
+                            }
+                        },
                     }
                     changed = true;
                 }
@@ -1070,15 +1096,39 @@ mod tests {
     }
 
     #[test]
-    fn kimi_does_not_invent_a_pairing_key_when_the_result_has_none() {
-        // 连 tool_use_id 都没有时不瞎编:没有可用的配对键,补出来的块同样配不上。
+    fn kimi_repairs_idless_orphan_results_by_content() {
+        // 无 tool_use_id 的孤儿结果块留在历史里每一轮都 400
+        // "tool_call_id is not found"(2026-08-19 真实会话:上游幻影空搜索
+        // 经 Science 落盘后正是这个形态)。空内容直接删,零证据损失。
         let (body, meta) = kimi(json!({
             "messages": [{"role": "assistant", "content": [
-                {"type": "web_search_tool_result", "content": []}
+                {"type": "web_search_tool_result", "content": []},
+                {"type": "text", "text": "答案"}
             ]}]
         }));
-        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 1);
-        assert!(!meta
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert!(meta
+            .rule_ids
+            .contains(&"provider.kimi.web-search-result-pairing-repair".to_string()));
+
+        // 有内容则合成配对键保住证据:键只是相关性标记,上游自己的
+        // 两半 id 本来也对不上。
+        let (body, meta) = kimi(json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "web_search_tool_result", "content": [
+                    {"type": "web_search_result", "url": "https://example.test"}
+                ]}
+            ]}]
+        }));
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "server_tool_use");
+        let synthesized = content[0]["id"].as_str().unwrap();
+        assert!(synthesized.starts_with("srvtoolu_csswitch_repair_"));
+        assert_eq!(content[1]["tool_use_id"], synthesized);
+        assert!(meta
             .rule_ids
             .contains(&"provider.kimi.web-search-result-pairing-repair".to_string()));
     }
