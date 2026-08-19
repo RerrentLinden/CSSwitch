@@ -27,10 +27,31 @@ pub struct UpstreamError {
 }
 
 pub(crate) fn upstream_failure_metadata(operation: &'static str, error: &UpstreamError) -> String {
-    format!(
+    let base = format!(
         "POST /v1/messages upstream_failure operation={operation} status={} upstream_status={:?}",
         error.status, error.upstream_status
-    )
+    );
+    match upstream_error_diagnostic(error) {
+        Some(diagnostic) => format!("{base} {diagnostic}"),
+        None => base,
+    }
+}
+
+/// 诊断开关 `CSSWITCH_DEBUG_UPSTREAM_ERROR=1` 下附带上游错误正文,用于定位
+/// 供应商兼容缺陷。仅在上游真的回了 HTTP 状态时输出——传输层失败的 detail 里
+/// 可能带 URL 与 query 凭证,那条路径保持不打印。
+fn upstream_error_diagnostic(error: &UpstreamError) -> Option<String> {
+    if std::env::var("CSSWITCH_DEBUG_UPSTREAM_ERROR").ok().as_deref() != Some("1") {
+        return None;
+    }
+    error.upstream_status?;
+    let detail: String = error
+        .detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(400)
+        .collect();
+    Some(format!("upstream_detail={detail}"))
 }
 
 #[derive(Debug)]

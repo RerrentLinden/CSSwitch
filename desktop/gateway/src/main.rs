@@ -31,6 +31,13 @@ fn main() {
         }
         return;
     }
+    if args.get(1).map(String::as_str) == Some("official-passthrough") {
+        if let Err(e) = csswitch_gateway::official_passthrough::run_cli(&args[2..]) {
+            eprintln!("csswitch-gateway official-passthrough: {e}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("science-control") {
         match csswitch_gateway::science_control::run_cli(&args[2..]) {
             Ok(result) => println!("{result}"),

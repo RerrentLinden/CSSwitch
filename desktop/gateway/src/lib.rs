@@ -12,6 +12,7 @@ pub mod dsml_shim;
 pub(crate) mod kimi_coding_search;
 pub mod messages;
 pub mod models;
+pub mod official_passthrough;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod policy;
