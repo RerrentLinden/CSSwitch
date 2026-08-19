@@ -10,11 +10,8 @@ fn display_token(token: &str) -> String {
     match token.to_ascii_lowercase().as_str() {
         "claude" => "Claude".into(),
         "deepseek" => "DeepSeek".into(),
-        "glm" => "GLM".into(),
         "gpt" => "GPT".into(),
         "kimi" => "Kimi".into(),
-        "minimax" => "MiniMax".into(),
-        "mimo" => "MiMo".into(),
         _ => {
             let mut chars = token.chars();
             match chars.next() {
@@ -213,9 +210,9 @@ mod tests {
 
     #[test]
     fn force_shell_response_matches_python_contract() {
-        let v = force_shell_response("glm-4.5");
+        let v = force_shell_response("k3-256k");
         assert_eq!(v["data"][0]["id"], "claude-opus-4-8");
-        assert_eq!(v["data"][0]["display_name"], "glm-4.5");
+        assert_eq!(v["data"][0]["display_name"], "k3-256k");
         assert_eq!(v["first_id"], "claude-opus-4-8");
         assert_eq!(v["last_id"], "claude-opus-4-8");
     }
@@ -223,16 +220,16 @@ mod tests {
     #[test]
     fn live_models_response_normalizes_supported_parameters() {
         let v = normalize_live_models_response(&json!({"data": [
-            {"id": "glm-4.5", "supported_parameters": ["tools", "temperature"]},
+            {"id": "k3-256k", "supported_parameters": ["tools", "temperature"]},
             {"id": "glm-lite", "supported_parameters": ["temperature"]},
             {"id": "glm-x"},
             {"no_id": true}
         ]}));
-        assert_eq!(v["data"][0]["id"], "glm-4.5");
+        assert_eq!(v["data"][0]["id"], "k3-256k");
         assert_eq!(v["data"][0]["supports_tools"], true);
         assert_eq!(v["data"][1]["supports_tools"], false);
         assert!(v["data"][2]["supports_tools"].is_null());
-        assert_eq!(v["first_id"], "glm-4.5");
+        assert_eq!(v["first_id"], "k3-256k");
         assert_eq!(v["last_id"], "glm-x");
     }
 
@@ -253,7 +250,7 @@ mod tests {
     fn normalize_live_models_humanizes_machine_displays_without_changing_ids() {
         let response = normalize_live_models_response(&json!({"data": [
             {"id": "kimi-k3"},
-            {"id": "qwen-plus-latest", "display_name": "qwen-plus-latest"},
+            {"id": "kimi-for-coding", "display_name": "kimi-for-coding"},
             {"id": "claude-sonnet-5", "display_name": "claude-sonnet-5"},
             {"id": "vendor/model-v2", "display_name": "compact-label"},
             {"id": "vendor-model", "display_name": "Vendor Model Pro"}
@@ -261,8 +258,8 @@ mod tests {
         let data = response["data"].as_array().unwrap();
         assert_eq!(data[0]["id"], "kimi-k3");
         assert_eq!(data[0]["display_name"], "kimi-k3");
-        assert_eq!(data[1]["id"], "qwen-plus-latest");
-        assert_eq!(data[1]["display_name"], "qwen-plus-latest");
+        assert_eq!(data[1]["id"], "kimi-for-coding");
+        assert_eq!(data[1]["display_name"], "kimi-for-coding");
         assert_eq!(data[2]["id"], "claude-sonnet-5");
         assert_eq!(data[2]["display_name"], "Claude Sonnet 5");
         assert_eq!(data[3]["id"], "vendor/model-v2");

@@ -193,27 +193,6 @@
       ]
     },
     {
-      "id": "tool.deepseek.web_search.server-tool-preserve",
-      "scope": "tool",
-      "match": {
-        "provider": "deepseek",
-        "provider_contract": "deepseek-native",
-        "tool_type_family": "web_search_*"
-      },
-      "status": "supported",
-      "action": "none",
-      "reason": "DeepSeek's native Anthropic contract supports provider-side Web Search. CSSwitch preserves the typed declaration and its server_tool_use/web_search_tool_result history without treating it as a DSML client function.",
-      "evidence": [
-        "desktop/gateway/src/policy.rs",
-        "desktop/gateway/src/server.rs",
-        "https://api-docs.deepseek.com/guides/anthropic_api/"
-      ],
-      "tests": [
-        "desktop/gateway/src/policy.rs::tests::deepseek_server_tool_policy_preserves_web_search_and_client_tools_only",
-        "test.test_gateway_rust.RustGatewayLoopback.test_deepseek_anthropic_server_tool_policy_and_web_search_two_round_history"
-      ]
-    },
-    {
       "id": "tool.deepseek.unsupported-server-tool-filter",
       "scope": "tool",
       "match": {
@@ -257,54 +236,6 @@
       "tests": [
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools",
         "desktop/gateway/src/policy.rs::tests::deepseek_server_tool_policy_preserves_web_search_and_client_tools_only"
-      ]
-    },
-    {
-      "id": "tool.relay.input-schema-normalize",
-      "scope": "tool",
-      "match": {
-        "provider": "relay",
-        "schema_field": "input_schema"
-      },
-      "status": "supported",
-      "action": "normalize",
-      "reason": "Anthropic-compatible relay providers can reject empty or loose input_schema values, so CSSwitch normalizes relay tools to object schemas without mutating the caller request.",
-      "evidence": [
-        "desktop/gateway/src/anthropic_compat.rs",
-        "desktop/gateway/src/anthropic_compat.rs",
-        "test/golden/relay_anthropic.json"
-      ],
-      "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
-        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_tool_choice_fixture_matrix_matches_python",
-        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
-        "test.test_gateway_rust.RustGatewayLoopback.test_relay_forced_model_shell_and_nonstream_passthrough"
-      ]
-    },
-    {
-      "id": "tool.siliconflow.forced-named-to-any",
-      "scope": "tool",
-      "match": {
-        "provider": "relay",
-        "endpoint_hosts": [
-          "api.siliconflow.cn",
-          "api.siliconflow.com"
-        ],
-        "tool_choice_type": "tool",
-        "tools_nonempty": true
-      },
-      "status": "limited",
-      "action": "degrade",
-      "reason": "CSSwitch is based on historical SiliconFlow compatibility evidence: for exact Anthropic endpoint hosts it degrades only forced named tool_choice to any while preserving tools. Live provider behavior was not revalidated in this worktree; current evidence is source, fixture, and loopback only.",
-      "evidence": [
-        "desktop/gateway/src/policy.rs",
-        "desktop/gateway/src/anthropic_compat.rs",
-        "desktop/gateway/src/anthropic_compat.rs"
-      ],
-      "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_tool_choice_fixture_matrix_matches_python",
-        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_tool_choice_fixture_matrix_matches_python",
-        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_endpoint_matching_is_exact_and_url_parsed"
       ]
     },
     {
@@ -353,30 +284,6 @@
         "desktop/gateway/src/openai_responses.rs::tests::dashscope_responses_host_contract_matches_python_fixture",
         "desktop/gateway/src/openai_responses.rs::tests::responses_dashscope_rules_match_python_fixture",
         "test.test_gateway_rust.RustGatewayLoopback.test_dashscope_responses_uppercase_host_rules_and_safe_metadata_logs"
-      ]
-    },
-    {
-      "id": "tool.dsml.deepseek-tooluse-rewrite",
-      "scope": "tool",
-      "match": {
-        "provider": "deepseek",
-        "shim_mode": "rewrite",
-        "leak_format": "DSML"
-      },
-      "status": "limited",
-      "action": "normalize",
-      "reason": "Managed DeepSeek runtimes enable the DSML shim by default so known leaked DSML tool calls become Anthropic tool_use blocks; explicit off and detect overrides remain available.",
-      "evidence": [
-        "desktop/gateway/src/dsml_shim.rs",
-        "desktop/gateway/src/dsml_shim.rs",
-        "desktop/gateway/src/server.rs"
-      ],
-      "tests": [
-        "desktop/gateway/src/dsml_shim.rs::tests::stream_dsml_becomes_tool_use_across_chunk_sizes",
-        "desktop/gateway/src/dsml_shim.rs::tests::rewrite_nonstream_injects_stable_tool_use_and_stop_reason",
-        "desktop/gateway/src/dsml_shim.rs::tests::rewrite_nonstream_injects_stable_tool_use_and_stop_reason",
-        "test.test_gateway_rust.RustGatewayLoopback.test_deepseek_dsml_rewrite_nonstream_opt_in",
-        "test.test_gateway_rust.RustGatewayLoopback.test_deepseek_dsml_rewrite_stream_opt_in"
       ]
     }
   ],

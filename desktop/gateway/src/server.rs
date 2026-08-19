@@ -275,10 +275,7 @@ fn handle_get(
             }
             write_json(stream, 200, "OK", health)
         }
-        "/v1/models"
-            if cfg.provider != "codex"
-                && cfg.intent != crate::config::GatewayIntent::ScratchModels =>
-        {
+        "/v1/models" if cfg.intent != crate::config::GatewayIntent::ScratchModels => {
             let Some(resolver) = cfg.static_model_resolver.as_ref() else {
                 typed_error_json(
                     stream,
@@ -1024,7 +1021,6 @@ fn handle_messages(
             raw,
             &target_model,
             cfg.relay_thinking.as_deref(),
-            &cfg.upstream_url,
             provider_contract_id,
         ) {
             Ok(result) => result,

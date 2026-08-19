@@ -15,8 +15,6 @@ const RULE_PROVIDER_KIMI_SPECIFIED_TOOL_CHOICE_DISABLES_THINKING: &str =
 const RULE_TOOL_KIMI_WEB_SEARCH_CLIENT_TOOL_BRIDGE: &str =
     "tool.kimi.web_search.client-tool-bridge";
 const RULE_PROVIDER_KIMI_DOCUMENT_PLACEHOLDER: &str = "provider.kimi.document-block-placeholder";
-const RULE_TOOL_SILICONFLOW_FORCED_NAMED_TO_ANY: &str = "tool.siliconflow.forced-named-to-any";
-const SILICONFLOW_API_HOSTS: [&str; 2] = ["api.siliconflow.cn", "api.siliconflow.com"];
 const MAX_KIMI_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_KIMI_THINKING_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KIMI_THINKING_BYTES: usize = 1024 * 1024;
@@ -672,39 +670,6 @@ fn append_rule_id(rule_ids: &mut Vec<String>, rule_id: &str) {
     }
 }
 
-fn is_siliconflow_anthropic_endpoint(endpoint: &str) -> bool {
-    let raw_authority = endpoint
-        .split_once("://")
-        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
-        .unwrap_or("");
-    if raw_authority.contains('@') {
-        return false;
-    }
-    let Ok(url) = reqwest::Url::parse(endpoint) else {
-        return false;
-    };
-    if !matches!(url.scheme(), "http" | "https") {
-        return false;
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = if let Some(without_dot) = host.strip_suffix('.') {
-        if without_dot.ends_with('.') {
-            return false;
-        }
-        without_dot
-    } else {
-        host
-    };
-    SILICONFLOW_API_HOSTS
-        .iter()
-        .any(|official| host.eq_ignore_ascii_case(official))
-}
-
 fn enabled_budget(max_tokens: Option<u64>) -> u64 {
     let default = 1024;
     match max_tokens {
@@ -1223,49 +1188,18 @@ fn validate_relay_tool_history(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_siliconflow_tool_choice_compat(
-    body: &mut Value,
-    upstream_url: &str,
-    rule_ids: &mut Vec<String>,
-) {
-    if !is_siliconflow_anthropic_endpoint(upstream_url) {
-        return;
-    }
-    let has_tools = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|tools| !tools.is_empty())
-        .unwrap_or(false);
-    if !has_tools {
-        return;
-    }
-    let is_forced_named = body
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| choice.get("type"))
-        .and_then(Value::as_str)
-        == Some("tool");
-    if !is_forced_named {
-        return;
-    }
-    body["tool_choice"] = json!({"type": "any"});
-    append_rule_id(rule_ids, RULE_TOOL_SILICONFLOW_FORCED_NAMED_TO_ANY);
-}
-
 pub fn transform_relay_request(
     body: Value,
     target_model: &str,
     relay_thinking: Option<&str>,
-    upstream_url: &str,
 ) -> Result<(Value, AnthropicMetadata), String> {
-    transform_relay_request_for_contract(body, target_model, relay_thinking, upstream_url, None)
+    transform_relay_request_for_contract(body, target_model, relay_thinking, None)
 }
 
 pub fn transform_relay_request_for_contract(
     mut body: Value,
     target_model: &str,
     relay_thinking: Option<&str>,
-    upstream_url: &str,
     provider_contract_id: Option<&str>,
 ) -> Result<(Value, AnthropicMetadata), String> {
     let obj = body
@@ -1297,7 +1231,6 @@ pub fn transform_relay_request_for_contract(
         normalize_relay_thinking(&mut body, relay_thinking);
     }
     let server_tools = filter_relay_server_tools(&mut body, flavor, &mut rule_ids);
-    apply_siliconflow_tool_choice_compat(&mut body, upstream_url, &mut rule_ids);
     Ok((
         body,
         AnthropicMetadata {
@@ -1314,9 +1247,8 @@ pub fn transform_relay_request_for_contract(
 mod tests {
     use super::{
         filter_kimi_nonstream_response, filter_kimi_nonstream_response_with_count,
-        is_siliconflow_anthropic_endpoint, transform_relay_request,
-        transform_relay_request_for_contract, AnthropicMetadata, KimiServerToolFilter, RelayFlavor,
-        MAX_KIMI_FRAME_BYTES,
+        transform_relay_request, transform_relay_request_for_contract, AnthropicMetadata,
+        KimiServerToolFilter, RelayFlavor, MAX_KIMI_FRAME_BYTES,
     };
     use serde_json::{json, Value};
 
@@ -1347,55 +1279,8 @@ mod tests {
                 json!({"messages": messages}),
                 "kimi-k3",
                 Some("enabled"),
-                "https://example.invalid/v1/messages",
             )
             .is_err());
-        }
-    }
-
-    #[test]
-    fn siliconflow_endpoint_matching_is_exact_and_url_parsed() {
-        for endpoint in [
-            "https://api.siliconflow.cn",
-            "https://API.SILICONFLOW.CN/v1/messages",
-            "http://api.siliconflow.com./anthropic/v1/messages",
-        ] {
-            assert!(is_siliconflow_anthropic_endpoint(endpoint), "{endpoint}");
-        }
-        for endpoint in [
-            "ftp://api.siliconflow.cn/v1/messages",
-            "https://sub.api.siliconflow.cn/v1/messages",
-            "https://api.siliconflow.cn.evil/v1/messages",
-            "https://api.siliconflow.com.evil/v1/messages",
-            "https://api.siliconflow.cn@evil.example/v1/messages",
-            "https://evil@api.siliconflow.cn/v1/messages",
-            "https://@api.siliconflow.cn/v1/messages",
-            "https://:pass@api.siliconflow.cn/v1/messages",
-            "https://user:@api.siliconflow.cn/v1/messages",
-            "https://api.siliconflow.cn../v1/messages",
-            "https://evil.example/api.siliconflow.cn/v1/messages",
-            "not a url api.siliconflow.cn",
-        ] {
-            assert!(!is_siliconflow_anthropic_endpoint(endpoint), "{endpoint}");
-        }
-    }
-
-    #[test]
-    fn siliconflow_tool_choice_fixture_matrix_matches_python() {
-        let fixture = fixture();
-        let cases = fixture["siliconflow_tool_choice_cases"].as_array().unwrap();
-        for case in cases {
-            let (mapped, metadata) = transform_relay_request(
-                case["request"].clone(),
-                case["mapped"]["model"].as_str().unwrap(),
-                None,
-                case["endpoint"].as_str().unwrap(),
-            )
-            .unwrap();
-            assert_eq!(mapped, case["mapped"], "{}", case["name"]);
-            let expected_rules: Vec<String> =
-                serde_json::from_value(case["rule_ids"].clone()).unwrap();
-            assert_eq!(metadata.rule_ids, expected_rules, "{}", case["name"]);
         }
     }
 
@@ -1406,7 +1291,6 @@ mod tests {
             fixture["plain_request"].clone(),
             fixture["plain_target_model"].as_str().unwrap(),
             None,
-            "",
         )
         .unwrap();
         assert_eq!(mapped, fixture["plain_mapped"]);
@@ -1418,8 +1302,7 @@ mod tests {
     fn relay_force_model_overrides_shell() {
         let fixture = fixture();
         let (mapped, metadata) =
-            transform_relay_request(fixture["force_request"].clone(), "MiniMax-M2", None, "")
-                .unwrap();
+            transform_relay_request(fixture["force_request"].clone(), "k3", None).unwrap();
         assert_eq!(mapped, fixture["force_mapped"]);
         assert_eq!(metadata.target_model, fixture["force_target_model"]);
         assert_eq!(metadata.rule_ids, Vec::<String>::new());
@@ -1432,7 +1315,6 @@ mod tests {
             fixture["kimi_request"].clone(),
             "kimi-k2.7-code",
             Some("upstream_default"),
-            "",
         )
         .unwrap();
         assert_eq!(mapped, fixture["kimi_mapped"]);
@@ -1454,7 +1336,6 @@ mod tests {
             body,
             "kimi-for-coding",
             Some("upstream_default"),
-            "https://api.kimi.com/coding/v1/messages",
             Some("kimi-anthropic-relay"),
         )
         .unwrap()
@@ -1467,7 +1348,6 @@ mod tests {
             body,
             "kimi-for-coding",
             Some("upstream_default"),
-            "https://api.moonshot.cn/anthropic/v1/messages",
             Some("kimi-anthropic-relay"),
         )
         .unwrap()
@@ -1709,10 +1589,9 @@ mod tests {
                 "model": "claude-opus-4-8",
                 "messages": [{"role": "user", "content": [document.clone()]}]
             }),
-            "glm-5.2",
+            "deepseek-v4-pro",
             Some("adaptive"),
-            "https://open.bigmodel.cn/api/anthropic/v1/messages",
-            Some("anthropic-relay"),
+            Some("deepseek-native"),
         )
         .unwrap();
         assert_eq!(mapped["messages"][0]["content"][0], document);
@@ -1750,7 +1629,6 @@ mod tests {
             }),
             "relay-model",
             None,
-            "",
         )
         .unwrap();
         let tools = mapped["tools"].as_array().unwrap();
@@ -1818,7 +1696,6 @@ mod tests {
             }),
             "k3-256k",
             None,
-            "",
             Some("kimi-anthropic-relay"),
         )
         .unwrap();
@@ -1864,7 +1741,6 @@ mod tests {
                 request.clone(),
                 model,
                 Some("upstream_default"),
-                "",
                 Some("kimi-anthropic-relay"),
             )
             .unwrap();
@@ -1875,7 +1751,6 @@ mod tests {
                 request,
                 model,
                 None,
-                "",
                 Some("custom-anthropic"),
             )
             .unwrap();
@@ -1885,7 +1760,7 @@ mod tests {
 
         // Standalone gateways carry no contract and fall back to the model name.
         let (_, standalone) =
-            transform_relay_request(json!({"messages": []}), "kimi-legacy", None, "").unwrap();
+            transform_relay_request(json!({"messages": []}), "kimi-legacy", None).unwrap();
         assert_eq!(standalone.flavor, RelayFlavor::Kimi);
     }
 
@@ -1907,7 +1782,6 @@ mod tests {
                 }),
                 "k3",
                 None,
-                "",
                 Some("kimi-anthropic-relay"),
             )
             .unwrap();

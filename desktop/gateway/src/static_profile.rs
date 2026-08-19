@@ -465,21 +465,21 @@ mod tests {
     fn resolver() -> StaticProfileResolver {
         let mut value = json!({
             "schema_version": 1,
-            "adapter": "qwen",
-            "default_selector_id": "claude-csswitch-qwen-plus-111111111111",
+            "adapter": "relay",
+            "default_selector_id": "claude-csswitch-kimi-plus-111111111111",
             "routes": [
-                {"selector_id":"claude-csswitch-qwen-max-222222222222","display_name":"Max","upstream_model":"qwen-max","supports_tools":true},
-                {"selector_id":"claude-csswitch-qwen-plus-111111111111","display_name":"Plus","upstream_model":"qwen-plus","supports_tools":null},
-                {"selector_id":"claude-csswitch-qwen-fast-333333333333","display_name":"Fast","upstream_model":"qwen-fast","supports_tools":true}
+                {"selector_id":"claude-csswitch-kimi-max-222222222222","display_name":"Max","upstream_model":"k3","supports_tools":true},
+                {"selector_id":"claude-csswitch-kimi-plus-111111111111","display_name":"Plus","upstream_model":"k3-256k","supports_tools":null},
+                {"selector_id":"claude-csswitch-kimi-fast-333333333333","display_name":"Fast","upstream_model":"kimi-for-coding","supports_tools":true}
             ],
             "role_bindings": {
-                "sonnet":"claude-csswitch-qwen-plus-111111111111",
-                "opus":"claude-csswitch-qwen-max-222222222222",
-                "haiku":"claude-csswitch-qwen-fast-333333333333",
-                "fable":"claude-csswitch-qwen-max-222222222222"
+                "sonnet":"claude-csswitch-kimi-plus-111111111111",
+                "opus":"claude-csswitch-kimi-max-222222222222",
+                "haiku":"claude-csswitch-kimi-fast-333333333333",
+                "fable":"claude-csswitch-kimi-max-222222222222"
             },
             "legacy_aliases": [
-                {"alias":"qwen-plus","selector_id":"claude-csswitch-qwen-plus-111111111111"}
+                {"alias":"k3-256k","selector_id":"claude-csswitch-kimi-plus-111111111111"}
             ]
         });
         let mut wire: WireCatalog = serde_json::from_value({
@@ -497,17 +497,17 @@ mod tests {
         let resolver = resolver();
         assert_eq!(
             resolver
-                .resolve("claude-csswitch-qwen-plus-111111111111")
+                .resolve("claude-csswitch-kimi-plus-111111111111")
                 .unwrap()
                 .kind,
             ResolutionKind::ExactSelector
         );
         assert_eq!(
-            resolver.resolve("qwen-plus").unwrap().kind,
+            resolver.resolve("k3-256k").unwrap().kind,
             ResolutionKind::LegacyExact
         );
         let resolved = resolver
-            .resolve("claude-csswitch-qwen-plus-111111111111")
+            .resolve("claude-csswitch-kimi-plus-111111111111")
             .unwrap();
         assert_eq!(resolved.reasoning_round_trip(), ReasoningRoundTrip::None);
         assert_eq!(resolved.supports_forced_tool_choice(), None);
@@ -518,20 +518,20 @@ mod tests {
                 .resolve("claude-opus-4-8-20250514")
                 .unwrap()
                 .upstream_model(),
-            "qwen-max"
+            "k3"
         );
         assert_eq!(
             resolver
                 .resolve("claude-3-5-sonnet-20241022")
                 .unwrap()
                 .upstream_model(),
-            "qwen-plus"
+            "k3-256k"
         );
         for rejected in [
             "",
             "claude-opus",
             "claude-opus-4-8-latest",
-            "claude-csswitch-codex-gpt-5",
+            "claude-csswitch-kimi-k3",
             "claude-opus-4-8-forged",
         ] {
             assert!(resolver.resolve(rejected).is_none(), "{rejected}");
@@ -543,7 +543,7 @@ mod tests {
         let response = resolver().models_response();
         assert_eq!(
             response["data"][0]["id"],
-            "claude-csswitch-qwen-plus-111111111111"
+            "claude-csswitch-kimi-plus-111111111111"
         );
         assert_eq!(response["data"].as_array().unwrap().len(), 8);
     }
@@ -554,11 +554,11 @@ mod tests {
         let response = resolver.models_response();
         let models = response["data"].as_array().unwrap();
         for (id, upstream, display_name) in [
-            ("claude-opus-5", "qwen-max", "Max"),
-            ("claude-sonnet-5", "qwen-plus", "Plus"),
-            ("claude-opus-4-8", "qwen-max", "Max"),
-            ("claude-sonnet-4-6", "qwen-plus", "Plus"),
-            ("claude-haiku-4-5-20251001", "qwen-fast", "Fast"),
+            ("claude-opus-5", "k3", "Max"),
+            ("claude-sonnet-5", "k3-256k", "Plus"),
+            ("claude-opus-4-8", "k3", "Max"),
+            ("claude-sonnet-4-6", "k3-256k", "Plus"),
+            ("claude-haiku-4-5-20251001", "kimi-for-coding", "Fast"),
         ] {
             let model = models
                 .iter()
@@ -580,7 +580,7 @@ mod tests {
             .unwrap();
         resolver.routes[default_index].display_name = "default".into();
         let response = resolver.models_response();
-        assert_eq!(response["data"][0]["display_name"], "qwen-plus");
+        assert_eq!(response["data"][0]["display_name"], "k3-256k");
     }
 
     #[test]
@@ -595,7 +595,7 @@ mod tests {
         let response = resolver.models_response();
         assert_eq!(
             response["data"][0]["id"],
-            "claude-csswitch-qwen-plus-111111111111"
+            "claude-csswitch-kimi-plus-111111111111"
         );
         assert_eq!(response["data"][0]["display_name"], "Claude Sonnet 5");
     }
@@ -604,14 +604,14 @@ mod tests {
     fn rejects_tampered_catalog_even_when_claimed_fingerprint_is_well_formed() {
         let mut value = serde_json::to_value(json!({
             "schema_version": 1,
-            "adapter": "qwen",
-            "default_selector_id": "claude-csswitch-qwen-plus-111111111111",
-            "routes": [{"selector_id":"claude-csswitch-qwen-plus-111111111111","display_name":"Plus","upstream_model":"qwen-plus","supports_tools":true}],
+            "adapter": "relay",
+            "default_selector_id": "claude-csswitch-kimi-plus-111111111111",
+            "routes": [{"selector_id":"claude-csswitch-kimi-plus-111111111111","display_name":"Plus","upstream_model":"k3-256k","supports_tools":true}],
             "role_bindings": {
-                "sonnet":"claude-csswitch-qwen-plus-111111111111",
-                "opus":"claude-csswitch-qwen-plus-111111111111",
-                "haiku":"claude-csswitch-qwen-plus-111111111111",
-                "fable":"claude-csswitch-qwen-plus-111111111111"
+                "sonnet":"claude-csswitch-kimi-plus-111111111111",
+                "opus":"claude-csswitch-kimi-plus-111111111111",
+                "haiku":"claude-csswitch-kimi-plus-111111111111",
+                "fable":"claude-csswitch-kimi-plus-111111111111"
             },
             "legacy_aliases": []
         })).unwrap();

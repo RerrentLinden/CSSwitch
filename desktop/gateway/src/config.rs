@@ -85,50 +85,6 @@ pub fn provider_supported(provider: &str, shim: &str) -> bool {
     matches!(provider, "deepseek" | "relay") && shim == "off"
 }
 
-pub fn normalize_openai_base(base: &str) -> String {
-    let mut out = base.trim().trim_end_matches('/').to_string();
-    for suffix in [
-        "/v1/chat/completions",
-        "/chat/completions",
-        "/v1/responses",
-        "/responses",
-        "/v1/models",
-        "/models",
-    ] {
-        if out.ends_with(suffix) {
-            let keep = out.len() - suffix.len();
-            out.truncate(keep);
-            while out.ends_with('/') {
-                out.pop();
-            }
-            break;
-        }
-    }
-    out
-}
-
-fn ends_with_version_segment(base: &str) -> bool {
-    let Some(last) = base.rsplit('/').next() else {
-        return false;
-    };
-    let Some(version) = last.strip_prefix('v') else {
-        return false;
-    };
-    !version.is_empty()
-        && version
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
-}
-
-pub fn openai_endpoint(base: &str, suffix: &str) -> String {
-    let mut root = normalize_openai_base(base);
-    if !ends_with_version_segment(&root) {
-        root.push_str("/v1");
-    }
-    root.push_str(suffix);
-    root
-}
-
 fn normalize_anthropic_v1_base(base: &str) -> String {
     let mut root = base.trim().trim_end_matches('/').to_string();
     for suffix in ["/messages", "/models"] {
@@ -153,41 +109,13 @@ fn joined_endpoints(
 ) -> Result<(String, Option<String>), String> {
     use crate::provider_contracts::EndpointJoin;
 
-    let inference_suffix = match transport {
-        "anthropic_messages" => "/messages",
-        "openai_chat" => "/chat/completions",
-        "openai_responses" => "/responses",
-        _ => return Err("provider contract transport cannot use a profile endpoint".into()),
-    };
+    if transport != "anthropic_messages" {
+        return Err("provider contract transport cannot use a profile endpoint".into());
+    }
     match join {
         EndpointJoin::AnthropicV1 => {
-            if transport != "anthropic_messages" {
-                return Err("anthropic endpoint join requires Anthropic transport".into());
-            }
             let root = normalize_anthropic_v1_base(base);
             Ok((format!("{root}/messages"), Some(format!("{root}/models"))))
-        }
-        EndpointJoin::OpenaiV1 => {
-            if !matches!(transport, "openai_chat" | "openai_responses") {
-                return Err("OpenAI endpoint join requires OpenAI transport".into());
-            }
-            Ok((
-                openai_endpoint(base, inference_suffix),
-                Some(openai_endpoint(base, "/models")),
-            ))
-        }
-        EndpointJoin::OpenaiPath => {
-            if !matches!(transport, "openai_chat" | "openai_responses") {
-                return Err("OpenAI path join requires OpenAI transport".into());
-            }
-            let root = normalize_openai_base(base);
-            Ok((
-                format!("{root}{inference_suffix}"),
-                Some(format!("{root}/models")),
-            ))
-        }
-        EndpointJoin::ManagedOfficial => {
-            Err("managed official endpoint cannot use a profile base".into())
         }
     }
 }
@@ -400,10 +328,7 @@ impl GatewayConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        joined_endpoints, normalize_openai_base, openai_endpoint, provider_supported,
-        upstream_url_for,
-    };
+    use super::{joined_endpoints, provider_supported, upstream_url_for};
     use crate::provider_contracts::EndpointJoin;
 
     #[test]
@@ -444,23 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_base_normalization_matches_python_proxy_contract() {
-        let root = "https://open.bigmodel.cn/api/paas/v4";
-        assert_eq!(
-            normalize_openai_base(&format!("{root}/chat/completions")),
-            root
-        );
-        assert_eq!(normalize_openai_base(&format!("{root}/responses")), root);
-        assert_eq!(normalize_openai_base(&format!("{root}/models")), root);
-        assert_eq!(openai_endpoint(root, "/models"), format!("{root}/models"));
-        assert_eq!(
-            openai_endpoint("https://api.siliconflow.cn", "/chat/completions"),
-            "https://api.siliconflow.cn/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn endpoint_join_policies_cover_full_urls_xai_gemini_and_opencode() {
+    fn anthropic_endpoint_join_handles_bare_v1_and_full_message_urls() {
         assert_eq!(
             joined_endpoints(
                 EndpointJoin::AnthropicV1,
@@ -474,56 +383,27 @@ mod tests {
             )
         );
         assert_eq!(
-            joined_endpoints(EndpointJoin::OpenaiV1, "openai_chat", "https://api.x.ai/v1").unwrap(),
-            (
-                "https://api.x.ai/v1/chat/completions".into(),
-                Some("https://api.x.ai/v1/models".into())
-            )
-        );
-        assert_eq!(
             joined_endpoints(
-                EndpointJoin::OpenaiV1,
-                "openai_chat",
-                "https://api.x.ai/v1/chat/completions"
-            )
-            .unwrap()
-            .0,
-            "https://api.x.ai/v1/chat/completions"
-        );
-        assert_eq!(
-            joined_endpoints(
-                EndpointJoin::OpenaiPath,
-                "openai_chat",
-                "https://generativelanguage.googleapis.com/v1beta/openai"
+                EndpointJoin::AnthropicV1,
+                "anthropic_messages",
+                "https://api.kimi.com/coding/v1/messages"
             )
             .unwrap(),
             (
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".into(),
-                Some("https://generativelanguage.googleapis.com/v1beta/openai/models".into())
+                "https://api.kimi.com/coding/v1/messages".into(),
+                Some("https://api.kimi.com/coding/v1/models".into())
             )
         );
         assert_eq!(
             joined_endpoints(
                 EndpointJoin::AnthropicV1,
                 "anthropic_messages",
-                "https://opencode.ai/zen/go/v1/messages"
+                "https://api.kimi.com/coding/v1"
             )
             .unwrap(),
             (
-                "https://opencode.ai/zen/go/v1/messages".into(),
-                Some("https://opencode.ai/zen/go/v1/models".into())
-            )
-        );
-        assert_eq!(
-            joined_endpoints(
-                EndpointJoin::AnthropicV1,
-                "anthropic_messages",
-                "https://opencode.ai/zen/go/v1"
-            )
-            .unwrap(),
-            (
-                "https://opencode.ai/zen/go/v1/messages".into(),
-                Some("https://opencode.ai/zen/go/v1/models".into())
+                "https://api.kimi.com/coding/v1/messages".into(),
+                Some("https://api.kimi.com/coding/v1/models".into())
             )
         );
         assert_eq!(

@@ -57,10 +57,7 @@ struct ProviderContractCatalog {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndpointJoin {
-    ManagedOfficial,
     AnthropicV1,
-    OpenaiV1,
-    OpenaiPath,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,10 +83,7 @@ impl AuthScheme {
 impl EndpointJoin {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "managed_official" => Ok(Self::ManagedOfficial),
             "anthropic_v1" => Ok(Self::AnthropicV1),
-            "openai_v1" => Ok(Self::OpenaiV1),
-            "openai_path" => Ok(Self::OpenaiPath),
             _ => Err("provider contract endpoint join is unsupported".into()),
         }
     }
@@ -248,16 +242,19 @@ mod tests {
         assert_eq!(kimi.endpoint_join, EndpointJoin::AnthropicV1);
         assert_eq!(kimi.transport, "anthropic_messages");
 
-        let opencode =
-            load_runtime_contract("relay", Some("opencode-go-anthropic"), Some(&digest)).unwrap();
-        assert_eq!(opencode.auth_scheme, AuthScheme::Bearer);
-        assert_eq!(opencode.endpoint_join, EndpointJoin::AnthropicV1);
-
-        let gemini =
-            load_runtime_contract("openai-custom", Some("gemini-openai-chat"), Some(&digest))
-                .unwrap();
-        assert_eq!(gemini.auth_scheme, AuthScheme::Bearer);
-        assert_eq!(gemini.endpoint_join, EndpointJoin::OpenaiPath);
+        // 已退役的渠道 id 必须找不到,而不是悄悄落到某个现存 contract 上。
+        for retired in [
+            "opencode-go-anthropic",
+            "gemini-openai-chat",
+            "codex-oauth",
+            "qwen-native",
+            "anthropic-relay",
+        ] {
+            assert!(
+                load_runtime_contract("relay", Some(retired), Some(&digest)).is_err(),
+                "{retired} 已退役,不该还能加载"
+            );
+        }
 
         assert!(load_runtime_contract(
             "openai-custom",

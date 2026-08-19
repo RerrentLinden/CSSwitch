@@ -209,9 +209,7 @@ fn auth_scheme(cfg: &GatewayConfig) -> AuthScheme {
         .as_ref()
         .map(|contract| contract.auth_scheme)
         .unwrap_or_else(|| match cfg.provider.as_str() {
-            "qwen" | "openai-custom" | "openai-responses" => AuthScheme::Bearer,
             "relay" => AuthScheme::AnthropicDual,
-            "codex" => AuthScheme::CsswitchOauth,
             _ => AuthScheme::AnthropicXApiKey,
         })
 }
@@ -262,12 +260,8 @@ fn merged_anthropic_beta(transport: Option<&AnthropicTransport>) -> Option<Strin
         .map(str::to_string)
 }
 
-fn models_timeout_secs(provider: &str) -> u64 {
-    if provider == "qwen" || provider == "openai-custom" || provider == "openai-responses" {
-        300
-    } else {
-        120
-    }
+fn models_timeout_secs(_provider: &str) -> u64 {
+    120
 }
 
 fn models_timeouts(cfg: &GatewayConfig) -> ModelsTimeouts {
@@ -363,7 +357,6 @@ fn post_with_timeouts(
             .header("x-api-key", api_key)
             .header("authorization", format!("Bearer {api_key}")),
         AuthScheme::AnthropicXApiKey => request.header("x-api-key", api_key),
-        // Codex requests use codex_transport and never reach this generic API-key path.
         AuthScheme::CsswitchOauth => request,
     };
     request.body(body).send().map_err(|e| UpstreamError {
@@ -969,9 +962,7 @@ mod tests {
         assert_eq!(INFERENCE_TIMEOUTS.total, Duration::from_secs(300));
         assert_eq!(INFERENCE_TIMEOUTS.read_idle, Duration::from_secs(300));
 
-        assert_eq!(models_timeout_secs("qwen"), 300);
-        assert_eq!(models_timeout_secs("openai-custom"), 300);
-        assert_eq!(models_timeout_secs("openai-responses"), 300);
+        // 独立启动的 models 超时对所有 provider 一致;托管启动由契约覆盖(见下)。
         assert_eq!(models_timeout_secs("deepseek"), 120);
         assert_eq!(models_timeout_secs("relay"), 120);
 
