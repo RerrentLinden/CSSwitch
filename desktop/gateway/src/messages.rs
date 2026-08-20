@@ -990,6 +990,7 @@ mod tests {
             static_model_resolver: None,
             shim_mode: "off".to_string(),
             launch_id: "timeout-test".to_string(),
+            web_search: true,
         }
     }
 

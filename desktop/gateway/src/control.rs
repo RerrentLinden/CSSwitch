@@ -182,6 +182,7 @@ fn channel_payload(channel: &Channel) -> Value {
         "quality_model": channel.quality_model,
         "fast_model": channel.fast_model,
         "fable_model": channel.fable_model,
+        "web_search": channel.web_search,
         "ready": channel.validate().is_ok(),
     })
 }
@@ -210,6 +211,13 @@ fn save_config(request: &Request, state: &Arc<AppState>) -> Result<Value, String
                 channel.api_key = api_key.trim().to_string();
             }
         }
+        // 缺省表示"保持不变"(与 API Key 同语义);出现就必须是布尔,
+        // 非布尔显式报错,不做类型降级。
+        match payload.get("web_search") {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(enabled)) => channel.web_search = *enabled,
+            Some(_) => return Err("web_search 必须是布尔值".into()),
+        }
         for (field, slot) in [
             ("default_model", 0),
             ("quality_model", 1),
@@ -234,10 +242,17 @@ fn save_config(request: &Request, state: &Arc<AppState>) -> Result<Value, String
     if let Ok(mut guard) = state.profile.write() {
         *guard = profile;
     }
+    // 提示必须对每个字段都成立:地址与模型槽要重启 Science 才生效,
+    // 联网搜索开关是每请求读快照的,下一次请求就生效。
+    let note = if payload.get("web_search").is_some() {
+        "已保存。地址与模型槽在下次切换或重启 Science 后生效;联网搜索开关下一次请求即生效。"
+    } else {
+        "已保存。运行中的链路不变,下次切换或重启 Science 时生效。"
+    };
     Ok(json!({
         "ok": true,
         "channel": channel_payload(&channel),
-        "note": "已保存。运行中的链路不变,下次切换或重启 Science 时生效。"
+        "note": note
     }))
 }
 

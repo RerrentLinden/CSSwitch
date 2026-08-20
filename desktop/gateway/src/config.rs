@@ -18,6 +18,11 @@ pub struct GatewayConfig {
     /// Opaque per-spawn identity supplied by the process manager.
     /// Standalone invocations may leave it empty, but managed launches always set it.
     pub launch_id: String,
+    /// 激活渠道是否提供联网搜索。`false` 时 typed `web_search` 在 relay 请求
+    /// 入口就被摘除,整条补偿链一致地按「本轮没有搜索声明」处理。
+    /// 只有单进程服务会把它置为 `false`(用户在控制台里关);standalone 网关
+    /// 没有用户配置文件,恒为 `true`,不接受环境变量 override。
+    pub web_search: bool,
 }
 
 pub const GATEWAY_INTENT_ENV: &str = "CSSWITCH_GATEWAY_INTENT";
@@ -173,6 +178,7 @@ impl GatewayConfig {
             static_model_resolver: Some(resolver),
             shim_mode: "off".to_string(),
             launch_id: String::new(),
+            web_search: channel.web_search,
         })
     }
 
@@ -324,6 +330,7 @@ impl GatewayConfig {
             static_model_resolver,
             shim_mode: shim.to_string(),
             launch_id,
+            web_search: true,
         })
     }
 }

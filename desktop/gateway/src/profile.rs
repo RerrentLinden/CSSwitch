@@ -106,6 +106,18 @@ pub struct Channel {
     pub fast_model: ModelSlot,
     #[serde(default)]
     pub fable_model: ModelSlot,
+    /// 本渠道是否提供联网搜索。关闭后 Science 声明的 typed `web_search`
+    /// 会在网关请求入口被摘除,模型拿不到该工具,兼容桥也就不触发。
+    ///
+    /// **默认必须是 `true`**:`#[serde(default)]` 对 `bool` 给的是 `false`,
+    /// 而存量 `service.v1.json` 里没有这个字段,用它等于给所有老用户静默
+    /// 关掉联网搜索。
+    #[serde(default = "default_web_search")]
+    pub web_search: bool,
+}
+
+fn default_web_search() -> bool {
+    true
 }
 
 impl Channel {
@@ -123,6 +135,7 @@ impl Channel {
             quality_model: ModelSlot::new("k3", "Kimi K3"),
             fast_model: ModelSlot::new("kimi-for-coding", "Kimi K2.7"),
             fable_model: ModelSlot::default(),
+            web_search: default_web_search(),
         }
     }
 
@@ -134,6 +147,7 @@ impl Channel {
             quality_model: ModelSlot::default(),
             fast_model: ModelSlot::new("deepseek-v4-flash", "DeepSeek V4 Flash"),
             fable_model: ModelSlot::default(),
+            web_search: default_web_search(),
         }
     }
 
@@ -341,6 +355,7 @@ mod tests {
             quality_model: ModelSlot::default(),
             fast_model: ModelSlot::new("m-fast", "Fast"),
             fable_model: ModelSlot::default(),
+            web_search: true,
         };
         let catalog = channel.static_catalog("relay");
         let bindings = &catalog["role_bindings"];
@@ -385,6 +400,39 @@ mod tests {
         channel.base_url = "https://x".into();
         channel.default_model = ModelSlot::default();
         assert!(channel.validate().is_err(), "默认槽必填");
+    }
+
+    #[test]
+    fn legacy_config_without_web_search_stays_enabled() {
+        // 存量 ~/.csswitch/service.v1.json 里没有这个字段。bool 的 serde 默认是
+        // false,直接用它等于给所有老用户静默关掉联网搜索 —— 这条测试钉死默认值。
+        let legacy = r#"{
+            "mode": "kimi",
+            "port": 8788,
+            "kimi": {
+                "base_url": "https://api.kimi.com/coding",
+                "api_key": "k",
+                "default_model": {"model_id": "k3", "display_name": "Kimi K3"}
+            },
+            "deepseek": {
+                "base_url": "https://api.deepseek.com/anthropic",
+                "api_key": "k",
+                "default_model": {"model_id": "deepseek-v4-pro", "display_name": ""}
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(legacy).unwrap();
+        assert!(profile.kimi.web_search, "缺字段的老配置必须读成开启");
+        assert!(profile.deepseek.web_search, "缺字段的老配置必须读成开启");
+    }
+
+    #[test]
+    fn web_search_false_survives_a_serde_round_trip() {
+        let mut profile = Profile::default();
+        profile.kimi.web_search = false;
+        let text = serde_json::to_string(&profile).unwrap();
+        let restored: Profile = serde_json::from_str(&text).unwrap();
+        assert!(!restored.kimi.web_search, "关闭态必须能存盘并读回");
+        assert!(restored.deepseek.web_search, "另一渠道不受影响");
     }
 
     #[test]

@@ -1233,7 +1233,7 @@ fn handle_messages(
     anthropic_transport: Option<&messages::AnthropicTransport>,
     _relay_models: &models::RelayModelCache,
 ) {
-    let raw: Value = match serde_json::from_slice(&body) {
+    let mut raw: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             invalid_request_json(stream, &e.to_string());
@@ -1275,6 +1275,13 @@ fn handle_messages(
             .provider_contract
             .as_ref()
             .map(|contract| contract.contract_id.as_str());
+        // 渠道联网搜索开关关闭:在补偿链之前摘掉 typed Web Search 声明,整条链
+        // 之后一致地按「本轮没有搜索声明」处理,兼容桥也就不触发。
+        let stripped_web_search = if cfg.web_search {
+            0
+        } else {
+            anthropic_compat::strip_typed_web_search_tools(&mut raw)
+        };
         let (mut transformed, mut metadata) =
             match anthropic_compat::transform_relay_request_for_contract(
                 raw,
@@ -1288,6 +1295,13 @@ fn handle_messages(
                     return;
                 }
             };
+        // 摘除发生在补偿链之前,规则序也放在最前,日志行读起来与实际顺序一致。
+        if stripped_web_search > 0 {
+            metadata.rule_ids.insert(
+                0,
+                anthropic_compat::RULE_TOOL_RELAY_WEB_SEARCH_DISABLED_BY_CONFIG.into(),
+            );
+        }
         let adapter =
             match kimi_web_search_adapter::prepare_request(&mut transformed, metadata.flavor) {
                 Ok(adapter) => adapter,
@@ -1573,10 +1587,108 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        forward_stream_body, handle_kimi_web_search_adapter, merged_shape, pair_key_prefix,
-        relay_server_tool_types, relay_thinking_type, stream_error_event, stream_strip_rules,
-        strip_stats_suffix, StreamTermination,
+        forward_stream_body, handle_kimi_web_search_adapter, handle_messages, merged_shape,
+        pair_key_prefix, relay_server_tool_types, relay_thinking_type, stream_error_event,
+        stream_strip_rules, strip_stats_suffix, StreamTermination,
     };
+
+    #[test]
+    fn disabled_channel_web_search_never_reaches_upstream() {
+        // 只测 strip 函数证明不了 `cfg.web_search` 真的被读到了 —— 本仓库刚被
+        // 一个恒假的门控谓词坑过(整条主路径成死代码而单测仍绿)。这条测试从
+        // handle_messages 一路打到 fake 上游,看真正发出去的报文。
+        //
+        // 断言落在"上游收到的 tools 只有 Bash"这一条上,它同时排除两种失败:
+        // 摘除没生效(会看到 typed web_search),以及桥仍然触发(会看到桥的私有
+        // 查询工具 —— 它同样叫 web_search)。
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_url = format!("http://{}/v1/messages", upstream.local_addr().unwrap());
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let request = read_http_json(&mut stream);
+            write_http_json(
+                &mut stream,
+                &json!({
+                    "id": "main", "type": "message", "role": "assistant", "model": "k3",
+                    "content": [{"type": "text", "text": "我这边没有联网检索能力。"}],
+                    "stop_reason": "end_turn", "stop_sequence": null,
+                    "usage": {"input_tokens": 3, "output_tokens": 4}
+                }),
+            );
+            requests_tx.send(request).unwrap();
+        });
+
+        let channel = crate::profile::Channel::from_defaults_for_test();
+        let resolver = crate::static_profile::StaticProfileResolver::from_json(
+            &channel.static_catalog("relay").to_string(),
+        )
+        .unwrap();
+        let contract = crate::provider_contracts::load_runtime_contract(
+            "relay",
+            Some("kimi-anthropic-relay"),
+            Some(&crate::provider_contracts::catalog_digest()),
+        )
+        .unwrap();
+        let cfg = crate::config::GatewayConfig {
+            provider: "relay".into(),
+            port: 0,
+            auth_secret: None,
+            api_key: Some("fake-key".into()),
+            upstream_url,
+            models_url: None,
+            relay_thinking: None,
+            provider_contract: Some(contract),
+            intent: crate::config::GatewayIntent::Formal,
+            static_model_resolver: Some(resolver),
+            shim_mode: "off".into(),
+            launch_id: "web-search-toggle-test".into(),
+            // 用户在控制台把这条渠道的联网搜索关掉了。
+            web_search: false,
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "claude-opus-5",
+            "max_tokens": 1024,
+            "stream": false,
+            "messages": [{"role": "user", "content": "查一下今天的新闻"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "Bash", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .unwrap();
+
+        let downstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let downstream_addr = downstream_listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(downstream_addr).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+        let (mut downstream, _) = downstream_listener.accept().unwrap();
+        handle_messages(
+            &mut downstream,
+            &cfg,
+            body,
+            None,
+            &crate::models::RelayModelCache::default(),
+        );
+        drop(downstream);
+        let response = String::from_utf8(client.join().unwrap()).unwrap();
+        upstream_thread.join().unwrap();
+
+        let upstream_request = requests_rx.recv().unwrap();
+        let tools = upstream_request["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "关闭态下上游只应看到普通客户端工具,实际收到 {tools:?}"
+        );
+        assert_eq!(tools[0]["name"], "Bash");
+        assert!(response.starts_with("HTTP/1.1 200"), "回答仍要正常送达");
+    }
 
     #[test]
     fn adapter_log_projections_expose_shapes_and_key_prefixes_only() {
@@ -1733,6 +1845,7 @@ mod tests {
             static_model_resolver: None,
             shim_mode: "off".into(),
             launch_id: "kimi-adapter-test".into(),
+            web_search: true,
         };
         let downstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let downstream_addr = downstream_listener.local_addr().unwrap();

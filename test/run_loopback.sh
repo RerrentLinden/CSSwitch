@@ -88,6 +88,47 @@ else
   echo "  ok   未触碰旧桌面端的 config.json"
 fi
 
+# 联网搜索开关:默认开 → 关掉能存 → 之后不带该字段的保存不得把它改回来。
+case "$status_after" in
+  *'"web_search":true'*) echo "  ok   联网搜索默认开启" ;;
+  *) echo "  FAIL 新配置的联网搜索默认值不对:$status_after"; fail=1 ;;
+esac
+
+body -X POST "http://127.0.0.1:$PORT/control/config" \
+  -H 'content-type: application/json' \
+  -d '{"channel":"kimi","web_search":false}' >/dev/null
+
+case "$(body "http://127.0.0.1:$PORT/control/status")" in
+  *'"web_search":false'*) echo "  ok   联网搜索可关闭并落盘" ;;
+  *) echo "  FAIL 关闭联网搜索未生效"; fail=1 ;;
+esac
+
+# 只改模型槽的保存不带 web_search,缺省语义是"保持不变",不能悄悄改回开启。
+body -X POST "http://127.0.0.1:$PORT/control/config" \
+  -H 'content-type: application/json' \
+  -d '{"channel":"kimi","default_model":{"model_id":"m2","display_name":"M2"}}' >/dev/null
+case "$(body "http://127.0.0.1:$PORT/control/status")" in
+  *'"web_search":false'*) echo "  ok   缺省字段不改动已保存的开关" ;;
+  *) echo "  FAIL 不带 web_search 的保存把开关改回了开启"; fail=1 ;;
+esac
+
+# 面板保存开关时 api_key 字段是空串(不是缺省),空串必须仍然表示"保持不变"。
+# 用户以后会为了翻这个开关频繁保存这张表单,清空 key 一次就够疼。
+body -X POST "http://127.0.0.1:$PORT/control/config" \
+  -H 'content-type: application/json' \
+  -d '{"channel":"kimi","api_key":"","web_search":false}' >/dev/null
+case "$(body "http://127.0.0.1:$PORT/control/status")" in
+  *'"has_api_key":true'*) echo "  ok   空 key 提交不清空已保存的 key" ;;
+  *) echo "  FAIL 空 key 提交把已保存的 key 清掉了"; fail=1 ;;
+esac
+
+# 非布尔值必须显式报错,不做类型降级。
+case "$(body -X POST "http://127.0.0.1:$PORT/control/config" \
+  -H 'content-type: application/json' -d '{"channel":"kimi","web_search":"off"}')" in
+  *'"error"'*) echo "  ok   非布尔 web_search 显式报错" ;;
+  *) echo "  FAIL 非布尔 web_search 被静默接受"; fail=1 ;;
+esac
+
 # 切到未配置完整的渠道必须失败,而不是切过去再在推理时炸。
 switch_bad="$(body -X POST "http://127.0.0.1:$PORT/control/switch" \
   -H 'content-type: application/json' -d '{"mode":"deepseek"}')"
@@ -96,5 +137,26 @@ case "$switch_bad" in
   *) echo "  FAIL 缺 key 的渠道竟然切换成功:$switch_bad"; fail=1 ;;
 esac
 
+# 关闭态的可诊断性:切到 Kimi,发一条声明了 typed web_search 的推理请求。
+# 上游是不存在的域名,请求必然失败 —— 但补偿规则行在联网之前就已写进 stderr,
+# 足以证明"摘除真的发生了且留下了痕迹"。没有这条,规则 id 被删掉也没人会发现。
+body -X POST "http://127.0.0.1:$PORT/control/switch" \
+  -H 'content-type: application/json' -d '{"mode":"kimi"}' >/dev/null
+body -X POST "http://127.0.0.1:$PORT/v1/messages" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-opus-5","max_tokens":64,"stream":false,
+       "messages":[{"role":"user","content":"查一下今天的新闻"}],
+       "tools":[{"type":"web_search_20250305","name":"web_search"},
+                {"name":"Bash","input_schema":{"type":"object"}}]}' >/dev/null
+
+relay_line="$(grep 'POST /v1/messages relay' "$SANDBOX/out.log" | tail -1)"
+case "$relay_line" in
+  *tool.relay.web-search-disabled-by-config*) echo "  ok   关闭态在日志里留下规则 id" ;;
+  *) echo "  FAIL 关闭态没有记录摘除规则:$relay_line"; fail=1 ;;
+esac
+case "$relay_line" in
+  *web-search.query-tool-adapter*) echo "  FAIL 关闭态仍然触发了兼容桥:$relay_line"; fail=1 ;;
+  *) echo "  ok   关闭态不触发兼容桥" ;;
+esac
 [ "$fail" = "0" ] || { echo; echo "服务输出:"; cat "$SANDBOX/out.log"; }
 exit "$fail"

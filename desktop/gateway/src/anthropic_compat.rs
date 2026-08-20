@@ -8,6 +8,8 @@ const RULE_TOOL_DEEPSEEK_WEB_SEARCH_SERVER_TOOL_PRESERVE: &str =
 const RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER: &str =
     "tool.deepseek.unsupported-server-tool-filter";
 const RULE_TOOL_UNKNOWN_SERVER_TOOL_PRESERVE: &str = "tool.anthropic.unknown-server-tool-preserve";
+pub(crate) const RULE_TOOL_RELAY_WEB_SEARCH_DISABLED_BY_CONFIG: &str =
+    "tool.relay.web-search-disabled-by-config";
 const RULE_PROVIDER_KIMI_THINKING_UPSTREAM_DEFAULT: &str =
     "provider.kimi.thinking-upstream-default";
 const RULE_PROVIDER_KIMI_SPECIFIED_TOOL_CHOICE_DISABLES_THINKING: &str =
@@ -318,6 +320,25 @@ fn classify_anthropic_server_tool(tool: &Value) -> Option<AnthropicServerToolKin
 
 pub(crate) fn is_anthropic_web_search_server_tool(tool: &Value) -> bool {
     classify_anthropic_server_tool(tool) == Some(AnthropicServerToolKind::WebSearch)
+}
+
+/// 渠道的联网搜索开关关闭时,在补偿链**之前**摘除 typed Web Search 声明,
+/// 返回摘掉的数量。
+///
+/// 摘在链首而不是 server tool policy 里:`reorder_science_context_before_user_intent`
+/// 等规则都以「本轮声明了 typed search」为触发条件,而 policy pass 跑在链尾 ——
+/// 在那里摘,重排规则已经先按"会搜索"交换过末尾两条 user message 了。链首摘除后
+/// 整条链一致地认为本轮没有搜索声明,既有规则一条都不用改。
+///
+/// 摘完可能留下空的 `tools` 数组:由链尾的 policy pass 统一删键并跑
+/// `degrade_missing_tool_choice`,这里不重复处理。
+pub(crate) fn strip_typed_web_search_tools(body: &mut Value) -> usize {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = tools.len();
+    tools.retain(|tool| !is_anthropic_web_search_server_tool(tool));
+    before - tools.len()
 }
 
 fn has_typed_web_search(body: &Value) -> bool {
@@ -1037,6 +1058,92 @@ mod tests {
         assert!(metadata
             .rule_ids
             .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
+    }
+
+    #[test]
+    fn disabled_web_search_is_stripped_before_any_kimi_rule_runs() {
+        // 摘除必须发生在补偿链之前。判据用尾随机器上下文重排:它只在声明了
+        // typed search 时交换末尾两条 user message。若改在链尾的 server tool
+        // policy 里摘,这条规则会先按"本轮会搜索"跑完 —— 在一个根本不会搜索的
+        // 轮次里改掉用户消息顺序,净效果是真实语义改动。
+        let intent = json!({"role": "user", "content": "联网查询 Rust 最新稳定版"});
+        let context = json!({
+            "role": "user",
+            "content": "Compute Snapshot\nCPU: 10 cores\nRAM: 32GiB"
+        });
+        let request = json!({
+            "messages": [intent.clone(), context.clone()],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "Bash", "input_schema": {"type": "object"}}
+            ]
+        });
+
+        // 开启态:声明保留,重排照常发生。
+        let (enabled, enabled_meta) = kimi(request.clone());
+        assert_eq!(
+            enabled["messages"],
+            json!([context.clone(), intent.clone()])
+        );
+        assert!(enabled_meta
+            .rule_ids
+            .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
+
+        // 关闭态:先摘声明,再进补偿链。
+        let mut stripped = request;
+        assert_eq!(super::strip_typed_web_search_tools(&mut stripped), 1);
+        let (mut disabled, disabled_meta) = kimi(stripped);
+        assert_eq!(
+            disabled["messages"],
+            json!([intent, context]),
+            "不会搜索的轮次不得改动消息顺序"
+        );
+        assert!(!disabled_meta
+            .rule_ids
+            .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
+        let tools = disabled["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "只摘 typed web_search,其它工具原样");
+        assert_eq!(tools[0]["name"], "Bash");
+        assert!(
+            crate::kimi_web_search_adapter::prepare_request(&mut disabled, RelayFlavor::Kimi)
+                .unwrap()
+                .is_none(),
+            "没有 typed 声明,兼容桥不触发"
+        );
+    }
+
+    #[test]
+    fn stripping_the_only_tool_leaves_no_dangling_forced_tool_choice() {
+        let mut request = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        });
+        assert_eq!(super::strip_typed_web_search_tools(&mut request), 1);
+        let (mapped, _) = kimi(request);
+        assert!(mapped.get("tools").is_none(), "空 tools 由链尾统一删键");
+        assert!(
+            mapped.get("tool_choice").is_none(),
+            "指向已摘工具的 forced choice 不得留给上游"
+        );
+    }
+
+    #[test]
+    fn stripping_is_a_no_op_without_a_typed_web_search_declaration() {
+        // 关闭开关不得影响不带搜索声明的普通轮:零命中就是零改写。
+        for original in [
+            json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "Bash"}
+            }),
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            json!({"messages": [{"role": "user", "content": "hi"}], "tools": []}),
+        ] {
+            let mut body = original.clone();
+            assert_eq!(super::strip_typed_web_search_tools(&mut body), 0);
+            assert_eq!(body, original, "零命中必须逐字段原样");
+        }
     }
 
     #[test]

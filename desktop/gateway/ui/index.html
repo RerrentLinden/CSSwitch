@@ -69,6 +69,8 @@
   }
   input:focus { outline: none; border-color: var(--accent); }
   .field { margin-bottom: 14px; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ink); margin: 0; }
+  .check input[type="checkbox"] { width: auto; margin: 0; accent-color: var(--accent); }
   .slots { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
   fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin: 0; }
   legend { font-size: 12px; color: var(--muted); padding: 0 6px; }
@@ -130,6 +132,16 @@
         默认模型必填;高质量、快速与 Fable 留空时自动继承默认模型。
         模型 ID 用于上游请求,显示名用于 Science 的模型菜单。
       </p>
+      <div class="field" id="web-search-field" hidden>
+        <label class="check">
+          <input type="checkbox" id="web-search">
+          <span>联网搜索(web_search 兼容桥)</span>
+        </label>
+        <p class="hint" style="margin:6px 0 0">
+          关闭后本渠道不提供联网搜索:Science 声明的 web_search 工具会在网关侧摘除,
+          模型拿不到它,兼容桥也不会触发。保存后下一次请求即生效,无需重启 Science。
+        </p>
+      </div>
       <div class="row">
         <button type="submit" class="act primary">保存配置</button>
         <span class="sub">保存只更新配置;运行中的链路不变,下次切换或重启 Science 时生效。</span>
@@ -198,6 +210,9 @@ function renderSlots() {
   const config = state.channels[channel];
   $('base').value = config.base_url || '';
   $('key').placeholder = config.has_api_key ? '已保存,留空则保持不变' : '尚未配置';
+  // 只有 Kimi 有 web_search 兼容桥;别的渠道不渲染一个按不动的开关。
+  $('web-search-field').hidden = channel !== 'kimi';
+  $('web-search').checked = config.web_search !== false;
   $('slots').innerHTML = SLOTS.map((slot) => {
     const value = config[slot.key] || { model_id: '', display_name: '' };
     return `<fieldset>
@@ -231,6 +246,14 @@ async function refresh() {
   state = await api('status');
   renderModes();
   renderSlots();
+  renderScience();
+}
+
+// 周期轮询只刷状态,不重绘配置表单:否则用户填到一半的地址、模型槽或还没保存的
+// 联网搜索开关会被无声覆盖回已保存值。
+async function poll() {
+  state = await api('status');
+  renderModes();
   renderScience();
 }
 
@@ -270,6 +293,7 @@ $('tabs').onclick = (event) => {
 $('cfg').onsubmit = async (event) => {
   event.preventDefault();
   const payload = { channel, base_url: $('base').value, api_key: $('key').value };
+  if (channel === 'kimi') payload.web_search = $('web-search').checked;
   SLOTS.forEach((slot) => { payload[slot.key] = { model_id: '', display_name: '' }; });
   document.querySelectorAll('#slots input').forEach((input) => {
     payload[input.dataset.slot][input.dataset.part] = input.value.trim();
@@ -366,7 +390,7 @@ refresh().catch((error) => {
   document.querySelector('.wrap').insertAdjacentHTML('afterbegin',
     `<div class="card" style="border-color:var(--err)">无法连接本地服务:${error.message}</div>`);
 });
-setInterval(() => refresh().catch(() => {}), 15000);
+setInterval(() => poll().catch(() => {}), 15000);
 </script>
 </body>
 </html>
