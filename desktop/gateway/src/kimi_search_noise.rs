@@ -14,8 +14,9 @@
 //!    没有,紧跟 `content: []` 的 `web_search_tool_result`(同样无 tool_use_id)。
 //!    该对经 Science 落盘后成为无 id 孤儿结果块,此后每一轮都 400
 //!    `tool_call_id is not found`(真实会话复现);UI 侧则渲染为一个空的
-//!    Server Tool 框。整对剥离。判据收窄为**两半都无键且内容为空**
-//!    (与探测记录的幻影形态精确一致);带键的空结果是真实零结果搜索,走采钥保留。
+//!    Server Tool 框。整对剥离。判据收窄为**两半都无键且 content 为显式 `[]`**
+//!    (与探测记录的幻影形态精确一致);带键的空结果是真实零结果搜索,走采钥保留;
+//!    content 缺失或非数组不算空(上游 schema 漂移必须保持可见),按无钥对放行。
 //!
 //! 3. **搜索对配对键采钥** `provider.kimi.search-pair-id-adopt`
 //!    真实搜索对的两半配对键恒不匹配:`server_tool_use.id` 为 `tool_…`,
@@ -25,6 +26,10 @@
 //!    `use.id` 改写为同对结果块的 `tool_use_id`(**只采用上游已有的键,
 //!    不发明新键**);result 侧无键而 use 侧有键时反向补齐。两半都无键的
 //!    非空对不归一,如实放行仅记数。采钥不改变块数与索引。
+//!
+//! 规则 2/3 只对 `name == "web_search"` 的 `server_tool_use` 生效;其它
+//! server tool 及其相邻结果块不参与配对判定,字节级直通(2026-08-20 收窄,
+//! 防止 `web_search_tool_result` 反向把任意 server tool 认作搜索调用)。
 //!
 //! 被吞的块不占用输出索引(后续块索引前移补洞);**未命中的流量保持字节级
 //! 零改写**。规则 ID 与吞块 / 采钥计数记入服务日志。
@@ -268,10 +273,10 @@ impl SearchNoiseFilter {
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .map(str::to_string);
-                let content_empty = block
-                    .and_then(|block| block.get("content"))
-                    .and_then(Value::as_array)
-                    .is_none_or(|content| content.is_empty());
+                let content_empty = matches!(
+                    block.and_then(|block| block.get("content")),
+                    Some(Value::Array(content)) if content.is_empty()
+                );
                 // 幻影对(两半都无键、内容为空,与探测形态精确一致):吞掉整对。
                 if use_id.is_none() && result_key.is_none() && content_empty {
                     let pending = self.pending.take().expect("checked above");
@@ -350,7 +355,12 @@ impl SearchNoiseFilter {
                 self.hold_frame(frame, sep, true)?;
                 Ok(self.decide_text())
             }
-            Some("server_tool_use") => {
+            Some("server_tool_use")
+                if block
+                    .and_then(|block| block.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("web_search") =>
+            {
                 let id = block
                     .and_then(|block| block.get("id"))
                     .and_then(Value::as_str)
@@ -637,7 +647,9 @@ pub fn strip_nonstream_noise(response: &mut Value) -> StripStats {
                 continue;
             }
         }
-        if block_type == Some("server_tool_use") {
+        if block_type == Some("server_tool_use")
+            && block.get("name").and_then(Value::as_str) == Some("web_search")
+        {
             let next_is_result = iter.peek().is_some_and(|next| {
                 next.get("type").and_then(Value::as_str) == Some("web_search_tool_result")
             });
@@ -653,10 +665,10 @@ pub fn strip_nonstream_noise(response: &mut Value) -> StripStats {
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .map(str::to_string);
-                let content_empty = result
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_none_or(|content| content.is_empty());
+                let content_empty = matches!(
+                    result.get("content"),
+                    Some(Value::Array(content)) if content.is_empty()
+                );
                 match (use_id, result_key) {
                     // 幻影对(两半都无键、内容为空):整对剥离。
                     (None, None) if content_empty => {
@@ -1001,6 +1013,60 @@ mod tests {
     }
 
     #[test]
+    fn malformed_search_result_content_is_not_a_phantom_stream_pair() {
+        // 只有现场出现过的显式 `[]` 才是幻影。旧判据把缺失或错误类型
+        // 都当空数组吞掉，会把上游 schema 漂移伪装成成功。
+        for (case, result_content) in [
+            ("missing", None),
+            ("string", Some(json!("invalid"))),
+            ("object", Some(json!({"unexpected": true}))),
+            ("null", Some(Value::Null)),
+        ] {
+            let mut result = json!({"type":"web_search_tool_result"});
+            if let Some(content) = result_content {
+                result["content"] = content;
+            }
+            let frames = vec![
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":result}),
+                json!({"type":"content_block_stop","index":1}),
+                json!({"type":"message_stop"}),
+            ];
+            let input = sse(&frames);
+            let mut filter = SearchNoiseFilter::new();
+            let mut out = filter.feed(&input).unwrap();
+            out.extend_from_slice(&filter.finalize().unwrap());
+            assert_eq!(out, input, "malformed {case} content must stay visible");
+            assert_eq!(filter.stats().unkeyed_pairs, 1, "{case}");
+            assert_eq!(filter.stats().total_blocks(), 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn non_web_search_server_tools_do_not_trigger_stream_pair_rewrites() {
+        // 旧逻辑会采纳第一对的 result id，并把第二对误判成幻影删除。
+        // `web_search_tool_result` 不能反向把任意 server tool 变成搜索调用。
+        let frames = vec![
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"tool_compute","name":"code_execution"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_search","content":[{"type":"web_search_result","url":"https://example.test"}]}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"server_tool_use","name":"code_execution"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"content_block_start","index":3,"content_block":{"type":"web_search_tool_result","content":[]}}),
+            json!({"type":"content_block_stop","index":3}),
+            json!({"type":"message_stop"}),
+        ];
+        let input = sse(&frames);
+        let mut filter = SearchNoiseFilter::new();
+        let mut out = filter.feed(&input).unwrap();
+        out.extend_from_slice(&filter.finalize().unwrap());
+        assert_eq!(out, input);
+        assert!(!filter.stats().any_activity());
+    }
+
+    #[test]
     fn flushes_a_held_server_tool_before_non_result_blocks() {
         let frames = vec![
             json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search"}}),
@@ -1263,5 +1329,49 @@ mod tests {
         assert!(content[8].get("id").is_none());
         assert!(content[9].get("tool_use_id").is_none());
         assert_eq!(content[10]["text"], "回答");
+    }
+
+    #[test]
+    fn malformed_search_result_content_is_not_a_phantom_nonstream_pair() {
+        // 与流式路径锁同一个信任边界，防止两份 pair matrix 再次漂移。
+        for (case, result_content) in [
+            ("missing", None),
+            ("string", Some(json!("invalid"))),
+            ("object", Some(json!({"unexpected": true}))),
+            ("null", Some(Value::Null)),
+        ] {
+            let mut result = json!({"type": "web_search_tool_result"});
+            if let Some(content) = result_content {
+                result["content"] = content;
+            }
+            let mut response = json!({"content": [
+                {"type": "server_tool_use", "name": "web_search"},
+                result,
+            ]});
+            let before = response.clone();
+            let stats = strip_nonstream_noise(&mut response);
+            assert_eq!(
+                response, before,
+                "malformed {case} content must stay visible"
+            );
+            assert_eq!(stats.unkeyed_pairs, 1, "{case}");
+            assert!(!stats.rewrote_body(), "{case}");
+        }
+    }
+
+    #[test]
+    fn non_web_search_server_tools_do_not_trigger_nonstream_pair_rewrites() {
+        let mut response = json!({"content": [
+            {"type": "server_tool_use", "id": "tool_compute", "name": "code_execution"},
+            {"type": "web_search_tool_result", "tool_use_id": "srv_search", "content": [
+                {"type": "web_search_result", "url": "https://example.test"}
+            ]},
+            {"type": "server_tool_use", "name": "code_execution"},
+            {"type": "web_search_tool_result", "content": []},
+        ]});
+        let before = response.clone();
+        let stats = strip_nonstream_noise(&mut response);
+        assert_eq!(response, before);
+        assert!(!stats.any_activity());
     }
 }

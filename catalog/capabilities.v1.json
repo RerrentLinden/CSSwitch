@@ -99,7 +99,7 @@
         ".trellis/tasks/archive/2026-08/08-03-kimi-protocol-compatibility/research/official-provider-capability-matrix.md"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools"
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_all_unsupported_tools_remove_every_tool_choice_shape"
       ]
     },
     {
@@ -167,7 +167,7 @@
       ]
     },
     {
-      "id": "provider.kimi.web-search-result-id-align",
+      "id": "provider.kimi.web-search-result-pairing-repair",
       "scope": "provider",
       "match": {
         "provider": "relay",
@@ -175,27 +175,42 @@
         "tool_type_family": "web_search_*"
       },
       "status": "active",
-      "action": "align_web_search_result_tool_use_id",
-      "reason": "Kimi 自己发出的 server_tool_use.id(tool_…)与 web_search_tool_result.tool_use_id(srvtoolu_…)不是同一个值;把它自己的输出原样回传会被 400 tool_call_id  is not found 拒收,一次搜索让此后每轮都失败。按块顺序绑到前面最近的 server_tool_use 即可。",
-      "evidence": "2026-08-19 真机:原样回传 400;两个 id 任一方向对齐后 200。",
+      "action": "repair_web_search_history_pairing",
+      "reason": "Science 历史可能只保留孤立 web_search_tool_result，或 Kimi 自己发出的 web_search server use/result ID 不一致；回放会 400 tool_call_id is not found。只绑定 name=web_search 的前置调用：错配时对齐、孤儿时补同 ID use；只有 idless result 的 content 精确为 [] 才删除，malformed content 不静默吞掉。",
+      "evidence": [
+        ".trellis/tasks/08-19-search-error-triage/research/2026-08-19-live-evidence.md",
+        ".trellis/tasks/08-19-kimi-web-search-review/research/2026-08-20-bridge-implementation-live.md"
+      ],
       "tests": [
-        "desktop/gateway/Cargo.toml::lib::anthropic_compat::tests::kimi_aligns_the_mismatched_web_search_result_id"
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_aligns_the_mismatched_web_search_result_id",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_repairs_idless_orphan_results_by_content",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_preserves_malformed_idless_orphan_result_content",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_history_pairing_ignores_intervening_non_search_server_tools"
       ]
     },
     {
-      "id": "tool.kimi.web_search.server-tool-preserve",
-      "scope": "tool",
+      "id": "provider.kimi.web-search.query-tool-adapter",
+      "scope": "provider",
       "match": {
         "provider": "relay",
         "provider_contract": "kimi-anthropic-relay",
         "tool_type_family": "web_search_*"
       },
       "status": "active",
-      "action": "preserve_server_tool",
-      "reason": "上游原生支持 web_search_20250305。历史上因'声明却未搜索必 429'改用客户端工具桥接,2026-08-19 复测 32 次未复现该 429,桥接退役,声明原样透传。",
-      "evidence": "2026-08-19 真机:k3 与 kimi-for-coding 各一轮,含 24 客户端工具形态,全部 200。",
+      "action": "bridge_web_search_via_private_query_tool",
+      "reason": "K3、K3-256k、K2.7 对完整 Science envelope 的 inline server-search planner/answer 行为不一致。主请求把 typed search 映射为私有 query tool，让模型决定是否搜索；私有 tool 复用公开名 web_search（模型会在可见 thinking 里复述工具名，私有名必泄漏，2026-08-20 真机 2/2 复现），同名冲突按 name 显式拒绝。搜索时发 forced nested 原生 Web Search（全模型一致强制，无白名单），nested 无正文且无未决 client tool 才 bounded synthesis；搜索+普通工具混合轮跳过 synthesis 以 tool_use 交回 Science。非搜索一调用、搜索二/三调用；三阶段共享 180s deadline，证据 512KiB 上限同时作用于直通合并路径，无 retry/fallback。原生 typed 路径保留为 nested executor。",
+      "evidence": [
+        ".trellis/tasks/08-19-kimi-web-search-review/research/2026-08-20-k27-adapter.md",
+        ".trellis/tasks/08-19-kimi-web-search-review/research/2026-08-20-bridge-implementation-live.md",
+        ".trellis/tasks/08-19-kimi-web-search-review/research/2026-08-20-bridge-code-review-live.md"
+      ],
       "tests": [
-        "desktop/gateway/Cargo.toml::lib::anthropic_compat::tests::kimi_now_preserves_the_server_web_search_declaration"
+        "desktop/gateway/src/kimi_web_search_adapter.rs::tests::the_kimi_contract_replaces_typed_search_for_every_model",
+        "desktop/gateway/src/kimi_web_search_adapter.rs::tests::resolver_synthesizes_only_when_nested_has_no_final_text",
+        "desktop/gateway/src/kimi_web_search_adapter.rs::tests::mixed_turns_without_nested_text_skip_synthesis_and_hand_the_call_back",
+        "desktop/gateway/src/kimi_web_search_adapter.rs::tests::merged_message_consumes_query_calls_and_streams_one_valid_lifecycle",
+        "desktop/gateway/src/kimi_web_search_adapter.rs::tests::nested_request_forces_the_search_for_every_model_without_a_whitelist",
+        "desktop/gateway/src/server.rs::tests::kimi_query_adapter_forces_the_same_nested_policy_for_every_model"
       ]
     },
     {
@@ -240,8 +255,7 @@
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
-        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_contract_policy_drops_typed_web_search_and_preserves_client_and_unknown_typed_tools",
-        "desktop/gateway/src/policy.rs::tests::deepseek_server_tool_policy_preserves_web_search_and_client_tools_only"
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_server_tools_are_not_client_schema_normalized"
       ]
     },
     {

@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -10,7 +11,7 @@ use crate::auth::{strip_path_secret, AuthResult};
 use crate::config::GatewayConfig;
 use crate::{
     anthropic_compat::{self, AnthropicMetadata},
-    connect, kimi_search_noise, messages, models,
+    connect, kimi_search_noise, kimi_web_search_adapter, messages, models,
 };
 
 use crate::kimi_search_noise::{
@@ -837,6 +838,21 @@ where
     }
 }
 
+/// The one place the streaming response head is written; both the native
+/// forwarding path and the Web Search adapter path go through it.
+fn write_sse_head(stream: &mut TcpStream) -> bool {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+    )
+    .and_then(|_| stream.flush())
+    .is_ok()
+}
+
+fn finish_chunked_stream(stream: &mut TcpStream) {
+    let _ = stream.write_all(b"0\r\n\r\n").and_then(|_| stream.flush());
+}
+
 fn handle_stream(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
@@ -851,13 +867,7 @@ fn handle_stream(
             return;
         }
     };
-    if write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
-    )
-    .and_then(|_| stream.flush())
-    .is_err()
-    {
+    if !write_sse_head(stream) {
         return;
     }
     let termination = forward_stream_body(&mut upstream.response, &[], filter, |chunk| {
@@ -870,7 +880,263 @@ fn handle_stream(
         | StreamTermination::ProtocolError => {}
         StreamTermination::DownstreamWriteError => return,
     }
-    let _ = stream.write_all(b"0\r\n\r\n").and_then(|_| stream.flush());
+    finish_chunked_stream(stream);
+}
+
+fn parse_adapter_message(body: &[u8], stage: &str) -> Result<Value, String> {
+    let message: Value = serde_json::from_slice(body).map_err(|error| {
+        format!("Kimi Web Search adapter {stage} returned invalid JSON: {error}")
+    })?;
+    if !message.is_object() {
+        return Err(format!(
+            "Kimi Web Search adapter {stage} returned a non-object response"
+        ));
+    }
+    Ok(message)
+}
+
+/// An SSE comment frame: protocol-legal, ignored by event parsers, and the
+/// only honest way to move first-byte time forward on a bridged turn — no
+/// fabricated `ping` events, no fake content.
+fn sse_comment(text: &str) -> Vec<u8> {
+    format!(": {text}\n\n").into_bytes()
+}
+
+/// Once the streaming head has been written, failures can no longer change
+/// the HTTP status; they become an explicit terminal SSE error instead.
+fn adapter_error(stream: &mut TcpStream, head_written: bool, status: u16, detail: &str) {
+    if head_written {
+        if write_chunk(stream, &stream_error_event(detail)).is_ok() {
+            finish_chunked_stream(stream);
+        }
+    } else {
+        api_error_json(stream, status, detail);
+    }
+}
+
+/// Safe projection of the merged content for the adapter log line: block
+/// types only, unknown types collapse to `other`.
+fn merged_shape(message: &Value) -> String {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return "-".into();
+    };
+    if content.is_empty() {
+        return "-".into();
+    }
+    content
+        .iter()
+        .map(|block| match block.get("type").and_then(Value::as_str) {
+            Some(
+                value @ ("thinking"
+                | "redacted_thinking"
+                | "text"
+                | "tool_use"
+                | "server_tool_use"
+                | "web_search_tool_result"),
+            ) => value,
+            Some(_) => "other",
+            None => "missing",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The leading `_`-segment of each distinct `web_search_tool_result`
+/// pairing key (e.g. `srvtoolu`), never the key itself: enough to see which
+/// id family survived into the merged message when a frame later drops the
+/// pair on disk.
+fn pair_key_prefix(message: &Value) -> String {
+    let mut prefixes: Vec<String> = Vec::new();
+    for block in message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if block.get("type").and_then(Value::as_str) != Some("web_search_tool_result") {
+            continue;
+        }
+        let prefix = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(|id| id.split('_').next().unwrap_or(id))
+            .map(|segment| segment.chars().take(12).collect::<String>())
+            .unwrap_or_else(|| "none".into());
+        if !prefixes.contains(&prefix) {
+            prefixes.push(prefix);
+        }
+    }
+    if prefixes.is_empty() {
+        "-".into()
+    } else {
+        prefixes.join(",")
+    }
+}
+
+fn handle_kimi_web_search_adapter(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    main_request: Value,
+    transport: Option<&messages::AnthropicTransport>,
+    downstream_stream: bool,
+    prepared: kimi_web_search_adapter::PreparedRequest,
+) {
+    let main_body = match serde_json::to_vec(&main_request) {
+        Ok(body) => body,
+        Err(error) => {
+            invalid_request_json(stream, &error.to_string());
+            return;
+        }
+    };
+    // A bridged turn takes several upstream calls before the first real
+    // frame. Claim the streaming response immediately and mark stage
+    // progress with SSE comments so the client sees bytes, not silence.
+    let head_written = downstream_stream && {
+        if !write_sse_head(stream) {
+            return;
+        }
+        let _ = write_chunk(stream, &sse_comment("bridge processing"));
+        true
+    };
+    let deadline = messages::inference_deadline(cfg);
+    let main_started = Instant::now();
+    let first = match messages::post_nonstream_before(cfg, main_body, transport, deadline) {
+        Ok(response) => match parse_adapter_message(&response.body, "main stage") {
+            Ok(message) => message,
+            Err(error) => {
+                adapter_error(stream, head_written, 502, &error);
+                return;
+            }
+        },
+        Err(error) => {
+            crate::log_line!(
+                "{}",
+                messages::upstream_failure_metadata("kimi_web_search_adapter_main", &error)
+            );
+            adapter_error(stream, head_written, error.status, &error.detail);
+            return;
+        }
+    };
+    let main_ms = main_started.elapsed().as_millis();
+    if head_written {
+        let _ = write_chunk(stream, &sse_comment("main stage complete"));
+    }
+
+    enum AdapterFailure {
+        Upstream(messages::UpstreamError),
+        Protocol(String),
+    }
+    let mut nested_ms = 0;
+    let mut synthesis_ms: Option<u128> = None;
+    let outcome = kimi_web_search_adapter::resolve_with(
+        &main_request,
+        &prepared,
+        &first,
+        |stage, request| {
+            let stage_name = match stage {
+                kimi_web_search_adapter::AdapterStage::Nested => "nested stage",
+                kimi_web_search_adapter::AdapterStage::Synthesis => "synthesis stage",
+            };
+            let body = serde_json::to_vec(&request).map_err(|error| {
+                AdapterFailure::Protocol(format!(
+                    "Kimi Web Search adapter {stage_name} request serialization failed: {error}"
+                ))
+            })?;
+            let started = Instant::now();
+            let response = messages::post_nonstream_before(cfg, body, transport, deadline);
+            let elapsed = started.elapsed().as_millis();
+            match stage {
+                kimi_web_search_adapter::AdapterStage::Nested => nested_ms = elapsed,
+                kimi_web_search_adapter::AdapterStage::Synthesis => synthesis_ms = Some(elapsed),
+            }
+            let response = response.map_err(AdapterFailure::Upstream)?;
+            if head_written && stage == kimi_web_search_adapter::AdapterStage::Nested {
+                let _ = write_chunk(stream, &sse_comment("nested stage complete"));
+            }
+            parse_adapter_message(&response.body, stage_name).map_err(AdapterFailure::Protocol)
+        },
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(kimi_web_search_adapter::ResolveError::Protocol(error))
+        | Err(kimi_web_search_adapter::ResolveError::Upstream(
+            _,
+            AdapterFailure::Protocol(error),
+        )) => {
+            crate::log_line!(
+                "relay Kimi Web Search adapter protocol failure rule={}: {error}",
+                kimi_web_search_adapter::RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER
+            );
+            adapter_error(stream, head_written, 502, &error);
+            return;
+        }
+        Err(kimi_web_search_adapter::ResolveError::Upstream(
+            stage,
+            AdapterFailure::Upstream(error),
+        )) => {
+            let operation = match stage {
+                kimi_web_search_adapter::AdapterStage::Nested => "kimi_web_search_adapter_nested",
+                kimi_web_search_adapter::AdapterStage::Synthesis => {
+                    "kimi_web_search_adapter_synthesis"
+                }
+            };
+            crate::log_line!("{}", messages::upstream_failure_metadata(operation, &error));
+            adapter_error(stream, head_written, error.status, &error.detail);
+            return;
+        }
+    };
+    if outcome.strip_stats.any_activity() {
+        crate::log_line!(
+            "relay nonstream rules={} noise={} pair={} bytes={}{}",
+            stream_strip_rules(&outcome.strip_stats),
+            outcome.strip_stats.noise_blocks,
+            outcome.strip_stats.pair_blocks,
+            outcome.strip_stats.bytes,
+            strip_stats_suffix(&outcome.strip_stats)
+        );
+    }
+    crate::log_line!(
+        "relay Kimi Web Search adapter rule={} model={} bridged={} queries={} upstream_calls={} stripped_client_search_tail={} merged_shape={} pair_key_prefix={} main_ms={} nested_ms={} synthesis_ms={}",
+        kimi_web_search_adapter::RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER,
+        main_request
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("-"),
+        usize::from(outcome.queries > 0),
+        outcome.queries,
+        1 + usize::from(outcome.queries > 0) + usize::from(synthesis_ms.is_some()),
+        outcome.stripped_client_search_tail,
+        merged_shape(&outcome.message),
+        pair_key_prefix(&outcome.message),
+        main_ms,
+        nested_ms,
+        synthesis_ms.unwrap_or(0)
+    );
+
+    if downstream_stream {
+        match kimi_web_search_adapter::render_stream(&outcome.message) {
+            Ok(body) => {
+                if write_chunk(stream, &body).is_ok() {
+                    finish_chunked_stream(stream);
+                }
+            }
+            Err(error) => adapter_error(stream, head_written, 502, &error),
+        }
+    } else {
+        match serde_json::to_vec(&outcome.message) {
+            Ok(body) => {
+                write_response(stream, 200, "OK", "application/json", &body);
+            }
+            Err(error) => {
+                adapter_error(
+                    stream,
+                    head_written,
+                    502,
+                    &format!("Kimi Web Search adapter response serialization failed: {error}"),
+                );
+            }
+        };
+    }
 }
 
 fn safe_relay_server_tool_type(tool_type: &str) -> &str {
@@ -1009,24 +1275,54 @@ fn handle_messages(
             .provider_contract
             .as_ref()
             .map(|contract| contract.contract_id.as_str());
-        let (transformed, metadata) = match anthropic_compat::transform_relay_request_for_contract(
-            raw,
-            &target_model,
-            cfg.relay_thinking.as_deref(),
-            provider_contract_id,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                invalid_request_json(stream, &e);
-                return;
-            }
-        };
+        let (mut transformed, mut metadata) =
+            match anthropic_compat::transform_relay_request_for_contract(
+                raw,
+                &target_model,
+                cfg.relay_thinking.as_deref(),
+                provider_contract_id,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    invalid_request_json(stream, &e);
+                    return;
+                }
+            };
+        let adapter =
+            match kimi_web_search_adapter::prepare_request(&mut transformed, metadata.flavor) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    invalid_request_json(stream, &error);
+                    return;
+                }
+            };
+        if adapter.is_some() {
+            metadata.rule_ids.push(
+                kimi_web_search_adapter::RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER.into(),
+            );
+        }
         let message_count = transformed
             .get("messages")
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or(0);
         log_relay_metadata(&metadata, &transformed, is_stream, message_count);
+        if let Some(prepared) = adapter {
+            handle_kimi_web_search_adapter(
+                stream,
+                cfg,
+                transformed,
+                anthropic_transport,
+                is_stream,
+                prepared,
+            );
+            return;
+        }
+        // 噪声整形对全部 Kimi 流量无条件生效:上游的噪声头 / 幻影对 / 配对键
+        // 漂移并不以「本轮声明了 typed search」为前提(历史轮、自发 server tool
+        // 都出现过),而零命中流量在过滤器内保持字节级原样,无代价。
+        // DeepSeek 与 Generic 流量不经过过滤器。
+        let use_noise_filter = metadata.flavor == anthropic_compat::RelayFlavor::Kimi;
         let transformed = match serde_json::to_vec(&transformed) {
             Ok(body) => body,
             Err(e) => {
@@ -1034,10 +1330,7 @@ fn handle_messages(
                 return;
             }
         };
-        // 噪声头剥离只针对 Kimi:上游往搜索轮注入 `Search results for query:`
-        // 文本块(证据见任务研究记录);DeepSeek 与 Generic 流量不经过过滤器。
-        let noise_filter = (metadata.flavor == anthropic_compat::RelayFlavor::Kimi)
-            .then(kimi_search_noise::SearchNoiseFilter::new);
+        let noise_filter = use_noise_filter.then(kimi_search_noise::SearchNoiseFilter::new);
         if is_stream {
             handle_stream(stream, cfg, transformed, anthropic_transport, noise_filter);
             return;
@@ -1272,14 +1565,249 @@ pub fn handle_inference(
 #[cfg(test)]
 mod tests {
 
-    use std::io::{Cursor, Error, ErrorKind, Read};
+    use std::io::{Cursor, Error, ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
 
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
-        forward_stream_body, relay_server_tool_types, relay_thinking_type, stream_error_event,
-        stream_strip_rules, strip_stats_suffix, StreamTermination,
+        forward_stream_body, handle_kimi_web_search_adapter, merged_shape, pair_key_prefix,
+        relay_server_tool_types, relay_thinking_type, stream_error_event, stream_strip_rules,
+        strip_stats_suffix, StreamTermination,
     };
+
+    #[test]
+    fn adapter_log_projections_expose_shapes_and_key_prefixes_only() {
+        let message = json!({
+            "content": [
+                {"type": "thinking", "thinking": "private"},
+                {"type": "server_tool_use", "id": "srvtoolu_abc", "name": "web_search",
+                 "input": {"query": "private query"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_abc",
+                 "content": [{"type": "web_search_result", "url": "https://private.test"}]},
+                {"type": "web_search_tool_result", "tool_use_id": "tool_def", "content": []},
+                {"type": "web_search_tool_result", "content": []},
+                {"type": "vendor_private_block", "secret": "must-not-leak"},
+                {"type": "text", "text": "private answer"}
+            ]
+        });
+        assert_eq!(
+            merged_shape(&message),
+            "thinking,server_tool_use,web_search_tool_result,web_search_tool_result,web_search_tool_result,other,text"
+        );
+        assert_eq!(pair_key_prefix(&message), "srvtoolu,tool,none");
+        let line = format!("{} {}", merged_shape(&message), pair_key_prefix(&message));
+        assert!(!line.contains("private"));
+        assert!(!line.contains("srvtoolu_abc"));
+
+        assert_eq!(merged_shape(&json!({"content": []})), "-");
+        assert_eq!(pair_key_prefix(&json!({"content": []})), "-");
+    }
+
+    fn read_http_json(stream: &mut TcpStream) -> serde_json::Value {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let expected = loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("read fake upstream request");
+            assert!(read > 0, "request ended before its body");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(head_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]);
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            break (head_end + 4, head_end + 4 + length);
+        };
+        while request.len() < expected.1 {
+            let read = stream.read(&mut buffer).expect("read fake upstream body");
+            assert!(read > 0, "request body ended early");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        serde_json::from_slice(&request[expected.0..expected.1]).unwrap()
+    }
+
+    fn write_http_json(stream: &mut TcpStream, value: &serde_json::Value) {
+        let body = serde_json::to_vec(value).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn run_kimi_query_adapter_fake(model: &'static str) {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_url = format!("http://{}/v1/messages", upstream.local_addr().unwrap());
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let upstream_thread = thread::spawn(move || {
+            let mut captured = Vec::new();
+            let calls = if model == "k3" { 3 } else { 2 };
+            for stage in 0..calls {
+                let (mut stream, _) = upstream.accept().unwrap();
+                let request = read_http_json(&mut stream);
+                captured.push(request.clone());
+                let response = if stage == 0 {
+                    let internal = request["tools"][0]["name"].as_str().unwrap();
+                    json!({
+                        "id": "main", "type": "message", "role": "assistant", "model": model,
+                        "content": [{"type": "tool_use", "id": "internal_1", "name": internal,
+                                     "input": {"query": "Rust stable release"}}],
+                        "stop_reason": "tool_use", "stop_sequence": null,
+                        "usage": {"input_tokens": 5, "output_tokens": 2}
+                    })
+                } else if stage == 1 {
+                    let mut content = vec![
+                        json!({"type": "text", "text": "Search results for query: Rust stable release"}),
+                        json!({"type": "server_tool_use", "id": "tool_original", "name": "web_search",
+                               "input": {"query": "Rust stable release"}}),
+                        json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+                            {"type": "web_search_result", "url": "https://example.test/rust"}
+                        ]}),
+                    ];
+                    if model != "k3" {
+                        content.push(json!({"type": "text", "text": "Rust is current."}));
+                    } else {
+                        content.push(json!({
+                            "type": "tool_use", "id": "hallucinated_search_tail",
+                            "name": "web_search", "input": {"query": "duplicate"}
+                        }));
+                    }
+                    json!({
+                        "id": "nested", "type": "message", "role": "assistant", "model": model,
+                        "content": content,
+                        "stop_reason": if model == "k3" { "tool_use" } else { "end_turn" },
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 7, "output_tokens": 9}
+                    })
+                } else {
+                    json!({
+                        "id": "synthesis", "type": "message", "role": "assistant", "model": model,
+                        "content": [{"type": "text", "text": "Synthesized answer."}],
+                        "stop_reason": "end_turn", "stop_sequence": null,
+                        "usage": {"input_tokens": 3, "output_tokens": 5}
+                    })
+                };
+                write_http_json(&mut stream, &response);
+            }
+            requests_tx.send(captured).unwrap();
+        });
+
+        let mut main_request = json!({
+            "model": model, "max_tokens": 128000, "stream": true,
+            "messages": [{"role": "user", "content": "latest Rust?"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "Bash", "input_schema": {"type": "object"}}
+            ]
+        });
+        let prepared = crate::kimi_web_search_adapter::prepare_request(
+            &mut main_request,
+            crate::anthropic_compat::RelayFlavor::Kimi,
+        )
+        .unwrap()
+        .unwrap();
+        let cfg = crate::config::GatewayConfig {
+            provider: "relay".into(),
+            port: 0,
+            auth_secret: None,
+            api_key: Some("fake-key".into()),
+            upstream_url,
+            models_url: None,
+            relay_thinking: None,
+            provider_contract: None,
+            intent: crate::config::GatewayIntent::Formal,
+            static_model_resolver: None,
+            shim_mode: "off".into(),
+            launch_id: "kimi-adapter-test".into(),
+        };
+        let downstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let downstream_addr = downstream_listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(downstream_addr).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+        let (mut downstream, _) = downstream_listener.accept().unwrap();
+        handle_kimi_web_search_adapter(&mut downstream, &cfg, main_request, None, true, prepared);
+        drop(downstream);
+        let response = String::from_utf8(client.join().unwrap()).unwrap();
+        upstream_thread.join().unwrap();
+        let requests = requests_rx.recv().unwrap();
+
+        assert_eq!(requests.len(), if model == "k3" { 3 } else { 2 });
+        assert_eq!(requests[0]["max_tokens"], 128000);
+        assert_eq!(requests[1]["max_tokens"], 4096);
+        assert!(requests[0]["tools"][0].get("type").is_none());
+        assert_eq!(
+            requests[1]["tool_choice"],
+            json!({"type": "tool", "name": "web_search"}),
+            "{model}"
+        );
+        assert_eq!(
+            requests[1]["thinking"],
+            json!({"type": "disabled"}),
+            "{model}"
+        );
+        assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 1);
+        if model == "k3" {
+            let synthesis = &requests[2];
+            assert_eq!(synthesis["max_tokens"], 8192);
+            let messages = synthesis["messages"].as_array().unwrap();
+            assert_eq!(
+                messages[messages.len() - 2]["content"][0]["id"],
+                "internal_1"
+            );
+            assert_eq!(
+                messages[messages.len() - 1]["content"][0]["tool_use_id"],
+                "internal_1"
+            );
+            assert_eq!(messages[messages.len() - 1]["content"][1]["type"], "text");
+            assert!(synthesis["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("Bash") }));
+            assert!(response.contains("Synthesized answer."));
+            assert!(!response.contains("hallucinated_search_tail"));
+        }
+        assert_eq!(response.matches("event: message_start").count(), 1);
+        assert_eq!(response.matches("event: message_stop").count(), 1);
+        assert!(response.contains("srvtoolu_1"));
+        assert!(!response.contains("tool_original"));
+        assert!(!response.contains("internal_1"));
+        assert!(!response.contains("Search results for query:"));
+        // First-byte progress: the head goes out before any upstream call and
+        // each completed stage leaves a comment frame ahead of message_start.
+        assert!(response.contains(": bridge processing"));
+        assert!(response.contains(": main stage complete"));
+        assert!(response.contains(": nested stage complete"));
+        assert!(
+            response.find(": bridge processing").unwrap()
+                < response.find("event: message_start").unwrap()
+        );
+    }
+
+    #[test]
+    fn kimi_query_adapter_forces_the_same_nested_policy_for_every_model() {
+        for model in ["k3", "k3-256k", "kimi-for-coding"] {
+            run_kimi_query_adapter_fake(model);
+        }
+    }
 
     #[test]
     fn kimi_search_adoption_rule_and_stats_are_logged_without_false_rules() {

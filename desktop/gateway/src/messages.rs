@@ -603,12 +603,12 @@ fn map_http_error(
     }
 }
 
-pub fn post_nonstream(
+fn post_nonstream_with_timeouts(
     cfg: &GatewayConfig,
     body: Vec<u8>,
     transport: Option<&AnthropicTransport>,
+    timeouts: InferenceTimeouts,
 ) -> Result<UpstreamBody, UpstreamError> {
-    let timeouts = inference_timeouts(cfg);
     let started = Instant::now();
     let resp = post_with_timeouts(cfg, body, timeouts, true, transport)?;
     if !resp.status().is_success() {
@@ -645,6 +645,43 @@ pub fn post_nonstream(
         content_type,
         body: response_body,
     })
+}
+
+pub fn post_nonstream(
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    transport: Option<&AnthropicTransport>,
+) -> Result<UpstreamBody, UpstreamError> {
+    post_nonstream_with_timeouts(cfg, body, transport, inference_timeouts(cfg))
+}
+
+/// One adapter turn can issue multiple finite upstream requests. They share
+/// the contract's cumulative deadline instead of each resetting the full
+/// timeout, while HTTP/auth/header construction stays owned by this module.
+pub(crate) fn inference_deadline(cfg: &GatewayConfig) -> Instant {
+    Instant::now()
+        .checked_add(inference_timeouts(cfg).total)
+        .expect("validated inference timeout must fit Instant")
+}
+
+pub(crate) fn post_nonstream_before(
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    transport: Option<&AnthropicTransport>,
+    deadline: Instant,
+) -> Result<UpstreamBody, UpstreamError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| UpstreamError {
+            status: 504,
+            upstream_status: None,
+            detail: "upstream request exceeded the cumulative total timeout".into(),
+        })?;
+    let mut timeouts = inference_timeouts(cfg);
+    timeouts.total = remaining;
+    timeouts.connect = timeouts.connect.min(remaining);
+    post_nonstream_with_timeouts(cfg, body, transport, timeouts)
 }
 
 #[cfg(test)]
@@ -726,10 +763,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        messages_post_url, models_timeout_secs, models_timeouts, post_with_timeouts,
-        read_body_with_deadline, read_first_line, redact_error_body, upstream_failure_metadata,
-        AnthropicTransport, BodyReadFailure, InferenceTimeouts, ModelsTimeouts, UpstreamError,
-        INFERENCE_TIMEOUTS,
+        messages_post_url, models_timeout_secs, models_timeouts, post_nonstream_before,
+        post_with_timeouts, read_body_with_deadline, read_first_line, redact_error_body,
+        upstream_failure_metadata, AnthropicTransport, BodyReadFailure, InferenceTimeouts,
+        ModelsTimeouts, UpstreamError, INFERENCE_TIMEOUTS,
     };
     use crate::config::GatewayConfig;
     use crate::provider_contracts::AuthScheme;
@@ -954,6 +991,21 @@ mod tests {
             shim_mode: "off".to_string(),
             launch_id: "timeout-test".to_string(),
         }
+    }
+
+    #[test]
+    fn expired_cumulative_inference_deadline_fails_before_network_io() {
+        let cfg = test_config("http://127.0.0.1:9/v1/messages".into());
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = post_nonstream_before(&cfg, b"{}".to_vec(), None, deadline).unwrap_err();
+        assert_eq!(error.status, 504);
+        assert_eq!(error.upstream_status, None);
+        assert_eq!(
+            error.detail,
+            "upstream request exceeded the cumulative total timeout"
+        );
     }
 
     #[test]

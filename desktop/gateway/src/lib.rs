@@ -6,6 +6,7 @@ pub mod connect;
 pub mod control;
 pub mod deepseek_compat;
 pub mod kimi_search_noise;
+pub mod kimi_web_search_adapter;
 pub mod messages;
 pub mod models;
 pub mod official_passthrough;

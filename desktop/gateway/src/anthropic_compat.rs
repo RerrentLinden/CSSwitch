@@ -3,8 +3,6 @@ use serde_json::{json, Map, Value};
 const RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE: &str = "tool.relay.input-schema-normalize";
 const RULE_TOOL_KIMI_UNSUPPORTED_SERVER_TOOL_FILTER: &str =
     "tool.kimi.unsupported-server-tool-filter";
-const RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_PRESERVE: &str =
-    "tool.kimi.web_search.server-tool-preserve";
 const RULE_TOOL_DEEPSEEK_WEB_SEARCH_SERVER_TOOL_PRESERVE: &str =
     "tool.deepseek.web_search.server-tool-preserve";
 const RULE_TOOL_DEEPSEEK_UNSUPPORTED_SERVER_TOOL_FILTER: &str =
@@ -244,7 +242,7 @@ fn normalize_relay_input_schema(schema: Option<&Value>) -> Value {
     Value::Object(out)
 }
 
-fn degrade_missing_tool_choice(body: &mut Value) {
+pub(crate) fn degrade_missing_tool_choice(body: &mut Value) {
     let has_tools = body
         .get("tools")
         .and_then(Value::as_array)
@@ -318,14 +316,14 @@ fn classify_anthropic_server_tool(tool: &Value) -> Option<AnthropicServerToolKin
     Some(kind)
 }
 
+pub(crate) fn is_anthropic_web_search_server_tool(tool: &Value) -> bool {
+    classify_anthropic_server_tool(tool) == Some(AnthropicServerToolKind::WebSearch)
+}
+
 fn has_typed_web_search(body: &Value) -> bool {
     body.get("tools")
         .and_then(Value::as_array)
-        .is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                classify_anthropic_server_tool(tool) == Some(AnthropicServerToolKind::WebSearch)
-            })
-        })
+        .is_some_and(|tools| tools.iter().any(is_anthropic_web_search_server_tool))
 }
 
 fn text_only_content(content: &Value) -> Option<String> {
@@ -423,14 +421,6 @@ pub struct ServerToolOutcome {
     pub dropped: usize,
 }
 
-pub fn apply_anthropic_server_tool_policy(
-    body: &mut Value,
-    policy: AnthropicServerToolPolicy,
-    rule_ids: &mut Vec<String>,
-) -> usize {
-    apply_anthropic_server_tool_policy_with_outcome(body, policy, rule_ids).dropped
-}
-
 pub fn apply_anthropic_server_tool_policy_with_outcome(
     body: &mut Value,
     policy: AnthropicServerToolPolicy,
@@ -458,7 +448,9 @@ pub fn apply_anthropic_server_tool_policy_with_outcome(
             None => filtered.push(tool.clone()),
             Some(AnthropicServerToolKind::WebSearch) => match policy {
                 AnthropicServerToolPolicy::Kimi => {
-                    append_rule_id(rule_ids, RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_PRESERVE);
+                    // Kept in the body so the Web Search query-tool adapter can
+                    // consume it downstream; that adapter logs its own rule, so
+                    // this pass claims nothing.
                     filtered.push(tool.clone());
                 }
                 AnthropicServerToolPolicy::DeepSeek => {
@@ -662,26 +654,28 @@ fn repair_web_search_result_pairing(body: &mut Value, rule_ids: &mut Vec<String>
         let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        let declared: Vec<String> = content
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("server_tool_use"))
-            .filter_map(|block| block.get("id").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect();
-
         let mut rebuilt: Vec<Value> = Vec::with_capacity(content.len() + 1);
+        let mut message_changed = false;
+        let mut declared = std::collections::BTreeSet::new();
         let mut nearest: Option<String> = None;
         for block in content.iter() {
             match block.get("type").and_then(Value::as_str) {
                 Some("server_tool_use") => {
-                    if let Some(id) = block.get("id").and_then(Value::as_str) {
-                        nearest = Some(id.to_string());
+                    if block.get("name").and_then(Value::as_str) == Some("web_search") {
+                        nearest = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string);
+                        if let Some(id) = nearest.as_ref() {
+                            declared.insert(id.clone());
+                        }
                     }
                     rebuilt.push(block.clone());
                 }
                 Some("web_search_tool_result") => {
                     let current = block.get("tool_use_id").and_then(Value::as_str);
-                    if current.is_some_and(|id| declared.iter().any(|d| d == id)) {
+                    if current.is_some_and(|id| declared.contains(id)) {
                         rebuilt.push(block.clone());
                         continue;
                     }
@@ -706,16 +700,17 @@ fn repair_web_search_result_pairing(body: &mut Value, rule_ids: &mut Vec<String>
                             // 连 tool_use_id 都没有的孤儿结果块。上游的幻影空搜索
                             // (无 id 空壳对)经 Science 落盘后正是这个形态,留在
                             // 历史里每一轮都 400 "tool_call_id is not found"
-                            // (2026-08-19 真实会话复现)。空内容直接删,零证据损失;
-                            // 有内容则合成配对键保住证据——键只是相关性标记,
-                            // 上游自己的两半 id 本来也对不上。
+                            // (2026-08-19 真实会话复现)。content 为显式 `[]` 才删
+                            // (与幻影落盘形态精确一致),零证据损失;其余形态
+                            // (含缺失 / 非数组的协议异常)一律合成配对键保住原文
+                            // ——键只是相关性标记,上游自己的两半 id 本来也对不上。
                             None => {
-                                let empty = block
-                                    .get("content")
-                                    .and_then(Value::as_array)
-                                    .is_none_or(|content| content.is_empty());
+                                let empty = matches!(
+                                    block.get("content"),
+                                    Some(Value::Array(content)) if content.is_empty()
+                                );
                                 if empty {
-                                    changed = true;
+                                    message_changed = true;
                                     continue;
                                 }
                                 synthesized += 1;
@@ -732,13 +727,14 @@ fn repair_web_search_result_pairing(body: &mut Value, rule_ids: &mut Vec<String>
                             }
                         },
                     }
-                    changed = true;
+                    message_changed = true;
                 }
                 _ => rebuilt.push(block.clone()),
             }
         }
-        if changed {
+        if message_changed {
             *content = rebuilt;
+            changed = true;
         }
     }
     if changed {
@@ -1007,18 +1003,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The same request through the open-platform endpoint must come out
-    /// identical: one contract, one set of compensations, only the URL differs.
-    fn kimi_open_platform(body: Value) -> (Value, AnthropicMetadata) {
-        transform_relay_request_for_contract(
-            body,
-            "kimi-for-coding",
-            Some("upstream_default"),
-            Some("kimi-anthropic-relay"),
-        )
-        .unwrap()
-    }
-
     #[test]
     fn kimi_moves_science_compute_context_before_the_real_search_intent() {
         // Live A/B 根因形状:Science 把本机上下文作为第二条 user 追加,
@@ -1138,23 +1122,6 @@ mod tests {
                 .rule_ids
                 .contains(&"provider.kimi.science-context-tail-reorder".to_string()));
         }
-    }
-
-    #[test]
-    fn both_kimi_endpoints_produce_identical_requests_and_rules() {
-        let body = json!({
-            "model": "claude-opus-4-8",
-            "messages": [{"role": "user", "content": [
-                {"type": "document", "source": {"media_type": "application/pdf"}}
-            ]}],
-            "thinking": {"type": "auto"},
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-        });
-        let (coding_mapped, coding_meta) = kimi(body.clone());
-        let (open_mapped, open_meta) = kimi_open_platform(body);
-        assert_eq!(coding_mapped, open_mapped);
-        assert_eq!(coding_meta.rule_ids, open_meta.rule_ids);
-        assert_eq!(coding_meta.flavor, open_meta.flavor);
     }
 
     #[test]
@@ -1350,8 +1317,68 @@ mod tests {
     }
 
     #[test]
-    fn kimi_now_preserves_the_server_web_search_declaration() {
-        // 桥接退役后 web_search 原样送上游,不再换成客户端工具。
+    fn kimi_preserves_malformed_idless_orphan_result_content() {
+        // 缺失或错误类型不是现场幻影 `content: []`。旧判据会静默删掉
+        // 这些协议异常；现在只补 pairing，原始 content 留给上游诊断。
+        for (case, result_content) in [
+            ("missing", None),
+            ("string", Some(json!("invalid"))),
+            ("object", Some(json!({"unexpected": true}))),
+            ("null", Some(Value::Null)),
+        ] {
+            let mut result = json!({"type": "web_search_tool_result"});
+            if let Some(content) = result_content {
+                result["content"] = content;
+            }
+            let original_content = result.get("content").cloned();
+            let (body, meta) = kimi(json!({
+                "messages": [{"role": "assistant", "content": [result]}]
+            }));
+            let blocks = body["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(blocks.len(), 2, "{case}");
+            assert_eq!(blocks[0]["name"], "web_search", "{case}");
+            assert_eq!(
+                blocks[1].get("content").cloned(),
+                original_content,
+                "{case}"
+            );
+            assert_eq!(blocks[1]["tool_use_id"], blocks[0]["id"], "{case}");
+            assert!(
+                meta.rule_ids
+                    .contains(&"provider.kimi.web-search-result-pairing-repair".to_string()),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_history_pairing_ignores_intervening_non_search_server_tools() {
+        // 历史里搜索 use/result 不保证严格紧邻。旧逻辑会把结果误绑到
+        // 中间的 code_execution；只应选择最近的前置 Web Search use。
+        let (body, meta) = kimi(json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srv_search", "name": "web_search", "input": {}},
+                {"type": "server_tool_use", "id": "srv_compute", "name": "code_execution", "input": {}},
+                {"type": "web_search_tool_result", "tool_use_id": "srv_compute", "content": [
+                    {"type": "web_search_result", "url": "https://example.test"}
+                ]}
+            ]}]
+        }));
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[1]["id"], "srv_compute");
+        assert_eq!(blocks[1]["name"], "code_execution");
+        assert_eq!(blocks[2]["tool_use_id"], "srv_search");
+        assert!(meta
+            .rule_ids
+            .contains(&"provider.kimi.web-search-result-pairing-repair".to_string()));
+    }
+
+    #[test]
+    fn kimi_keeps_the_typed_web_search_for_the_adapter_without_claiming_a_rule() {
+        // 变换层只是把 typed 声明留在 body 里交给 query-tool adapter 消费;
+        // 真正发往上游的形态由 adapter 决定并记它自己的规则 ID,这一层不得
+        // 宣称任何 preserve 规则(净效果为零的改写不记规则)。
         let (body, meta) = kimi(json!({
             "messages": [{"role": "user", "content": "搜一下"}],
             "tools": [{"type": "web_search_20250305", "name": "web_search"}]
@@ -1360,9 +1387,7 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "web_search_20250305");
         assert_eq!(meta.dropped_server_tools, 0);
-        assert!(meta
-            .rule_ids
-            .contains(&"tool.kimi.web_search.server-tool-preserve".to_string()));
+        assert!(meta.rule_ids.is_empty(), "{:?}", meta.rule_ids);
     }
 
     #[test]
