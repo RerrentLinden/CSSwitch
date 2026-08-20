@@ -44,11 +44,13 @@
   - Science 会把 `compute snapshot` 机器上下文作为独立 user message 追加在真实问题之后；Kimi 主 query planner 会误取最后一条为主题。仅在 typed web_search 与精确硬件签名同时出现时交换尾部两条 text-only user message。
   - 幻影对在剥离规则落地前已落盘的历史，靠请求侧配对修复的无 id 分支救活（实测 Resume 后 400 → 200）；未经修复版本 gateway 的存量会话首轮可能仍撞一次 400。
   - 有搜索历史的下一轮，Science 会把上轮结果存盘并渲染一个**输出为空的 Server Tool 折叠框**（`[System] … results persisted`）。这是 Science 平台自己的历史压缩行为，与渠道无关，不是缺陷。
+  - **桥接搜索卡片仅在最新轮存活**（2026-08-20）：会话每推进一轮，Science 把旧 assistant 消息规整为纯 text，桥接轮的搜索对被追溯剥离、卡片消失（答案正文永久保留）；原生 typed 流式路径的卡片则跨轮持久。两者线上形态在可黑盒检视维度等形，Science 持久层选收依据未知；诊断靠 adapter 日志 `merged_shape` / `pair_key_prefix`。验收陷阱：测"重载后卡片仍在"必须先发过追问再重载，只测最新轮是假阳性。
   - nonstream 搜索轮实测 29.5–40s，合同 `total_ms` 已从 30s 上调至 180s；流式 read_idle 维持 300s。
   - 该端点仍存在与 web_search 无关的偶发 429；任何把 429 解释为特定语义的策略都不可靠。
 - `400 relay history ends with unresolved tool calls`：当客户端工具调用在等待用户授权（如 `request_network_access`）时，Science 仍会继续发起推理，历史以未解决的 `tool_use` 结尾，被 relay 通路的 `validate_relay_tool_history` 拒绝。该校验对所有 relay contract 无差别生效，非本渠道特有。当前 search bridge 不把失败降级成 network-access/command fallback，但普通工具本身仍可能触达该通用问题。
 - 上游不实现 Anthropic `document` 内容块（控制组判定为解析器未知块分支）。该块是 Science 平台 PDF 视觉通道的载荷，故**该平台路径在本渠道不可用**；CSSwitch 替换为署名占位文本保住该轮。读 PDF 仍可行：Agent 渲染页面为 `image` 块传入。占位文本必须署名来源（未署名时模型曾把正确结论当编造撤回）。
-- 已在最终 bridge release 上分别验证 `k3`、`k3-256k`、`kimi-for-coding` 的搜索、同会话不联网追问与整页重载（2026-08-20 内置浏览器）。K3-256k 搜索/追问观察到约 145s/156s，低于共享 180s deadline但延迟高；未知模型、图片/视频输入、原生流式结构化输出未验证。
+- 已在最终 bridge release 上分别验证 `k3`、`k3-256k`、`kimi-for-coding` 的搜索、同会话不联网追问与整页重载（2026-08-20 内置浏览器）。未知模型、图片/视频输入、原生流式结构化输出未验证。
+- **K3-256k 搜索慢已定性为上游 256k 服务池属性，非桥接开销**（2026-08-20 补正，此前"首字节延迟为已知代价"的说法不准确）：同题受控对比（宇树股价），差距全部在 nested（上游执行搜索）那一跳——`k3-256k` main 7.5s + nested 56.7s ≈ 64s，`k3` main 6.1s + nested 13.5s ≈ 20s；多次观测 `k3` nested 稳定 8–15s，`k3-256k` nested 在 15s / 26s / 57s / 100s+ 间波动。桥接固有代价只有"首字节 ≈ main 时长"（约 6–10s），对三个模型相同。网关无法改变单次上游调用时长；nested 执行端点可指定是唯一调节点（产品决策，未动）。已向 Kimi 官方反馈。
 - 真机验收细节与逐条判据见 [test/LIVE_ACCEPTANCE.md](../../test/LIVE_ACCEPTANCE.md)；本轮修复的任务证据在 `.trellis/tasks/archive/2026-08/08-19-kimi-search-hang/`。
 
 ## 测试
