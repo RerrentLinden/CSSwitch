@@ -94,10 +94,12 @@ flowchart TD
     TC -->|是| TCF[thinking 置 disabled]
     TC -->|否| TH{thinking 是 auto 或 adaptive?}
     TH -->|是| THF[删掉整个字段]
-    TH -->|否| TOOLS[web_search 声明原样保留]
+    TH -->|否| TOOLS[typed web_search 换私有 query tool]
     TCF --> TOOLS
     THF --> TOOLS
-    TOOLS --> OUT[发往上游]
+    TOOLS --> MAIN{主模型请求搜索?}
+    MAIN -->|否| CLIENT[普通回答/客户端工具]
+    MAIN -->|是| OUT[forced nested 原生 web_search]
     OUT --> RESP[上游响应]
     RESP --> NOISE[剥 Search results for query 噪声头]
     NOISE --> PAIR[剥无 id 的幻影空搜索对]
@@ -135,14 +137,16 @@ Science 的工作项分类器正是这个形状,每建一个工作项触发一�
 | 不带 / `auto` / `any` | 200,`[thinking, tool_use]` |
 | `{"type":"tool"}` | **400** |
 
-### 3. web_search:原生透传 + 历史配对修复
+### 3. web_search:统一 query-tool bridge + 历史配对修复
 
 历史成因是 429:只要**声明了却没实际搜索**就返回 429,而 Science 每轮都声明它。
-2026-08-19 复测 32 次**未再复现**,原先 920 行的客户端工具桥已退役,
-`web_search_20250305` 现在原样透传。
+2026-08-19 曾复测 32 次未复现旧 429并退役桥接；2026-08-20 fresh review 证明 K3、
+K3-256k、K2.7 的 inline planner/answer 不一致，恢复为精简 query-tool bridge。Science 主请求先让
+模型用私有普通工具决定 query；需要搜索才发 forced nested typed Web Search，nested 无正文时再做
+有界 synthesis。原生路径保留为 nested executor，不作为 Science 主入口。
 
 真实 Science 还会把 `compute snapshot` 机器上下文作为独立 user message 追加在
-真实问题之后。Kimi 原生搜索会把最后一条 user 当作查询主题。请求侧规则
+真实问题之后。Kimi 主 query planner 会把最后一条 user 当作查询主题。请求侧规则
 `provider.kimi.science-context-tail-reorder` 仅在 typed web_search、尾部双 user、
 末条 text-only 且同时命中 `compute snapshot`、独立词 `cores` 与 RAM/带数字 GiB
 容量规格时交换两条完整消息；上下文与真实问题原文都不改。普通连续 user、工具结果、
@@ -167,10 +171,9 @@ id 不匹配就对齐到最近的那个;**连 id 都没有的孤儿**(幻影空�
 选补块而非丢块,是为了保住这一轮的搜索证据。
 
 响应侧有三条整形(`kimi_search_noise.rs`):剥离上游注入的
-`Search results for query:` 噪声头 text 块;剥离"两半都无键 +
-空内容结果块"的幻影对——后者正是无 id 孤儿的源头;以及**配对键采钥**——
+`Search results for query:` 噪声头 text 块;只剥离前置 `name=web_search`、两半都无键且
+result `content` 精确为数组 `[]` 的幻影对——后者正是无 id 孤儿的源头;以及**配对键采钥**——
 真实搜索对放行前把 `server_tool_use.id` 改写为同对结果块的 `tool_use_id`
 (只采用上游已有的键),让 Science 能正常落盘配对,新轮次不再依赖请求侧修复。
 被吞的块不占输出索引,未命中流量字节级零改写。上游成因、危害与真机证据见
 [Kimi 渠道 §3b/§3c/§3d](features/kimi-channels.md)。
-

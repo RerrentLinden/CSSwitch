@@ -4,9 +4,9 @@ Kimi 走一个 provider contract（`kimi-anthropic-relay`），默认地址
 `https://api.kimi.com/coding`，可在控制台改成开放平台或其它区域端点；
 模型清单由用户在四个槽里自己填，所以换端点不需要改代码。
 
-> **证据边界**：补偿的实测证据来自 `api.kimi.com/coding`，2026-08-19 在 K3 上复测。
-> K2.7 系列与开放平台按用户判定沿用同一套补偿，**未独立实测**。若行为不符，
-> 表现应为可见错误而非静默降级。
+> **证据边界**：补偿证据来自 `api.kimi.com/coding`。2026-08-20 当前 query-tool bridge
+> 已分别用 K3、K3-256k、K2.7 在真实 Claude Science 搜索/追问/重载通过；开放平台和其它
+> 未列模型沿用同 contract，但没有独立 live，异常必须可见失败。
 
 ## 后端契约
 
@@ -32,7 +32,8 @@ Kimi 走一个 provider contract（`kimi-anthropic-relay`），默认地址
 
 ## 上游缺陷与已实施的补偿
 
-四条都由 `api.kimi.com/coding` 的真实 live 请求确认，各自绑定规则 ID 与单测。
+核心补偿均由 `api.kimi.com/coding` 的真实 live 请求确认，各自绑定规则 ID 与单测；
+Web Search bridge 另有 K3、K3-256k、K2.7 三模型的最终 Science 验收。
 
 ### 1. 非标准 `thinking: {"type":"auto"}` 导致静默不思考
 
@@ -67,7 +68,7 @@ Science 的工作项分类器（`create_work_item`）正是这个形状，每建
 （分类器依赖拿到结构化输出）。`any` 与 `auto` 上游无此问题，不做任何补偿。
 规则 `provider.kimi.specified-tool-choice-disables-thinking`。
 
-### 3. web_search:桥接已退役,改为原生透传 + 历史配对修复
+### 3. web_search:统一 query-tool bridge + 原生 nested executor
 
 #### 曾经的理由:429
 
@@ -75,8 +76,27 @@ Science 的工作项分类器（`create_work_item`）正是这个形状，每建
 每轮都声明它,于是真实会话每轮都失败。当时的对策是把服务端工具换成同名客户端工具
 (920 行的 `kimi_coding_search.rs`)。
 
-2026-08-19 复测 **32 次全部 200,零 429**(k3 与 kimi-for-coding 各一轮,含
-"只声明 web_search"与"web_search + 24 个客户端工具"两种形态)。该缺陷不再复现。
+2026-08-19 复测 **32 次全部 200,零 429**，一度退役桥接改为原生 inline。随后 review
+发现功能合同仍不成立：K2.7/Science 会只发幻影对并声称搜索不可用，K3-256k 也会忽略 typed
+search；即使 direct 能搜索，各模型对 search result→final answer 的行为仍不一致。因此
+2026-08-20 恢复早期桥接语义，但没有机械恢复旧 920 行实现。
+
+当前规则 `provider.kimi.web-search.query-tool-adapter`：
+
+```text
+Science typed web_search
+  -> main: 私有 ordinary query tool（模型决定是否搜索）
+  -> 不搜索: 1 call，原回答/普通工具返回
+  -> 搜索: nested typed web_search（指定工具 + thinking disabled）
+       -> 有正文: 2 calls
+       -> 只有真实 pair: bounded synthesis，第 3 call 生成正文
+  -> Science: 单一 message lifecycle、真实 Web Search 卡片/正文；内部工具零泄漏
+```
+
+主调用保留 Science 完整 system/messages/compute/client tools；query/evidence 以 untrusted data
+传递，不作为指令执行。nested/synthesis 输出上限分别 4096/8192，evidence 总量 512 KiB，
+三阶段共享一次 contract 180s deadline，无 retry、command fallback 或伪造成功。原生 typed 路径
+仍保留为 nested executor，并继续使用噪声/幻影/采钥规则。
 
 #### 真正的硬缺陷:搜索结果送不回历史
 
@@ -119,11 +139,12 @@ m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
 无 id 孤儿是上游"幻影空搜索"(见 §3c)经 Science 落盘后的产物,留着它每一轮都 400;
 配对键只是相关性标记——上游自己发的两半 id 本来也对不上,合成键并不比原状更假。
 
-#### 净结果
+#### 当前净结果
 
-删除 920 行桥接 + 响应侧剥离过滤器 + 13 个相关测试。
-`web_search_20250305` 现在原样透传给上游(规则
-`tool.kimi.web_search.server-tool-preserve`),Science 按原生 web_search 渲染。
+三个模型统一走一个主 bridge；搜索轮才增加 nested/synthesis，非搜索轮仍只有一次 main call。
+早期约 920 行状态机没有原样恢复；当前实现复用 `messages` transport、SSE validator、
+`kimi_search_noise` 与历史修复。日志只记录 rule/model、bridged/query/call 数与阶段耗时，不记录 query、
+结果或正文。
 
 > 第一次退役(2026-08-19 上午)在这里就收手了,真机验收 16 轮零报错,
 > 功能却是废的——助手内容里反复出现空的 `Search results for query:` 头,
@@ -131,8 +152,7 @@ m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
 > 不能只验报错**。当天傍晚的隔离探测把"功能废"拆成了三个可修的窄毛病
 > (下两节),才完成第二次、真正的退役。
 >
-> 若 429 卷土重来(它是负载相关的),桥接的完整实现保留在 git 历史里,
-> 提交 `1bdbbbd` 之前的 `desktop/gateway/src/kimi_coding_search.rs`。
+> 旧实现仍保留在 git 历史（提交 `1bdbbbd` 之前）作为证据，不是当前恢复方式的源码副本。
 
 ### 3b. 搜索轮的噪声头(响应侧剥离)
 
@@ -158,8 +178,9 @@ m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
 结果块,**此后每一轮都 400 `tool_call_id is not found`**(真实会话第 3 轮当场复现,
 Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id 孤儿"一行的来源)。
 
-补偿:响应侧规则 `provider.kimi.empty-search-pair-strip` 把"两半都无键的
-`server_tool_use` + 空内容结果块"整对剥掉,幻影对从此进不了历史;请求侧
+补偿:响应侧规则 `provider.kimi.empty-search-pair-strip` 只把"前置 `name=web_search`、
+两半都无键、结果 `content` 字段存在且精确为数组 `[]`"的整对剥掉；缺失/string/object/null
+不按空结果删除。请求侧
 `web-search-result-pairing-repair` 的无 id 分支负责救活修复落地前已中毒的历史
 (实测同一会话 Resume 后 400 → 200)。**带键的真实零结果搜索不剥离**;
 两半键不一致时由 §3d 的采钥规则归一后保留。
@@ -169,13 +190,21 @@ Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id �
 > 一个输出为空的 Server Tool 折叠框。**这是 Science 平台自己的历史压缩行为**,
 > 与渠道无关(官方渠道同样出现),CSSwitch 不改写它。
 
-#### 本轮真机验收(2026-08-19,内置浏览器驱动真实 Science + 真实订阅 key)
+#### 历史 native 真机验收(2026-08-19,内置浏览器驱动真实 Science + 真实订阅 key)
 
 同一 K3 会话连续 6 轮:原生搜索(组件渲染、来源齐全、开头无噪声)→ 凭历史追问
 (配对修复命中)→ 中毒历史 Resume 后再搜索(400 → 200)→ 无需搜索轮(幻影对
 剥离命中、落盘干净)→ 搜索历史 + python 工具循环(3 次 LLM 调用零失败,这正是
 当初 502 死循环的形态)→ 搜索 + 工具混合轮。K2.7 新起一轮原生搜索,正常回答。
 全程 `upstream_failure` 仅出现在修复落地前的中毒历史上。
+
+#### 统一 bridge 真机验收(2026-08-20)
+
+- K3：Elixir 搜索 14 results → 不联网追问 → 重载，PASS；搜索 2 calls，追问 1 call。
+- K3-256k：Vite 搜索 17 results → 不联网追问 → 重载，PASS；搜索约 145s、追问约 156s，
+  均在共享 180s deadline 内。高延迟是用户选择统一 bridge 的明确代价。
+- K2.7：Lua 搜索 13 results → 不联网追问 → 重载，PASS；搜索 2 calls。
+- 三者 query/card/text 均正确，追问 `bridged=0`，无 pairing repair / 400 / upstream failure。
 
 ### 3d. 搜索对配对键采钥(响应侧归一)
 
@@ -200,8 +229,8 @@ Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id �
 ### 3e. Science 尾随机器上下文重排(请求侧)
 
 真实 Science 会把用户问题与本机 `compute snapshot` 放成末尾相邻的两条 user message,
-机器上下文在后。direct K3 A/B 保持正文不变只交换两条顺序时,原顺序稳定搜索机器规格,
-反向顺序稳定搜索用户的 Rust 主题,因此问题位于 Kimi 原生搜索对消息顺序的解释。
+机器上下文在后。direct K3 A/B 保持正文不变只交换两条顺序时,原顺序让主 query planner 选择机器规格,
+反向顺序稳定选择用户的 Rust 主题,因此问题位于 Kimi 主 query planner 对消息顺序的解释。
 
 规则 `provider.kimi.science-context-tail-reorder` 只在 Kimi 请求声明 typed web_search、
 末尾两条都是 user、两条均为 text-only,且最后一条大小写无关命中
@@ -209,8 +238,8 @@ Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id �
 交换两条完整消息。它不删除或重建正文,也不改写 query；普通连续 user、历史工具结果、
 client tool 与兄弟 provider 均保持原样。真机候选在同一 K3 会话完成 Rust 搜索、
 历史复述、Python 搜索、跨搜索不联网比较与两轮连续计算；两张 query/card 和最终结果
-整页重载后均保留。搜索轮与响应侧 `search-pair-id-adopt adopted=1` 正常叠加，
-非搜索轮只命中 empty-pair-strip，全程无 repair / 400 / upstream failure。
+整页重载后均保留。该重排现在发生在 typed search 映射为私有 query tool 之前；bridge 搜索轮
+与响应整形正常叠加。
 
 ### 4. 不接受 Anthropic `document` 内容块
 

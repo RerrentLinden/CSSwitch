@@ -407,12 +407,133 @@ body.get("tool_choice").and_then(Value::as_object)
 
 ---
 
+## 场景：通过 query-tool bridge 执行 Kimi Web Search
+
+### 1. 范围 / 触发条件
+
+`kimi-anthropic-relay` 收到 typed `web_search_*` 时适用。K3、K3-256k、K2.7 对 inline
+server search 的 planner/answer 行为不一致；Science 主请求统一先把能力映射为私有 ordinary query tool，
+只有模型实际请求搜索时才发 nested server search。
+
+### 2. 签名
+
+```text
+kimi_web_search_adapter::prepare_request(&mut Value, RelayFlavor)
+kimi_web_search_adapter::resolve_with(main, prepared, first, upstream_call)
+kimi_web_search_adapter::render_stream(&Value) -> Result<Vec<u8>, String>
+messages::inference_deadline(&GatewayConfig) -> Instant
+messages::post_nonstream_before(..., deadline)
+RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
+  "provider.kimi.web-search.query-tool-adapter"
+```
+
+### 3. 合同
+
+- 主调用保留完整 Science system/messages/compute/client tools；只把唯一 typed Web Search 声明换成
+  内部 ordinary `{query:string}` tool，**其名字就是 `web_search`**——模型思考自然提到工具名时
+  从构造上无泄漏（2026-08-20 真机 2/2 复现过改名前的 thinking 泄漏；清洗式方案被否）。
+  同请求存在任何其它 `name=web_search` 工具（裸名 / `type:"custom"` / 异类 typed）时显式 400，
+  守卫按 name 匹配、不看 type。未调用它时只有一次上游请求，普通回答/工具原样返回。
+- 调用内部 tool 时，query 必须非空、唯一 ID、只含 `query` 字段，最多四次且 query 去重不能绕过调用数上限。
+- nested 只含原 typed Web Search，**对任何 Kimi 模型无条件**使用指定型 `tool_choice` 与显式
+  `thinking: disabled`（禁止模型名白名单——2026-08-20 review 抓到 fail-open 白名单让 catalog
+  出厂 id 静默不强制）；`max_tokens=min(main,4096)`。它必须返回 1..4 组唯一 `name=web_search` pair。
+- nested 有正文时两调用完成；只有真实 pair 时才做 synthesis。synthesis 使用 exact main tool IDs 的
+  `tool_result`、保留其它 Science tools、移除内部 tool 防递归，随后必须经
+  `degrade_missing_tool_choice`（防 `{"type":"any"}` 等 forced choice 被继承进已改动的 tools），
+  `max_tokens=min(main,8192)`。
+- nested 无正文且 main 含可见 client tool_use 时**跳过 synthesis 直接 merge**，
+  以 `stop_reason=tool_use` 把搜索证据与未决工具一并交回 Science 续轮；不得 fail closed
+  （2026-08-20 修复：旧硬错把可服务的混合轮变确定性 502，且与 merge 的显式支持自相矛盾）。
+- query 与网页 evidence 都是 **untrusted data**：以 JSON/tool_result 数据传递，回答指令不得拼接或执行其中指令。
+  evidence 总量最多 512 KiB，该上限**同时作用于 synthesis 与 nested-has-text 直通合并两条路径**，
+  超限失败，不截断；上限检查先于任何全量物化。
+- K3 在完整 pair 后偶发尾随 client `tool_use(name=web_search)`；仅当它是最后一个块且
+  `stop_reason=tool_use` 时按 type/name 剥离并记数（不逐字段校验将被丢弃的块），
+  安全性由随后的单次 nested 校验兜底。任何其它位置/工具 fail closed。
+- main/nested/synthesis 共享一次 contract total deadline；每阶段不得重置 180 秒。无 retry、command fallback
+  或伪造正文。usage 数值字段跨阶段 checked-add（溢出显式失败）；同键**类型**跨阶段不一致时取最后阶段值
+  并记 log_line 告警，不得为元数据差异丢弃整轮已完成的回答。
+- 对 Science 只输出一个 Anthropic lifecycle；merged 可见内容不得含任何 client
+  `tool_use(name=web_search)` 块（server_tool_use 除外），内部查询调用必须全部被消费。
+  流式路径进入即写 200 头 + `: bridge processing` SSE 注释帧，main/nested 完成后各一条阶段注释帧
+  （SSE 注释协议合法、事件解析器忽略）；写头后的失败以流内 `event: error` 呈现。
+  渲染后的 SSE 以 64 KiB 分块 feed 校验器（只看 Err，不做 round-trip 字节比对）。
+- 原生 typed 路径保留作为 nested executor；nested 响应继续经过 noise/phantom/adoption。
+  非 adapter 的 Kimi 响应路径**无条件**建 `SearchNoiseFilter`（零命中字节级原样）——
+  门控谓词一律从**变换前**的请求状态推导，禁止读被 `prepare_request` 改写后的 body
+  （2026-08-20 review：后置谓词恒为 false，整条过滤主路径成了死代码而测试仍绿）。
+- adapter 日志行携带 `merged_shape=<块类型序列>` 与 `pair_key_prefix=<键前缀段>`
+  诊断投影（只记形状与前缀，不记查询词或 id 全文），是排查 Science 落盘行为的一手数据。
+
+### 4. 校验与错误矩阵
+
+| 条件 | 行为 |
+| --- | --- |
+| 无 typed search / 兄弟 provider | bridge 不触发，原样路径 |
+| 私有 tool 名冲突、多个 typed search、非法 query/ID | 明确 400/502，不覆盖用户工具 |
+| nested 429/5xx/超时/非 JSON/缺 pair/异名 pair | 保留 stage 与状态，显式失败，不 retry |
+| nested 有 pair + text | 2 calls，合并真实 pair/text |
+| nested 有 pair、无 text、无未决普通 tool | bounded synthesis，第 3 call 生成正文/普通工具 |
+| nested 无 text 且 main 有未决普通 tool | 跳过 synthesis，merge 后 `stop_reason=tool_use` 交回 Science 续轮 |
+| evidence > 512 KiB（两条路径同判）/ usage 数值溢出 | 502，零截断、零假成功 |
+| usage 同键类型跨阶段不一致 | 取最后阶段值 + log_line 告警，不 502 |
+| shared deadline 过期 | 504，下一阶段联网前失败 |
+
+### 5. 正常 / 基线 / 错误案例
+
+- 正常：Science K2.7 搜索 → query tool → forced nested → 原生卡片 + 正文；下一轮不搜索
+  `bridged=0/upstream_calls=1`。
+- 基线：Kimi 普通轮即使声明 typed search，也由模型决定不调用私有 tool，零 nested 开销。
+- 错误：每轮强制 server search；拿完整用户 prompt 当 query；nested 失败后改走 Bash；把网页正文当指令；
+  或对下游发送两套 message lifecycle。
+
+### 6. 必需测试
+
+- 三模型 fake upstream：搜索严格 2/3 POST、不搜索 1 POST；nested forced/disabled、token caps、shared deadline。
+- query 数量/字段/唯一 ID、pair/result 1..4 唯一性、512 KiB、usage checked-add、stage-specific 429/协议错误。
+- JSON 与规范 SSE：merged 可见内容零 client `tool_use(name=web_search)`、查询调用全消费、
+  真实 pair/input delta、普通 tool 的 `stop_reason=tool_use`、单 `message_start/message_stop`、
+  阶段注释帧先于 `message_start`、大合并流可渲染而超大单帧仍显式失败。
+- K3 尾随 client search 正例与位置/name/id/input/无 pair 负例。
+- 真机必须在同一最终构建上分别跑 K3、K3-256k、K2.7：搜索 → 不联网追问 → 重载；
+  核对 query/card/text、`bridged`、calls、无 400/repair/upstream failure。direct/provider 与 Science 证据分栏。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+Science 每轮声明 web_search → 每轮直接强制搜索 → 非搜索轮多余调用/延迟/失败
+```
+
+#### Correct
+
+```text
+主模型通过私有 query tool 决定是否搜索 → nested 只执行真实 server search
+→ 有正文直接返回；无正文才用 exact tool_result synthesis → Science 单一生命周期
+```
+
+> **Warning（已知边界，2026-08-20）**：Science 的历史规整会在会话每推进一轮后,
+> 把**非最新** assistant 消息裁剪为纯 text（thinking 与 server 搜索对被追溯剥离,
+> `frame_messages` 可证）。桥接路径的搜索卡片因此只在「自己还是最新轮」期间可见;
+> 原生 typed 流式路径的卡片则由 Science 的持久转录层跨轮保留（2026-08-19 R6
+> 六轮验收可证）。两者在所有可黑盒检视的线上维度（块序、`srvtoolu` 键前缀、
+> usage 透传、shell 空 input + delta 单发）等形,Science 持久层的选收依据未知。
+> 诊断靠 adapter 日志的 `merged_shape` / `pair_key_prefix`;要根治需原生 vs 桥接
+> SSE 字节级抓包对差（原生流式已不对 Science 服务,需临时构建）。
+> 判「卡片消失」缺陷前,先确认是否只是这一语义:同轮/最新轮可见 + 正文永久保留 = 非缺陷。
+> 另注意由此派生的测试陷阱:验收「重载后卡片仍在」必须在**发过追问之后**再重载,
+> 只在最新轮重载会得到假阳性（2026-08-19 的 K3/K2.7 分化即此成因）。
+
+---
+
 ## 场景：重排 Science 尾随机器上下文以保住 Kimi 搜索意图
 
 ### 1. 范围 / 触发条件
 
-真实 Science 在用户问题后追加独立 `role=user` 的 compute snapshot；Kimi 原生
-web_search 会把最后一条 user 当查询主题时适用。direct A/B 必须只交换两条消息顺序，
+真实 Science 在用户问题后追加独立 `role=user` 的 compute snapshot；Kimi 主调用的
+query planner 会把最后一条 user 当搜索主题时适用。direct A/B 必须只交换两条消息顺序，
 以排除响应过滤器、system 内容与工具声明等变量。
 
 ### 2. 签名
@@ -425,7 +546,7 @@ RULE_PROVIDER_KIMI_SCIENCE_CONTEXT_TAIL_REORDER =
 
 ### 3. 合同
 
-- 仅 Kimi + typed `web_search_*` 生效；同名 client tool、DeepSeek 与 Generic 零改写。
+- 仅 Kimi + typed `web_search_*` 生效；发生在 typed→私有 query tool 之前；DeepSeek 与 Generic 零改写。
 - 只看末尾相邻两条 user message，且两条都必须是 string 或全 text blocks。前一条含
   `tool_result` 等非 text 块时不得交换，避免拆断 assistant/tool_result 历史配对。
 - 末条大小写无关包含 `compute snapshot`，并同时含独立词 `cores` 与独立词 `RAM`，
@@ -497,8 +618,10 @@ RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT =
 
 - `result.tool_use_id=K` 存在且与 `use.id` 不同时，只把 `use.id` 改为上游已有的 `K`；
   不改 `input.query`、结果内容或块索引。
+- 只有前置块 `type=server_tool_use,name=web_search` 才能参与采钥/幻影判定；其它 server tool 原样。
 - 只有 `use.id` 存在时，反向补到 `result.tool_use_id`。
-- 两半都无键且结果为空才是幻影对，整对剥离；带键的空结果是合法零结果搜索，必须保留。
+- 两半都无键且 result 的 `content` **存在、为数组并显式 `[]`** 才是幻影对；字段缺失、null、string、
+  object 等 schema 异常不得按空数组删除。带键的空结果是合法零结果搜索，必须保留。
 - 两半都无键但结果非空时不得发明键：原样放行并计 `unkeyed_pairs`。
 - `adopted_pairs > 0` 时非流式 body 必须重序列化；`unkeyed_pairs` 单独出现时是零改写，
   `rules=-`，但日志仍记 `unkeyed=N`。
@@ -511,7 +634,8 @@ RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT =
 | --- | --- | --- | --- |
 | 无或不等于 `K` | `K` | 任意 | `use.id := K`，`adopted_pairs += 1` |
 | `U` | 无 | 任意 | `result.tool_use_id := U`，`adopted_pairs += 1` |
-| 无 | 无 | 空 | 剥离整对，`pair_blocks += 2` |
+| 无 | 无 | 显式数组 `[]` | 剥离整对，`pair_blocks += 2` |
+| 无 | 无 | 缺失/非数组 | 原样或显式协议失败，不当幻影 |
 | 无 | 无 | 非空 | 原样放行，`unkeyed_pairs += 1` |
 | `K` | `K` | 任意 | 字节级原样放行，零命中 |
 
@@ -524,7 +648,8 @@ RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT =
 
 ### 6. 必需测试
 
-- 流式与非流式都覆盖：双键不匹配、反向采钥、带键空结果、无键非空、已配对零改写。
+- 流式与非流式都覆盖：双键不匹配、反向采钥、带键空结果、无键非空、已配对零改写、
+  malformed content 与非 Web Search server tool 负例。
 - 断言采钥不改变块索引、查询输入与结果内容；非流式 `adopted_pairs > 0` 后 body 被重序列化。
 - 断言规则日志包含 `search-pair-id-adopt` 与 `adopted=N`；只有无钥对时 `rules=-`
   且包含 `unkeyed=N`。

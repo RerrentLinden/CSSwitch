@@ -34,21 +34,21 @@
 
 ## Kimi 渠道（开放平台 / for Coding）
 
-最后更新：2026-08-19（web_search 桥接退役、原生透传落地当日）。
+最后更新：2026-08-20（恢复统一 query-tool bridge 并完成三模型真机验收）。
 
 - 两个渠道共用 provider contract `kimi-anthropic-relay` 与同一套补偿；差异只有默认地址与模型预设。**实测证据全部来自 `api.kimi.com/coding`，开放平台按用户判定沿用、未独立实测。**
 - 开放平台原有的一批只服务它的处理已全部移除（`?beta=true`、强制 `anthropic-beta`、伪装 `claude-cli/*` UA、强制 `x-app: cli`、失败历史尾巴清理、thinking 强制 `enabled` 与思考续写存储）。**若开放平台实际依赖这些标识放行，表现将是请求被拒或能力降级**；恢复实现见 git 历史。
-- **web_search 客户端工具桥已退役**（2026-08-19 第二次尝试，成功）：429 缺陷复测 32+2 次未再复现；`web_search_20250305` 原样透传，配套六条窄规则（Science 尾随机器上下文重排、请求侧配对修复、响应侧噪声头剥离、幻影空搜索对剥离、搜索对配对键采钥、`server-tool-preserve`）。上游成因、逐条证据与本轮真机验收见[渠道文档](../../docs/features/kimi-channels.md)。桥接完整实现保留在 git 历史（提交 `1bdbbbd` 之前）以备 429 复发。
-- 退役后的已知边界：
+- **web_search 已恢复统一 query-tool bridge**：2026-08-20 review 证明 K3、K3-256k、K2.7 的原生 inline planner/answer 行为不一致。Science 主请求把 typed search 映射为私有 query tool；需要搜索才发 forced nested server search，必要时有界 synthesis。旧 920 行实现未机械恢复；当前桥复用 transport/SSE/filter，保留原生路径作为 nested executor。逐条合同与真机证据见[渠道文档](../../docs/features/kimi-channels.md)。
+- 当前已知边界：
   - 上游搜索轮**每轮**注入 `Search results for query:` 噪声头，不搜索的轮次**常发**无 id 幻影空搜索对——两条剥离规则是常态命中而非偶发补丁，日志 `noise=/pair=` 可见。
-  - Science 会把 `compute snapshot` 机器上下文作为独立 user message 追加在真实问题之后；Kimi 原生搜索会误取最后一条为主题。仅在 typed web_search 与精确硬件签名同时出现时交换尾部两条 text-only user message。
+  - Science 会把 `compute snapshot` 机器上下文作为独立 user message 追加在真实问题之后；Kimi 主 query planner 会误取最后一条为主题。仅在 typed web_search 与精确硬件签名同时出现时交换尾部两条 text-only user message。
   - 幻影对在剥离规则落地前已落盘的历史，靠请求侧配对修复的无 id 分支救活（实测 Resume 后 400 → 200）；未经修复版本 gateway 的存量会话首轮可能仍撞一次 400。
   - 有搜索历史的下一轮，Science 会把上轮结果存盘并渲染一个**输出为空的 Server Tool 折叠框**（`[System] … results persisted`）。这是 Science 平台自己的历史压缩行为，与渠道无关，不是缺陷。
   - nonstream 搜索轮实测 29.5–40s，合同 `total_ms` 已从 30s 上调至 180s；流式 read_idle 维持 300s。
   - 该端点仍存在与 web_search 无关的偶发 429；任何把 429 解释为特定语义的策略都不可靠。
-- `400 relay history ends with unresolved tool calls`：当客户端工具调用在等待用户授权（如 `request_network_access`）时，Science 仍会继续发起推理，历史以未解决的 `tool_use` 结尾，被 relay 通路的 `validate_relay_tool_history` 拒绝。该校验对所有 relay contract 无差别生效，非本渠道特有。桥接退役后模型不再被迫改用 `request_network_access`，触达概率进一步下降，但该通用问题本身仍未修复。
+- `400 relay history ends with unresolved tool calls`：当客户端工具调用在等待用户授权（如 `request_network_access`）时，Science 仍会继续发起推理，历史以未解决的 `tool_use` 结尾，被 relay 通路的 `validate_relay_tool_history` 拒绝。该校验对所有 relay contract 无差别生效，非本渠道特有。当前 search bridge 不把失败降级成 network-access/command fallback，但普通工具本身仍可能触达该通用问题。
 - 上游不实现 Anthropic `document` 内容块（控制组判定为解析器未知块分支）。该块是 Science 平台 PDF 视觉通道的载荷，故**该平台路径在本渠道不可用**；CSSwitch 替换为署名占位文本保住该轮。读 PDF 仍可行：Agent 渲染页面为 `image` 块传入。占位文本必须署名来源（未署名时模型曾把正确结论当编造撤回）。
-- 已验证 `kimi-for-coding`、`k3` 的原生搜索、多轮、工具循环与混合轮（2026-08-19 内置浏览器驱动真实 Science）；`kimi-for-coding-highspeed`、`k3-256k` 按同契约沿用未单测；图片、视频输入、原生流式结构化输出未验证。
+- 已在最终 bridge release 上分别验证 `k3`、`k3-256k`、`kimi-for-coding` 的搜索、同会话不联网追问与整页重载（2026-08-20 内置浏览器）。K3-256k 搜索/追问观察到约 145s/156s，低于共享 180s deadline但延迟高；未知模型、图片/视频输入、原生流式结构化输出未验证。
 - 真机验收细节与逐条判据见 [test/LIVE_ACCEPTANCE.md](../../test/LIVE_ACCEPTANCE.md)；本轮修复的任务证据在 `.trellis/tasks/archive/2026-08/08-19-kimi-search-hang/`。
 
 ## 测试
