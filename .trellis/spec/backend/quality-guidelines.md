@@ -465,6 +465,14 @@ RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
   （2026-08-20 review：后置谓词恒为 false，整条过滤主路径成了死代码而测试仍绿）。
 - adapter 日志行携带 `merged_shape=<块类型序列>` 与 `pair_key_prefix=<键前缀段>`
   诊断投影（只记形状与前缀，不记查询词或 id 全文），是排查 Science 落盘行为的一手数据。
+- **渠道级能力开关关闭时，声明在补偿链之前摘除**（`strip_typed_web_search_tools`，规则
+  `tool.relay.web-search-disabled-by-config`），不在链尾的 server tool policy 里摘：
+  §「重排 Science 尾随机器上下文」等规则以「本轮声明了 typed search」为触发条件且跑在更早，
+  链尾摘除会让它们先按"会搜索"改写一个根本不会搜索的轮次。链首摘除后整条链一致地落到
+  「无 typed search → bridge 不触发，原样路径」这一既有分支，既有规则一条都不用改。
+  开关默认开，serde 默认值必须显式写 `true`——`bool` 原生默认是 `false`，存量配置没有该字段，
+  用原生默认等于给所有老用户静默停掉该能力。关闭态不清洗历史工具块，
+  「未声明该工具却回放其历史」是否被上游接受属未验证形状，交真机判定，不预先兜底。
 
 ### 4. 校验与错误矩阵
 
@@ -479,6 +487,7 @@ RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
 | evidence > 512 KiB（两条路径同判）/ usage 数值溢出 | 502，零截断、零假成功 |
 | usage 同键类型跨阶段不一致 | 取最后阶段值 + log_line 告警，不 502 |
 | shared deadline 过期 | 504，下一阶段联网前失败 |
+| 渠道开关关闭 | 链首摘声明 + 记规则，bridge 与 tail-reorder 均不触发，上游 1 call；无声明的轮次零改写 |
 
 ### 5. 正常 / 基线 / 错误案例
 
@@ -498,6 +507,10 @@ RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
 - K3 尾随 client search 正例与位置/name/id/input/无 pair 负例。
 - 真机必须在同一最终构建上分别跑 K3、K3-256k、K2.7：搜索 → 不联网追问 → 重载；
   核对 query/card/text、`bridged`、calls、无 400/repair/upstream failure。direct/provider 与 Science 证据分栏。
+- 渠道开关：**从 `handle_messages` 打到 fake 上游**看真正发出去的报文，断言上游 tools 里既没有
+  typed search 也没有 bridge 的私有查询工具（它同名 `web_search`，只断言"没有 typed"会漏掉桥仍触发）。
+  只测摘除函数本身证明不了 `cfg` 里的开关被读到。另需：链首摘除后 tail-reorder 不触发、
+  无声明轮次逐字段原样、缺省字段不改动已保存值、非布尔值显式报错。
 
 ### 7. Wrong vs Correct
 

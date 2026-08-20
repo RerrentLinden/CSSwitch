@@ -139,6 +139,29 @@ m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
 无 id 孤儿是上游"幻影空搜索"(见 §3c)经 Science 落盘后的产物,留着它每一轮都 400;
 配对键只是相关性标记——上游自己发的两半 id 本来也对不上,合成键并不比原状更假。
 
+#### 渠道级开关(2026-08-20)
+
+控制台「渠道配置 → Kimi」有一个联网搜索开关,存进
+`~/.csswitch/service.v1.json` 的 `kimi.web_search`,**默认开启**。存量配置没有这个
+字段时按开启读(自定义 serde 默认值;`bool` 的原生默认是 `false`,直接用它等于给老用户
+静默关掉搜索)。
+
+关闭时,typed `web_search` 声明在 relay 请求入口、**补偿链之前**被摘除,记规则
+`tool.relay.web-search-disabled-by-config`。摘在链首而不是链尾的 server tool policy 里,
+是因为 §3e 的尾随上下文重排以"本轮声明了 typed search"为触发条件:在链尾摘,重排会先在一个
+根本不会搜索的轮次里交换末尾两条 user message。链首摘除后整条链一致地按"本轮没有搜索声明"
+处理,§3 的 bridge 自然不触发,上游只有一次调用。
+
+配置是每请求读快照的,所以开关保存后下一次请求即生效,不需要重启 Science
+(地址与模型槽仍需重启,因为 Science 只在启动时读它们)。
+
+已知边界:关闭态**不清洗历史**里已有的 `server_tool_use` / `web_search_tool_result` 块。
+§3 的请求侧配对修复对 Kimi 流量无条件运行,配对完整性不受影响;但"本轮不声明该工具却回放
+它的历史"这一形状**未单独取证**,判据保留在 `test/LIVE_ACCEPTANCE.md`。
+
+2026-08-20 真机验收:用户在真实 Science + Kimi 渠道上实测通过,开关行为符合预期,
+未发现问题。上面那条历史回放形状不在本次取证范围内,仍按未验证记录。
+
 #### 当前净结果
 
 三个模型统一走一个主 bridge；搜索轮才增加 nested/synthesis，非搜索轮仍只有一次 main call。
