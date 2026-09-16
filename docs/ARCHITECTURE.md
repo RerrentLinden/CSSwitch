@@ -23,6 +23,11 @@ Science daemon 由服务用 CLI 拉起,注入 `ANTHROPIC_BASE_URL=http://127.0.0
 手动 `claude-science serve` 仍用 Science 自己的默认 8000,与经 CSSwitch 启动的地址不同。
 两者都绑 loopback。
 
+日志只打到服务进程的 stderr(终端),不落文件。控制台「请求日志」卡片的「记录请求日志」开关
+(`service.v1.json` 的 `request_log`,默认开启,切换立即生效)控制每条请求的明细:终端里的
+`POST /v1/messages relay …` / `relay stream|nonstream rules=…` / Web Search 桥接统计行,
+以及卡片里的请求列表。启动横幅、沙箱生命周期、警告与上游错误不受开关影响,始终输出。
+
 ## 三种模式
 
 | 模式 | `/v1/messages` | `/v1/models` |

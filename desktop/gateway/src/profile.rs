@@ -264,10 +264,21 @@ pub struct Profile {
     pub port: u16,
     pub kimi: Channel,
     pub deepseek: Channel,
+    /// 是否记录每条请求的日志(终端里的请求明细行与控制台「请求日志」面板)。
+    /// 启动信息、警告与错误不受它影响。
+    ///
+    /// **默认必须是 `true`**:`bool` 的 serde 原生默认是 `false`,而存量
+    /// `service.v1.json` 没有这个键,直接用它等于升级后静默关掉日志。
+    #[serde(default = "default_request_log")]
+    pub request_log: bool,
 }
 
 fn default_port() -> u16 {
     8788
+}
+
+fn default_request_log() -> bool {
+    true
 }
 
 impl Default for Profile {
@@ -277,6 +288,7 @@ impl Default for Profile {
             port: default_port(),
             kimi: Channel::kimi_default(),
             deepseek: Channel::deepseek_default(),
+            request_log: default_request_log(),
         }
     }
 }
@@ -433,6 +445,31 @@ mod tests {
         let restored: Profile = serde_json::from_str(&text).unwrap();
         assert!(!restored.kimi.web_search, "关闭态必须能存盘并读回");
         assert!(restored.deepseek.web_search, "另一渠道不受影响");
+    }
+
+    #[test]
+    fn request_log_defaults_on_and_survives_a_round_trip() {
+        let legacy = r#"{
+            "mode": "kimi",
+            "port": 8788,
+            "kimi": {
+                "base_url": "https://api.kimi.com/coding",
+                "default_model": {"model_id": "k3", "display_name": "Kimi K3"}
+            },
+            "deepseek": {
+                "base_url": "https://api.deepseek.com/anthropic",
+                "default_model": {"model_id": "deepseek-v4-pro", "display_name": ""}
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(legacy).unwrap();
+        assert!(profile.request_log, "缺键的老配置必须读成开启");
+
+        let mut profile = Profile::default();
+        assert!(profile.request_log, "新配置默认开启");
+        profile.request_log = false;
+        let text = serde_json::to_string(&profile).unwrap();
+        let restored: Profile = serde_json::from_str(&text).unwrap();
+        assert!(!restored.request_log, "关闭态必须能存盘并读回");
     }
 
     #[test]

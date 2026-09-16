@@ -27,6 +27,30 @@ macro_rules! log_line {
     };
 }
 
+/// 请求级日志开关(控制台「记录请求日志」)。进程级单值:单进程服务启动时按
+/// `service.v1.json` 设置,控制台切换后立即生效;standalone 网关没有配置文件,恒为开启。
+static REQUEST_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn request_log_enabled() -> bool {
+    REQUEST_LOG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_request_log_enabled(enabled: bool) {
+    REQUEST_LOG.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 请求级明细日志行:每条推理请求的规则 / 剥离 / 桥接统计。受
+/// [`request_log_enabled`] 控制。启动横幅、警告与错误仍直接走 [`log_line!`],
+/// 开关关闭时照常输出——关开关是为了安静,不是为了把故障一起藏掉。
+#[macro_export]
+macro_rules! request_log_line {
+    ($($arg:tt)*) => {
+        if $crate::request_log_enabled() {
+            $crate::log_line!($($arg)*);
+        }
+    };
+}
+
 /// 当前 UTC 时刻的 ISO-8601 毫秒时间戳,如 `2026-08-19T12:19:46.558Z`。
 pub fn utc_timestamp_ms() -> String {
     let epoch_ms = std::time::SystemTime::now()

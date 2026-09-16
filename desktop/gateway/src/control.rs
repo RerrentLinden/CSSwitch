@@ -48,6 +48,13 @@ impl AppState {
         }
     }
 
+    /// 普通请求条目,受「记录请求日志」开关控制。错误条目走 [`Self::record`],始终保留。
+    pub fn record_request(&self, entry: Value) {
+        if crate::request_log_enabled() {
+            self.record(entry);
+        }
+    }
+
     fn snapshot(&self) -> Profile {
         self.profile
             .read()
@@ -62,6 +69,7 @@ pub fn serve(port_override: Option<u16>) -> Result<(), String> {
         profile.port = port;
     }
     let port = profile.port;
+    crate::set_request_log_enabled(profile.request_log);
     let state = Arc::new(AppState::new(profile, port));
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("无法监听 127.0.0.1:{port}:{e}"))?;
@@ -134,6 +142,7 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
             "entries": state.log.lock().map(|log| log.clone()).unwrap_or_default()
         })),
         ("POST", "config") => save_config(request, state),
+        ("POST", "logging") => save_logging(request, state),
         ("POST", "switch") => switch_mode(request, state),
         ("POST", "probe-models") => probe_models(request),
         ("POST", "science/start") => start_science(state),
@@ -171,6 +180,7 @@ fn status_payload(state: &Arc<AppState>) -> Value {
         "base_url": format!("http://127.0.0.1:{}", state.port),
         "science": science,
         "sandbox": crate::sandbox::status(),
+        "request_log": profile.request_log,
         "channels": {
             "kimi": channel_payload(&profile.kimi),
             "deepseek": channel_payload(&profile.deepseek),
@@ -259,6 +269,30 @@ fn save_config(request: &Request, state: &Arc<AppState>) -> Result<Value, String
         "channel": channel_payload(&channel),
         "note": note
     }))
+}
+
+/// 「记录请求日志」开关。先存盘再改运行时:存盘失败时进程行为保持不变,
+/// 界面收到错误后回滚勾选状态,两边不会出现不一致。
+fn save_logging(request: &Request, state: &Arc<AppState>) -> Result<Value, String> {
+    let payload: Value =
+        serde_json::from_slice(&request.body).map_err(|e| format!("请求体不是合法 JSON:{e}"))?;
+    let enabled = parse_request_log(&payload)?;
+    let mut profile = state.snapshot();
+    profile.request_log = enabled;
+    profile.save()?;
+    crate::set_request_log_enabled(enabled);
+    if let Ok(mut guard) = state.profile.write() {
+        *guard = profile;
+    }
+    Ok(json!({"ok": true, "request_log": enabled}))
+}
+
+fn parse_request_log(payload: &Value) -> Result<bool, String> {
+    match payload.get("request_log") {
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err("request_log 必须是布尔值".into()),
+        None => Err("缺少 request_log".into()),
+    }
 }
 
 fn switch_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String> {
@@ -587,6 +621,15 @@ mod tests {
             model_list_candidates("https://api.kimi.com"),
             vec!["https://api.kimi.com/v1/models".to_string()]
         );
+    }
+
+    #[test]
+    fn request_log_payload_must_be_an_explicit_bool() {
+        assert_eq!(parse_request_log(&json!({"request_log": false})), Ok(false));
+        assert_eq!(parse_request_log(&json!({"request_log": true})), Ok(true));
+        // 不做类型降级:字符串 "false" 在 JS 里是真值,静默接受会把意图反过来。
+        assert!(parse_request_log(&json!({"request_log": "false"})).is_err());
+        assert!(parse_request_log(&json!({})).is_err());
     }
 
     #[test]

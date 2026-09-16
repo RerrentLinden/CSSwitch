@@ -169,6 +169,17 @@
 
   <section class="card">
     <h2>请求日志</h2>
+    <div class="field" style="margin-bottom:12px">
+      <label class="check">
+        <input type="checkbox" id="request-log">
+        <span>记录请求日志</span>
+      </label>
+      <p class="hint" style="margin:6px 0 0">
+        关闭后不再记录每条请求:终端里的请求明细行与下方列表都停止记录。
+        启动信息、警告与错误始终保留。切换立即生效,无需重启。
+      </p>
+      <div class="msg" id="log-msg"></div>
+    </div>
     <div class="row" style="margin-bottom:12px">
       <button class="act" id="btn-logs">刷新</button>
       <span class="sub">仅记录方法、路径、状态与耗时,不含任何凭证或消息内容。</span>
@@ -282,6 +293,7 @@ async function refresh() {
   renderSlots();
   renderScience();
   renderSandbox();
+  $('request-log').checked = state.request_log !== false;
 }
 
 // 周期轮询只刷状态,不重绘配置表单:否则用户填到一半的地址、模型槽或还没保存的
@@ -435,6 +447,23 @@ $('btn-quit').onclick = async () => {
   document.querySelector('.wrap').innerHTML =
     '<div class="card"><h2>服务已退出</h2>' +
     '<p class="sub">重新运行 <code>./csswitch</code> 即可再次启动。</p></div>';
+};
+
+$('request-log').onchange = async (event) => {
+  const enabled = event.target.checked;
+  try {
+    const result = await api('logging', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ request_log: enabled }),
+    });
+    state.request_log = result.request_log;
+    msg($('log-msg'), enabled ? '已开启请求日志。' : '已关闭请求日志;警告与错误仍会记录。');
+  } catch (error) {
+    // 服务端没存上,勾选状态回滚,界面不能和实际行为不一致。
+    event.target.checked = !enabled;
+    msg($('log-msg'), '切换失败:' + error.message, 'err');
+  }
 };
 
 $('btn-logs').onclick = async () => {

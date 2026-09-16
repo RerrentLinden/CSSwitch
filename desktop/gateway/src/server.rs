@@ -751,7 +751,7 @@ where
                     }
                     let stats = filter.stats();
                     if stats.any_activity() {
-                        crate::log_line!(
+                        crate::request_log_line!(
                             "relay stream rules={} noise={} pair={} bytes={}{}",
                             stream_strip_rules(&stats),
                             stats.noise_blocks,
@@ -1086,7 +1086,7 @@ fn handle_kimi_web_search_adapter(
         }
     };
     if outcome.strip_stats.any_activity() {
-        crate::log_line!(
+        crate::request_log_line!(
             "relay nonstream rules={} noise={} pair={} bytes={}{}",
             stream_strip_rules(&outcome.strip_stats),
             outcome.strip_stats.noise_blocks,
@@ -1095,7 +1095,7 @@ fn handle_kimi_web_search_adapter(
             strip_stats_suffix(&outcome.strip_stats)
         );
     }
-    crate::log_line!(
+    crate::request_log_line!(
         "relay Kimi Web Search adapter rule={} model={} bridged={} queries={} upstream_calls={} stripped_client_search_tail={} merged_shape={} pair_key_prefix={} main_ms={} nested_ms={} synthesis_ms={}",
         kimi_web_search_adapter::RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER,
         main_request
@@ -1210,7 +1210,7 @@ fn log_relay_metadata(
     } else {
         metadata.rule_ids.join(",")
     };
-    crate::log_line!(
+    crate::request_log_line!(
         "POST /v1/messages relay target={} stream={} msgs={} thinking_type={} budget_tokens={:?} max_tokens={:?} server_tool_types={} dropped_server_tools={} rules={}",
         metadata.target_model,
         is_stream,
@@ -1355,7 +1355,7 @@ fn handle_messages(
                     if let Ok(mut body) = serde_json::from_slice::<Value>(&resp.body) {
                         let stats = kimi_search_noise::strip_nonstream_noise(&mut body);
                         if stats.any_activity() {
-                            crate::log_line!(
+                            crate::request_log_line!(
                                 "relay nonstream rules={} noise={} pair={} bytes={}{}",
                                 stream_strip_rules(&stats),
                                 stats.noise_blocks,
@@ -1514,7 +1514,7 @@ pub fn handle_inference(
             body,
             crate::official_passthrough::DEFAULT_UPSTREAM,
         );
-        state.record(crate::control::log_entry(
+        state.record_request(crate::control::log_entry(
             "inference",
             json!({
                 "mode": "official",
@@ -1565,7 +1565,7 @@ pub fn handle_inference(
         }
         _ => not_found_json(stream, path),
     }
-    state.record(crate::control::log_entry(
+    state.record_request(crate::control::log_entry(
         "inference",
         json!({
             "mode": profile.mode.as_str(),
