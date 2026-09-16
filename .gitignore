@@ -23,13 +23,11 @@ scratchpad/
 .claude/
 .superpowers/
 
-# Trellis:只入库项目知识(规范、工作流定义)。
-# 任务目录含调研草稿与逐日 journal,属个人执行痕迹;
-# agents/scripts 与 .agents/skills 是 trellis 工具的生成物,由 trellis update 维护。
-/.trellis/tasks/
-/.trellis/workspace/
-/.trellis/agents/
-/.trellis/scripts/
+# Trellis:只入库项目规范(.trellis/spec/)。
+# 其余都是本机执行痕迹或 trellis 工具维护的内容:任务与逐日 journal、工作流定义、
+# 配置、版本号与模板哈希、agents/scripts;.agents/skills 同属工具生成物。
+/.trellis/*
+!/.trellis/spec/
 /.agents/skills/
 /.codex/
 
