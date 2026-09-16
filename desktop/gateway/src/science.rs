@@ -7,7 +7,10 @@
 //! 硬约束(经实测确认,违反会伤到用户的真实实例或改变它的行为):
 //! - 不传 `--data-dir` / `--config`:那会造出隔离实例,对话从此分家;
 //! - 不传 `--no-auto-update`:官方实例必须保留自身的自动更新;
-//! - 不传 `--port`:用 Science 自己的默认端口,地址才稳定可收藏;
+//! - 端口固定为 [`OFFICIAL_PORT`] / [`OFFICIAL_SANDBOX_PORT`],不用 `0` 随机端口:
+//!   控制台地址必须稳定可收藏。不沿用 Science 默认的 8000/8001,那两个端口常被
+//!   本机其它开发服务占用;代价是手动 `claude-science serve` 仍落在 8000,
+//!   与经 CSSwitch 启动的地址不同;
 //! - 不写、不读、不伪造任何 auth 状态。
 
 use std::path::PathBuf;
@@ -33,6 +36,12 @@ pub(crate) const MODEL_ENV_KEYS_TO_CLEAR: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
 ];
+
+/// 经 CSSwitch 启动官方实例时的监听端口。
+pub const OFFICIAL_PORT: u16 = 8686;
+/// 官方实例的 HTML 预览端口。显式给出而不依赖 Science 的「port+1」默认推导,
+/// 这样两个端口都能在代码里一眼看到,推导规则变了也不会悄悄漂移。
+pub const OFFICIAL_SANDBOX_PORT: u16 = 8687;
 
 const BIN_ENV: &str = "CLAUDE_SCIENCE_BIN";
 const BINARY_NAME: &str = "claude-science";
@@ -128,15 +137,28 @@ pub fn stop() -> Result<(), String> {
     }
 }
 
+/// 官方实例的 `serve` 参数。不带 --data-dir / --config / --no-auto-update:
+/// 见模块文档的硬约束;端口固定,理由同上。
+fn serve_args() -> Vec<String> {
+    vec![
+        "serve".into(),
+        "--port".into(),
+        OFFICIAL_PORT.to_string(),
+        "--sandbox-port".into(),
+        OFFICIAL_SANDBOX_PORT.to_string(),
+        "--detached".into(),
+        "--no-browser".into(),
+    ]
+}
+
 /// 以官方默认 profile 启动 daemon,仅注入 base_url。
 pub fn start(proxy_base_url: &str) -> Result<(), String> {
     let bin = find_binary()?;
+    let args = serve_args();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(
         &bin,
-        // 不带 --data-dir / --config / --no-auto-update:见模块文档的三条硬约束。
-        // 也不带 --port:让 Science 用它自己的默认端口,用户手动启动是什么端口,
-        // 经 CSSwitch 启动就还是什么端口(随机端口会让控制台地址每次都变)。
-        &["serve", "--detached", "--no-browser"],
+        &args,
         &[("ANTHROPIC_BASE_URL", proxy_base_url.to_string())],
     )?;
     if output.status.success() {
@@ -176,6 +198,23 @@ mod tests {
             Some("http://localhost:53787/?nonce=abc123")
         );
         assert!(extract_url("no url here").is_none());
+    }
+
+    #[test]
+    fn official_serve_args_pin_ports_and_never_isolate() {
+        let args = serve_args();
+        let pair = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .and_then(|index| args.get(index + 1))
+                .cloned()
+        };
+        assert_eq!(pair("--port").as_deref(), Some("8686"));
+        assert_eq!(pair("--sandbox-port").as_deref(), Some("8687"));
+        // 回归:这三个参数任何一个出现,都会伤到用户的真实实例。
+        for forbidden in ["--data-dir", "--config", "--no-auto-update"] {
+            assert!(!args.iter().any(|arg| arg == forbidden), "{forbidden} 不得出现");
+        }
     }
 
     #[test]

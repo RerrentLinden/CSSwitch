@@ -19,6 +19,8 @@
 ```
 
 Science daemon 由服务用 CLI 拉起,注入 `ANTHROPIC_BASE_URL=http://127.0.0.1:8788`。
+官方实例固定监听 `127.0.0.1:8686`(预览端口 8687),免登录沙箱监听 8790/8791。
+手动 `claude-science serve` 仍用 Science 自己的默认 8000,与经 CSSwitch 启动的地址不同。
 两者都绑 loopback。
 
 ## 三种模式

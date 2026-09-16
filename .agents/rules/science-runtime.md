@@ -7,7 +7,8 @@ CSSwitch 接管的是**用户自己的官方 Science 实例**,不做数据隔离
 
 - 只用用户自己安装的 Science(PATH / `~/.claude-science/bin` / `~/.local/bin`);
   `CLAUDE_SCIENCE_BIN` 是显式开发 override,无效时 fail closed,不隐式回退别的候选。
-- 启动参数固定为 `serve --port 0 --detached --no-browser`,**禁止**追加:
+- 启动参数固定为 `serve --port 8686 --sandbox-port 8687 --detached --no-browser`,
+  端口不用 `0`(控制台地址要稳定可收藏),也不沿用 Science 默认的 8000/8001。**禁止**追加:
   - `--data-dir` / `--config`:会造出隔离实例,用户的对话从此分家;
   - `--no-auto-update`:官方实例必须保留它自己的自动更新。
 - 只注入 `ANTHROPIC_BASE_URL`;启动前清空 `ANTHROPIC_MODEL` 系列与
