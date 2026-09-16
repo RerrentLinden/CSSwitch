@@ -168,6 +168,10 @@ fn report_upstream_failure(
     error: &messages::UpstreamError,
 ) {
     crate::log_line!("{}", messages::upstream_failure_metadata(operation, error));
+    crate::debug_capture::write(
+        "error.txt",
+        format!("{}\n{}", messages::upstream_failure_metadata(operation, error), error.detail).as_bytes(),
+    );
     api_error_json(stream, error.status, &error.detail);
 }
 
@@ -715,11 +719,13 @@ where
         if !validated.bytes.is_empty() && emit(&validated.bytes).is_err() {
             return Some(StreamTermination::DownstreamWriteError);
         }
+        crate::debug_capture::append("4-science-response.sse", &validated.bytes);
         validated
             .terminal_error
             .then_some(StreamTermination::UpstreamTerminalError)
     };
 
+    crate::debug_capture::append("3-upstream-response.sse", first);
     let first_chunk = if let Some(filter) = filter.as_mut() {
         match filter.feed(first) {
             Ok(chunk) => chunk,
@@ -814,6 +820,7 @@ where
                 };
             }
             Ok(n) => {
+                crate::debug_capture::append("3-upstream-response.sse", &buf[..n]);
                 let chunk = if let Some(filter) = filter.as_mut() {
                     match filter.feed(&buf[..n]) {
                         Ok(chunk) => chunk,
@@ -1271,6 +1278,8 @@ fn handle_messages(
     // DeepSeek 的官方 /anthropic 端点与 Kimi 同为 Anthropic Messages 中继,
     // 共用契约驱动的补偿链;两者的差异全部落在 RelayFlavor 上。
     if cfg.provider == "relay" || cfg.provider == "deepseek" {
+        crate::debug_capture::begin(&target_model);
+        crate::debug_capture::json("1-science-request.json", &raw);
         let provider_contract_id = cfg
             .provider_contract
             .as_ref()
@@ -1321,6 +1330,7 @@ fn handle_messages(
             .map(Vec::len)
             .unwrap_or(0);
         log_relay_metadata(&metadata, &transformed, is_stream, message_count);
+        crate::debug_capture::json("2-upstream-request.json", &transformed);
         if let Some(prepared) = adapter {
             handle_kimi_web_search_adapter(
                 stream,
@@ -1351,6 +1361,7 @@ fn handle_messages(
         }
         match messages::post_nonstream(cfg, transformed, anthropic_transport) {
             Ok(mut resp) => {
+                crate::debug_capture::write("3-upstream-response.json", &resp.body);
                 if noise_filter.is_some() && resp.status == 200 {
                     if let Ok(mut body) = serde_json::from_slice::<Value>(&resp.body) {
                         let stats = kimi_search_noise::strip_nonstream_noise(&mut body);
@@ -1383,6 +1394,7 @@ fn handle_messages(
                         }
                     }
                 }
+                crate::debug_capture::write("4-science-response.json", &resp.body);
                 write_response(
                     stream,
                     resp.status,

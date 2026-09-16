@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod connect;
 pub mod control;
+pub(crate) mod debug_capture;
 pub mod deepseek_compat;
 pub mod kimi_search_noise;
 pub mod kimi_web_search_adapter;
