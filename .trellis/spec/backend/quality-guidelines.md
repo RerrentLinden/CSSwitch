@@ -273,6 +273,7 @@ claude-science stop | status | url
 | --- | --- |
 | 找不到 claude-science | 明确报错并列出已查找路径；`CLAUDE_SCIENCE_BIN` 无效时 fail closed，不回退其它候选 |
 | daemon 未运行时 stop | 视为成功（stderr 含 not running / no daemon） |
+| 退出服务（`/control/quit`） | 先并行停掉**正在运行的**官方实例与沙箱再退进程；未安装 / 未运行不算失败，沙箱未运行时不碰其目录；停止失败不拦截退出，原文随响应 `errors` 返回 |
 | 有活跃会话且未确认 | 拒绝切换并报告会话数，不静默打断 |
 | 渠道配置不完整 | 切换前就拒绝，不要等推理时才 400 |
 
@@ -287,6 +288,8 @@ claude-science stop | status | url
 - `science::tests::model_env_clear_list_covers_auth_and_role_overrides`：断言清除列表
   覆盖模型与凭证变量，且 **`ANTHROPIC_BASE_URL` 不在其中**（它是要注入的）。
 - loopback 层断言配置文件权限为 `0600`、且未写出 `~/.csswitch/config.json`。
+- loopback 层用假 `CLAUDE_SCIENCE_BIN` 与命令行同形的假沙箱进程，断言退出服务停掉两个实例且进程退出；
+  loopback 全程不得解析到本机真实 `claude-science`。
 
 ### 7. Wrong vs Correct
 
