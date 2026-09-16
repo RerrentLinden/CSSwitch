@@ -152,6 +152,8 @@ m4/user:      tool_result           = tool_lATdsqlOGD0n8Cgv
 根本不会搜索的轮次里交换末尾两条 user message。链首摘除后整条链一致地按"本轮没有搜索声明"
 处理,§3 的 bridge 自然不触发,上游只有一次调用。
 
+开关只有「走桥」与「关闭」两档,**不提供原生直通**,依据见下文「为什么不提供原生直通」。
+
 配置是每请求读快照的,所以开关保存后下一次请求即生效,不需要重启 Science
 (地址与模型槽仍需重启,因为 Science 只在启动时读它们)。
 
@@ -228,6 +230,55 @@ Science 侧表现为 Agent Failed + 中断,这正是配对修复表里"无 id �
   均在共享 180s deadline 内。高延迟是用户选择统一 bridge 的明确代价。
 - K2.7：Lua 搜索 13 results → 不联网追问 → 重载，PASS；搜索 2 calls。
 - 三者 query/card/text 均正确，追问 `bridged=0`，无 pairing repair / 400 / upstream failure。
+
+#### 为什么不提供原生直通(2026-09-16 真机取证)
+
+2026-09-16 曾临时加过第三档「原生直通」(typed 声明原样发给上游,不映射 query tool,其余补偿
+照常运行),真机验证后撤回,开关回到两档。
+
+现象:直通下搜索「用一次就不可用」,模型回答「当前会话的 web_search 工具已不可用」。
+
+根因:**Kimi 不把 typed web_search 作为可调用函数交给模型**,而是在每次请求开头由服务端
+预搜索规划器决定搜不搜。证据全部来自真实 Science 会话的抓包(`CSSWITCH_DEBUG_CAPTURE_DIR`):
+
+- 发往上游的请求里 `tools[0]` 就是 `web_search_20250305`,模型的原始思考却是
+  "I don't see a web_search tool in my available functions"。
+- 上游返回的块顺序恒为「噪声头 → `server_tool_use` → 结果 → **thinking** → 正文」:搜索发生在
+  模型开始思考之前。事后模型的思考是 "it wasn't in my function list at the top, but the system
+  executed it"。
+- 搜索词带规划器改写的痕迹:「智谱」被直译成 `Wisdom spectrum`,开头拼上当天日期。
+- 规划器判定不搜时,留下的就是空噪声头 + §3c 的幻影对——流式下每个不搜索的步骤都有。
+
+后果:用户消息本身就是搜索请求时(第一轮常见),规划器会搜;任务中途才出现的搜索需求
+(先算出年份再搜、先查技能再搜)模型没有办法触发,只能改走网络请求或声称工具不可用。
+同一问题「先用 python 随机选年份,再搜索那年诺贝尔物理学奖」的 K3 真机对照:
+
+| | 原生直通 | 走桥 |
+| --- | --- | --- |
+| 模型可见 web_search | 否 | 是 |
+| 步数 | 5 步,4 步浪费(调 API → 拦截 → 申请权限 → 502) | 2 步(python → 搜索) |
+| 搜索词作者 | 规划器 | 模型,年份正确 |
+
+这正是 §3 bridge 存在的理由:把 typed 声明换成模型可见的私有 query tool,搜索时机和搜索词
+交还给模型。
+
+#### 3c/3d 只发生在流式路径(2026-09-16 直连取证)
+
+一次退役评估里,非流式探针得出了"上游已修"的错误结论。同一问题、同一模型、只切
+`stream`,两条路径的形态完全不同:
+
+| 轮次形态 | `stream: false` | `stream: true` |
+| --- | --- | --- |
+| 搜索轮的配对键 | 两半都是 `srvtoolu_…`,**恒匹配**(23/23) | `tool_…` vs `srvtoolu_…`,**恒不匹配** |
+| 不搜索轮的幻影对 | **0 次**(12 轮) | **每轮都有**(无键 `server_tool_use` + 空 `web_search_tool_result`) |
+| 搜索轮噪声头 | 每轮都有 | 每轮都有 |
+
+Science 全程走流式,所以 §3b / §3c / §3d 三条补偿一条都不能退役。真机日志同期佐证:
+`adopted=1`(采钥开火)与 `pair=2`(幻影剥离开火)都出现在 `relay stream` 行上,
+`relay nonstream` 行则恒为 `adopted=0 pair=0`。
+
+**方法论**:验一条 Kimi 补偿能否退役,探针必须用 `stream: true`,并且最终要在真实 Science 里复现——隔离探针的历史形态和 Science 不同(Science 会删掉历史搜索块、附 `Prior-turn` 说明、在同一条 user 消息里拼 skill_discovery 与 compute snapshot),直连多轮探针 8/8 复现不出上面的问题。真实会话用 `CSSWITCH_DEBUG_CAPTURE_DIR=<目录>` 抓包:每条 relay 请求落盘 Science 原始请求、上游请求、上游原始响应与回给 Science 的响应(文件含完整对话正文,权限 0600,排障后删除;桥接的内部 nested 调用不落盘)。非流式通过不构成证据——
+这是继"只验报错不验功能"之后,同一条退役路径上踩到的第二个坑。
 
 ### 3d. 搜索对配对键采钥(响应侧归一)
 
