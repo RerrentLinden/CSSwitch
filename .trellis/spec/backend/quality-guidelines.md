@@ -339,6 +339,11 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
   forge 修复/铸新后先清沙箱钥匙串旧条目（0.1.48 以 Keychain 为权威，不清会被
   回写吃掉修复形成死循环）；启动后正向校验密钥确在沙箱钥匙串内，不过即停 daemon。
 - 固定端口 8790/8791，占用即报错，永不自动改绑；全部监听回环。
+- 对外入口链接的主机名固定 `127.0.0.1`，`localhost` 留给真实实例：浏览器 cookie 只按
+  主机名划作用域、不看端口，而 Science 的 `operon_auth` / `operon_csrf` 都是 host-only，
+  两实例同主机时后登录的一方会顶掉另一方。daemon 的 Host 闸门与写操作 Origin 闸门
+  本就同时放行这两个主机名，换主机名不得给 daemon 加任何参数；改沙箱一侧而非真实
+  实例（真实实例的 claude.ai OAuth 回调固定归一到 `localhost`）。
 - 兜底停止只杀「pid 来自沙箱 `operon.lock` + 进程存活 + argv[0] 是 claude-science
   + 含 serve + `--data-dir` 逐 token 精确等于沙箱目录」的进程。
 - SSH 桥接是唯一刻意跨出隔离边界的动作：只 symlink 真实 `~/.ssh` 的 `config` 与
@@ -362,6 +367,8 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
 - 护栏负例断言**零写入**（真实目录逐字节不变、符号链接目标不建目录）。
 - 幂等三态：Reused 断言 `.enc` 与 `encryption.key` 逐字节不变；Repaired 断言 org 保留。
 - 兜底停止的命令行匹配：正例命中、pid 复用/真实实例/前缀相似目录/瞬时 CLI 四组负例拒绝。
+- 入口链接主机名改写：localhost → 127.0.0.1、带路径前缀、已是 127.0.0.1 时幂等、
+  非法 URL 原样返回，四例都钉住；并断言沙箱主机名不等于 `localhost`。
 
 ---
 

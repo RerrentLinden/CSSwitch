@@ -6,6 +6,8 @@
 //! - 绝不读写真实 `~/.claude-science`:forge 三道护栏在写任何文件之前拒绝;
 //! - 固定端口 8790/8791(邻接网关 8788 端口族,避开真实实例 8765/8767),占用即报
 //!   明确错误,永不自动改绑;全部监听回环;
+//! - 入口链接的主机名固定 `127.0.0.1`,真实实例留给 `localhost`:浏览器 cookie 只按主机名
+//!   划作用域、不看端口,两实例同主机时会互相顶掉登录(见 `pin_cookie_host`);
 //! - 推理只经 `ANTHROPIC_BASE_URL` 指向本网关,模型类/凭证类环境变量一律清除
 //!   (与真实实例共享 `science::MODEL_ENV_KEYS_TO_CLEAR` 同一份清单);
 //! - 沙箱钥匙串必须真正生效并经启动后正向校验:0.1.48 起 daemon 会把 encryption keys
@@ -30,6 +32,9 @@ use crate::sandbox_forge::LoginAction;
 /// 沙箱 daemon 与预览端口。
 const DAEMON_PORT: u16 = 8790;
 const PREVIEW_PORT: u16 = 8791;
+/// 沙箱入口链接对外使用的主机名。真实实例走 `localhost`,两边分开 cookie 作用域
+/// (理由见 `pin_cookie_host`)。监听地址仍是 `127.0.0.1`,这里只换链接里的写法。
+const COOKIE_HOST: &str = "127.0.0.1";
 /// 假账号:`.invalid` 保留顶级域(RFC 2606),与真实账号零碰撞。
 const VIRTUAL_EMAIL: &str = "virtual@localhost.invalid";
 /// daemon 外联 Anthropic 的兜底:经网关快速失败,回环与官方 MCP 除外(沿用旧脚本清单)。
@@ -195,6 +200,7 @@ pub fn stop() -> Result<(), String> {
 }
 
 /// 一次性入口链接(nonce 由同版本官方 CLI 内部消化,协议漂移免疫)。
+/// 出口前把主机名钉到 `127.0.0.1`,与真实实例的 `localhost` 分开 cookie 作用域。
 pub fn entry_url() -> Result<String, String> {
     let bin = crate::science::find_binary()?;
     let args = vec![
@@ -210,7 +216,34 @@ pub fn entry_url() -> Result<String, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    crate::science::extract_url(&stdout).ok_or_else(|| "沙箱 daemon 未返回入口链接".to_string())
+    crate::science::extract_url(&stdout)
+        .map(|url| pin_cookie_host(&url))
+        .ok_or_else(|| "沙箱 daemon 未返回入口链接".to_string())
+}
+
+/// 把入口链接的主机名换成 `COOKIE_HOST`,端口/路径/nonce 一概不动。
+///
+/// 浏览器 cookie 只按主机名划分作用域、不看端口(RFC 6265 §5.1.3/§5.3),而 Science 的
+/// `operon_auth` / `operon_csrf` 都是 host-only(签发时不带 Domain 属性)。daemon 的
+/// `url` 子命令在 macOS 上固定打印 `localhost`,于是沙箱与真实实例虽然端口不同,却共用
+/// 同一份 cookie —— 哪边后登录,哪边就把对方顶掉。
+///
+/// 换主机名不需要给 daemon 加任何参数:0.1.48 的 Host 闸门是
+/// `^(?:127\.0\.0\.1|localhost)(?::\d+)?$`,写操作的 Origin 闸门是
+/// `^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?$`,两者都原样放行 `127.0.0.1`;
+/// HTML 预览口(8791)的 origin 由 daemon 自己按 `http://127.0.0.1:<port>` 组装,不受影响。
+///
+/// 只改沙箱一侧:真实实例的 claude.ai OAuth 回调地址固定归一到 `localhost`,且它是用户
+/// 可收藏的稳定入口,动它会伤到真实登录。解析失败时原样返回 —— 宁可退回旧行为(会话互挤),
+/// 也不吐出一个拼坏的链接。
+fn pin_cookie_host(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    if parsed.set_host(Some(COOKIE_HOST)).is_err() {
+        return url.to_string();
+    }
+    parsed.to_string()
 }
 
 // ---------- 启动组装(纯函数,供单测钉死) ----------
@@ -538,6 +571,32 @@ mod tests {
         assert!(joined.contains("--no-auto-update"));
         assert!(joined.contains("--detached"));
         assert!(!joined.contains("8765"), "绝不碰真实实例保留端口");
+    }
+
+    #[test]
+    fn entry_url_host_is_pinned_away_from_the_real_instance() {
+        // 回归:daemon 的 `url` 子命令在 macOS 上固定打印 localhost,不换主机名两实例
+        // 就共用同一份 host-only cookie,后登录的一方会把另一方顶下线。
+        assert_eq!(
+            pin_cookie_host("http://localhost:8790/?nonce=abc123"),
+            "http://127.0.0.1:8790/?nonce=abc123"
+        );
+        // 端口、路径、nonce 一概不动。
+        assert_eq!(
+            pin_cookie_host("http://localhost:8790/bio/?nonce=abc123"),
+            "http://127.0.0.1:8790/bio/?nonce=abc123"
+        );
+        // 幂等:daemon 若已经给出 127.0.0.1(url_host 被它自己覆盖时)不重复改写。
+        assert_eq!(
+            pin_cookie_host("http://127.0.0.1:8790/?nonce=abc123"),
+            "http://127.0.0.1:8790/?nonce=abc123"
+        );
+        // 解析不了就原样返回,绝不吐出拼坏的链接。
+        assert_eq!(pin_cookie_host("not a url"), "not a url");
+        assert_ne!(
+            COOKIE_HOST, "localhost",
+            "沙箱主机名必须与真实实例的 localhost 不同,否则 cookie 作用域又合流"
+        );
     }
 
     #[test]
