@@ -308,6 +308,63 @@ claude-science stop | status | url
 
 ---
 
+## 场景：运行免登录沙箱 Science 实例
+
+### 1. 范围 / 触发条件
+
+改动 `sandbox.rs` / `sandbox_forge.rs`（隔离实例的铸造、起停、钥匙串）时适用。
+沙箱是 CSSwitch 自有隔离目录里的第二个 Science 实例：全部写入落在
+`~/.csswitch/science-sandbox/`，与「接管用户官方实例」场景的规则互不豁免——
+真实实例路径（`science.rs`）一行都不因沙箱而改变行为。
+
+### 2. 签名
+
+```text
+sandbox::start(base_url) → forge(幂等三态) → 沙箱钥匙串 → 端口检查 → daemon → 健康 → 钥匙串校验
+claude-science serve --data-dir <沙箱> --host 127.0.0.1 --port 8790 --sandbox-port 8791
+  --no-browser --no-auto-update --detached
+  env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>  https_proxy=<网关快速失败>
+sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护栏先行
+```
+
+### 3. 合同
+
+- **真实 `~/.claude-science` 铁律**：写入根解析后落在真实目录之内/本身即拒绝，
+  先于一切写入，先于「隔离根内」检查（防隔离根本身是符号链接指向真实树）。
+- 假账号 email 必须 `localhost.invalid` 结尾；绝不从可解密 token 借 org 身份；
+  `orgs/` 多于一个候选直接报错，不静默选择。
+- 全部写入：拒符号链接 + `O_EXCL` 临时文件 + rename + `0600`；删除/列举旧 `.enc`
+  失败必须显式失败（Science 预期 `.oauth-tokens/` 恰好一个 `.enc`）。
+- 沙箱钥匙串用随机密码（空密码在当前 macOS 解锁失败），密码文件落盘即 0600；
+  forge 修复/铸新后先清沙箱钥匙串旧条目（0.1.48 以 Keychain 为权威，不清会被
+  回写吃掉修复形成死循环）；启动后正向校验密钥确在沙箱钥匙串内，不过即停 daemon。
+- 固定端口 8790/8791，占用即报错，永不自动改绑；全部监听回环。
+- 兜底停止只杀「pid 来自沙箱 `operon.lock` + 进程存活 + argv[0] 是 claude-science
+  + 含 serve + `--data-dir` 逐 token 精确等于沙箱目录」的进程。
+- SSH 桥接是唯一刻意跨出隔离边界的动作：只 symlink 真实 `~/.ssh` 的 `config` 与
+  `known_hosts` 两个非秘密文件进沙箱 HOME（Compute 按 `$HOME/.ssh/config` 找主机别名），
+  私钥一律不链接（认证走继承的 `SSH_AUTH_SOCK` / 绝对 `IdentityFile`），
+  不修改源、目标已存在（含悬空链接）绝不覆盖。
+- token/key/钥匙串密码不进日志、不进控制面响应；`security` 命令输出全丢弃。
+
+### 4. 校验与错误矩阵
+
+| 条件 | 要求行为 |
+| --- | --- |
+| 官方模式或渠道配置不完整时点启动 | 启动前拒绝，不拉起注定 401 的沙箱 |
+| 健康检查超时 / 钥匙串校验失败 | 先停 daemon 再报错，不带病运行 |
+| CLI 报 not running 但 lock pid 仍活 | 兜底 SIGTERM 仍要收口，不漏杀 |
+| blob 被判 free / 过期 / 结构损坏 | 不得复用，修复回 max 并沿用原 org |
+| 契约漂移（自更新后格式变更） | 写后解密回读自校验失败 → 整体报错，fail-closed 不静默兜底 |
+
+### 5. 必需测试
+
+- 护栏负例断言**零写入**（真实目录逐字节不变、符号链接目标不建目录）。
+- 幂等三态：Reused 断言 `.enc` 与 `encryption.key` 逐字节不变；Repaired 断言 org 保留。
+- 兜底停止的命令行匹配：正例命中、pid 复用/真实实例/前缀相似目录/瞬时 CLI 四组负例拒绝。
+
+---
+
 ## 场景：与既有应用共用配置目录
 
 ### 1. 范围 / 触发条件
