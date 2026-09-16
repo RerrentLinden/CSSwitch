@@ -35,7 +35,7 @@ CSSwitch 服务  ── /v1/messages、/v1/models  按当前模式路由
 
 ```bash
 ./csswitch status    # 当前模式与 Science 状态
-./csswitch stop      # 停止服务(等同控制台里的「退出服务」)
+./csswitch stop      # 先停掉 Science 与免登录沙箱,再停止服务(等同控制台里的「退出服务」)
 ```
 
 端口默认 8788,`CSSWITCH_PORT` 可改。

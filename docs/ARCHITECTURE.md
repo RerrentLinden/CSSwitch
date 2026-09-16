@@ -23,6 +23,10 @@ Science daemon 由服务用 CLI 拉起,注入 `ANTHROPIC_BASE_URL=http://127.0.0
 手动 `claude-science serve` 仍用 Science 自己的默认 8000,与经 CSSwitch 启动的地址不同。
 两者都绑 loopback。
 
+退出服务(`/control/quit`,控制台按钮与 `./csswitch stop` 共用)先并行停掉正在运行的官方实例与
+免登录沙箱,再退出进程:网关一走,指向它的实例只剩断掉的推理链路。停止失败不拦截退出,
+失败原文随响应返回。终端里 Ctrl-C 只结束服务进程,不停实例。
+
 日志只打到服务进程的 stderr(终端),不落文件。控制台「请求日志」卡片的「记录请求日志」开关
 (`service.v1.json` 的 `request_log`,默认开启,切换立即生效)控制每条请求的明细:终端里的
 `POST /v1/messages relay …` / `relay stream|nonstream rules=…` / Web Search 桥接统计行,

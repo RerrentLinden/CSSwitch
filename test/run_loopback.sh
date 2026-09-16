@@ -19,13 +19,33 @@ SANDBOX="$(mktemp -d)"
 PORT=$(( 18800 + RANDOM % 400 ))
 cleanup() {
   [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null
+  [ -n "${SB_PID:-}" ] && kill "$SB_PID" 2>/dev/null
   rm -rf "$SANDBOX"
 }
 trap cleanup EXIT
 
-# 隔离 HOME:服务的配置落在沙箱里,且 PATH 清掉以确保找不到 claude-science
-# (这一层不该依赖本机是否装了 Science)。
-HOME="$SANDBOX" "$BIN" serve --port "$PORT" >"$SANDBOX/out.log" 2>&1 &
+# 假 claude-science:只记录调用;`running` 标记文件决定 status 的回答,
+# 官方形态的 stop(不带 --data-dir)会清掉它。沙箱形态的 stop 什么也不做,
+# 留给服务的兜底 SIGTERM 去收口。
+FAKE_SCI="$SANDBOX/fake-science"
+mkdir -p "$FAKE_SCI"
+cat >"$FAKE_SCI/claude-science" <<'EOF'
+#!/bin/bash
+dir="$(dirname "$0")"
+echo "$*" >>"$dir/calls.log"
+case "$1" in
+  status) if [ -e "$dir/running" ]; then echo '{"running":true}'; else echo '{"running":false}'; fi ;;
+  stop) [ "$#" -eq 1 ] && rm -f "$dir/running" ;;
+esac
+exit 0
+EOF
+chmod +x "$FAKE_SCI/claude-science"
+
+# 隔离 HOME:服务的配置落在沙箱里。Science 二进制显式指向假脚本
+# (CLAUDE_SCIENCE_BIN 无效时 fail closed,不回落):这一层既不依赖本机是否装了
+# Science,也绝不触碰本机的真实实例。
+HOME="$SANDBOX" CLAUDE_SCIENCE_BIN="$FAKE_SCI/claude-science" \
+  "$BIN" serve --port "$PORT" >"$SANDBOX/out.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 40); do
   curl -sf --max-time 1 "http://127.0.0.1:$PORT/control/status" >/dev/null 2>&1 && break
@@ -158,5 +178,46 @@ case "$relay_line" in
   *web-search.query-tool-adapter*) echo "  FAIL 关闭态仍然触发了兼容桥:$relay_line"; fail=1 ;;
   *) echo "  ok   关闭态不触发兼容桥" ;;
 esac
+
+# 退出服务必须先停掉两个实例,再退出进程(放在最后:之后服务就不在了)。
+# 官方实例:假脚本报告在跑。沙箱:一个命令行与真 daemon 同形的假进程
+# (argv[0] 以 claude-science 结尾 + serve + 精确 --data-dir),pid 写进沙箱 lock。
+# 双层子 shell 让它脱离本脚本,被 launchd 及时回收——留成僵尸会被当成还活着。
+touch "$FAKE_SCI/running"
+SB_DATA="$SANDBOX/.csswitch/science-sandbox/home/.claude-science"
+mkdir -p "$SB_DATA"
+SB_PID="$( (exec -a "$FAKE_SCI/claude-science" /bin/bash -c 'while :; do sleep 1; done' \
+  serve --data-dir "$SB_DATA" >/dev/null 2>&1 &
+  echo $!) )"
+printf '{"pid":%s}' "$SB_PID" >"$SB_DATA/operon.lock"
+case "$(body "http://127.0.0.1:$PORT/control/status")" in
+  *'"sandbox":{'*'"running":true'*) echo "  ok   假沙箱 daemon 被识别为运行中" ;;
+  *) echo "  FAIL 假沙箱 daemon 未被识别,退出场景不成立"; fail=1 ;;
+esac
+
+quit="$(curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT/control/quit")"
+case "$quit" in
+  *'"stopped":["Science","免登录沙箱"]'*) echo "  ok   退出响应列出两个已停止的实例" ;;
+  *) echo "  FAIL 退出响应不对:$quit"; fail=1 ;;
+esac
+if grep -qx 'stop' "$FAKE_SCI/calls.log" && [ ! -e "$FAKE_SCI/running" ]; then
+  echo "  ok   官方实例收到了 stop"
+else
+  echo "  FAIL 官方实例没有被停止"; fail=1
+fi
+if kill -0 "$SB_PID" 2>/dev/null; then
+  echo "  FAIL 沙箱 daemon 仍在运行"; fail=1
+else
+  echo "  ok   沙箱 daemon 已停止"
+fi
+for _ in $(seq 1 25); do
+  kill -0 "$PID" 2>/dev/null || break
+  sleep 0.2
+done
+if kill -0 "$PID" 2>/dev/null; then
+  echo "  FAIL 退出服务后进程仍在"; fail=1
+else
+  echo "  ok   退出服务后进程已退出"
+fi
 [ "$fail" = "0" ] || { echo; echo "服务输出:"; cat "$SANDBOX/out.log"; }
 exit "$fail"

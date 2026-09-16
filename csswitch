@@ -2,10 +2,11 @@
 # CSSwitch:启动本地服务并打开控制台。
 #
 #   ./csswitch          启动(已在跑则只打开控制台)
-#   ./csswitch stop     停止
+#   ./csswitch stop     停止(先停掉正在运行的 Science 与免登录沙箱)
 #   ./csswitch status   看一眼当前模式
 #
-# 服务在前台运行,Ctrl-C 或控制台里的「退出服务」都能停掉它。
+# 服务在前台运行。控制台里的「退出服务」与 ./csswitch stop 会先停掉 Science
+# 与免登录沙箱再退出;Ctrl-C 只结束服务进程本身。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -19,8 +20,23 @@ running() { curl -sf --max-time 2 "$CONSOLE/control/status" >/dev/null 2>&1; }
 case "${1:-start}" in
   stop)
     if running; then
-      curl -sf --max-time 5 -X POST "$CONSOLE/control/quit" >/dev/null 2>&1
-      echo "已请求退出。"
+      # 服务先停完实例才回话,停 daemon 要几秒,超时放宽。
+      curl -s --max-time 60 -X POST "$CONSOLE/control/quit" \
+        | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if "stopped" not in d:
+    print("服务正在退出(运行中的是旧版本,不会停止 Science 与免登录沙箱)。")
+    sys.exit()
+stopped, errors = d["stopped"], d.get("errors") or []
+if stopped:
+    print("已停止:" + "、".join(stopped) + "。")
+elif not errors:
+    print("没有正在运行的 Science 或免登录沙箱。")
+for error in errors:
+    print(error)
+print("服务正在退出。")' 2>/dev/null \
+        || echo "已请求退出,但没有收到停止结果。"
     else
       echo "服务未在运行。"
     fi

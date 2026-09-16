@@ -152,8 +152,28 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
         ("POST", "sandbox/stop") => crate::sandbox::stop().map(|_| json!({"ok": true})),
         ("GET", "sandbox/url") => crate::sandbox::entry_url().map(|url| json!({"url": url})),
         ("POST", "quit") => {
+            // 网关一退,经它启动的实例只剩断掉的推理链路,所以先停实例再退。
+            // 停止失败不拦截退出(退出是用户的明确意图),失败原文随响应交给控制台。
+            let (stopped, errors) = stop_instances();
+            if !stopped.is_empty() {
+                crate::log_line!("退出服务:已停止 {}", stopped.join("、"));
+            } else if errors.is_empty() {
+                crate::log_line!("退出服务:没有需要停止的实例");
+            }
+            for error in &errors {
+                crate::log_line!("退出服务:{error}");
+            }
             // 先把响应写回去再退,否则控制台只会看到连接被切断。
-            respond_json(stream, 200, json!({"ok": true, "message": "服务正在退出"}));
+            respond_json(
+                stream,
+                200,
+                json!({
+                    "ok": true,
+                    "message": "服务正在退出",
+                    "stopped": stopped,
+                    "errors": errors,
+                }),
+            );
             let _ = stream.flush();
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(150));
@@ -358,6 +378,40 @@ fn start_science(state: &Arc<AppState>) -> Result<Value, String> {
     crate::science::start(&format!("http://127.0.0.1:{}", state.port))?;
     let url = crate::science::login_url().ok();
     Ok(json!({"ok": true, "url": url}))
+}
+
+/// 退出服务前停掉官方实例与免登录沙箱,返回(已停止的实例, 失败原文)。
+/// 只停正在运行的:未安装 / 未运行不算失败,沙箱从未初始化时也不去碰它的目录。
+/// 两者互不依赖,并行停止以缩短等待。
+fn stop_instances() -> (Vec<&'static str>, Vec<String>) {
+    let (science, sandbox) = thread::scope(|scope| {
+        let sandbox =
+            scope.spawn(|| stop_if_running(&crate::sandbox::status(), crate::sandbox::stop));
+        let science = stop_if_running(&crate::science::status(), crate::science::stop);
+        let sandbox = sandbox
+            .join()
+            .unwrap_or_else(|_| Some(Err("停止免登录沙箱的线程意外终止".into())));
+        (science, sandbox)
+    });
+    let mut stopped = Vec::new();
+    let mut errors = Vec::new();
+    for (label, outcome) in [("Science", science), ("免登录沙箱", sandbox)] {
+        match outcome {
+            Some(Ok(())) => stopped.push(label),
+            Some(Err(error)) => errors.push(error),
+            None => {}
+        }
+    }
+    (stopped, errors)
+}
+
+/// `None` 表示实例本就没在运行,无需停止。
+fn stop_if_running(status: &Value, stop: fn() -> Result<(), String>) -> Option<Result<(), String>> {
+    let running = status
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    running.then(stop)
 }
 
 /// 免登录沙箱的推理走网关当前模式:官方模式下沙箱没有可用上游,渠道配置不完整

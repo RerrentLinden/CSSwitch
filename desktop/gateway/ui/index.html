@@ -433,15 +433,38 @@ $('btn-sb-open').onclick = async () => {
 };
 
 $('btn-quit').onclick = async () => {
-  if (!confirm('退出 CSSwitch 服务?Science 会继续运行,但模型请求将无法送达。')) return;
+  if (!confirm('退出 CSSwitch 服务?\n\n会先停止正在运行的 Science 与免登录沙箱,进行中的会话会被打断。')) return;
+  // 服务要先停完实例才回话,这几秒里按钮不能再点。
+  $('btn-quit').disabled = true;
+  $('btn-quit').textContent = '正在停止实例…';
+  let result = null;
   try {
-    await api('quit', { method: 'POST' });
+    result = await api('quit', { method: 'POST' });
   } catch (error) {
-    // 服务可能在响应写完后立刻退出,连接中断不算失败。
+    // 没拿到响应:服务多半已经退出,只是停止结果未知。
   }
-  document.querySelector('.wrap').innerHTML =
-    '<div class="card"><h2>服务已退出</h2>' +
-    '<p class="sub">重新运行 <code>./csswitch</code> 即可再次启动。</p></div>';
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<h2>服务已退出</h2>';
+  const line = (text, className) => {
+    const p = document.createElement('p');
+    p.className = className;
+    p.textContent = text;
+    card.append(p);
+  };
+  if (!result) {
+    line('没有收到停止结果,请自行确认 Science 与免登录沙箱是否仍在运行。', 'msg err show');
+  } else {
+    const stopped = result.stopped || [];
+    const errors = result.errors || [];
+    if (stopped.length) line(`已停止:${stopped.join('、')}。`, 'sub');
+    else if (!errors.length) line('没有正在运行的 Science 或免登录沙箱。', 'sub');
+    // 停止失败不拦截退出,原文逐条展示,方便手动收尾。
+    errors.forEach((error) => line(error, 'msg err show'));
+  }
+  card.insertAdjacentHTML('beforeend',
+    '<p class="sub">重新运行 <code>./csswitch</code> 即可再次启动。</p>');
+  document.querySelector('.wrap').replaceChildren(card);
 };
 
 $('request-log').onchange = async (event) => {
