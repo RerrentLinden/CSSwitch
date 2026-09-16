@@ -138,6 +138,10 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
         ("POST", "probe-models") => probe_models(request),
         ("POST", "science/start") => start_science(state),
         ("POST", "science/stop") => crate::science::stop().map(|_| json!({"ok": true})),
+        ("GET", "sandbox/status") => Ok(crate::sandbox::status()),
+        ("POST", "sandbox/start") => start_sandbox(state),
+        ("POST", "sandbox/stop") => crate::sandbox::stop().map(|_| json!({"ok": true})),
+        ("GET", "sandbox/url") => crate::sandbox::entry_url().map(|url| json!({"url": url})),
         ("POST", "quit") => {
             // 先把响应写回去再退,否则控制台只会看到连接被切断。
             respond_json(stream, 200, json!({"ok": true, "message": "服务正在退出"}));
@@ -166,6 +170,7 @@ fn status_payload(state: &Arc<AppState>) -> Value {
         "port": state.port,
         "base_url": format!("http://127.0.0.1:{}", state.port),
         "science": science,
+        "sandbox": crate::sandbox::status(),
         "channels": {
             "kimi": channel_payload(&profile.kimi),
             "deepseek": channel_payload(&profile.deepseek),
@@ -319,6 +324,17 @@ fn start_science(state: &Arc<AppState>) -> Result<Value, String> {
     crate::science::start(&format!("http://127.0.0.1:{}", state.port))?;
     let url = crate::science::login_url().ok();
     Ok(json!({"ok": true, "url": url}))
+}
+
+/// 免登录沙箱的推理走网关当前模式:官方模式下沙箱没有可用上游,渠道配置不完整
+/// 也注定失败 —— 启动前先拒绝,不要等沙箱起来后才 401。
+fn start_sandbox(state: &Arc<AppState>) -> Result<Value, String> {
+    let profile = state.snapshot();
+    let channel = profile
+        .channel(&profile.mode)
+        .ok_or("免登录沙箱需要第三方渠道:请先切换到 Kimi 或 DeepSeek 模式")?;
+    channel.validate()?;
+    crate::sandbox::start(&format!("http://127.0.0.1:{}", state.port))
 }
 
 /// 向渠道拉取可用模型清单(WebUI 的"获取可用模型")。

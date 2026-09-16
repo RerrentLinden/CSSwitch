@@ -109,6 +109,23 @@
   </section>
 
   <section class="card">
+    <h2>免登录沙箱</h2>
+    <p class="hint" style="margin-top:0">
+      无 Claude 订阅时,用当前第三方渠道驱动一个隔离的 Science 实例(127.0.0.1:8790)。
+      沙箱的对话历史与正式实例相互独立,数据保存在 <code>~/.csswitch/science-sandbox/</code>;
+      正式实例不受任何影响。
+    </p>
+    <div class="row">
+      <span class="pill"><span class="dot" id="sb-dot"></span><span id="sb-text">检查中…</span></span>
+      <button class="act primary" id="btn-sb-start">启动沙箱</button>
+      <button class="act" id="btn-sb-stop">停止</button>
+      <button class="act" id="btn-sb-open">打开沙箱</button>
+    </div>
+    <p class="hint" style="margin-top:10px">入口链接是一次性的;会话过期或沙箱重启后,回到这里重新点「打开沙箱」即可。</p>
+    <div class="msg" id="sb-msg"></div>
+  </section>
+
+  <section class="card">
     <h2>渠道配置</h2>
     <div class="tabs" id="tabs">
       <button class="tab" data-ch="kimi" aria-selected="true">Kimi</button>
@@ -242,11 +259,29 @@ function renderScience() {
   $('btn-open').disabled = !running;
 }
 
+const SB_ACTIONS = {
+  created: '首次铸造虚拟登录',
+  repaired: '已修复沙箱登录并沿用沙箱内原有对话',
+  reused: '沙箱登录完整,直接复用',
+  'already-running': '沙箱已在运行',
+};
+
+function renderSandbox() {
+  const sandbox = state.sandbox || {};
+  const running = !!sandbox.running;
+  $('sb-dot').className = 'dot ' + (running ? 'on' : 'off');
+  $('sb-text').textContent = running
+    ? '沙箱运行中'
+    : (sandbox.initialized ? '沙箱未运行' : '沙箱未初始化');
+  $('btn-sb-open').disabled = !running;
+}
+
 async function refresh() {
   state = await api('status');
   renderModes();
   renderSlots();
   renderScience();
+  renderSandbox();
 }
 
 // 周期轮询只刷状态,不重绘配置表单:否则用户填到一半的地址、模型槽或还没保存的
@@ -255,6 +290,7 @@ async function poll() {
   state = await api('status');
   renderModes();
   renderScience();
+  renderSandbox();
 }
 
 async function switchMode(mode, force) {
@@ -356,6 +392,36 @@ $('btn-open').onclick = async () => {
     window.open(result.url, '_blank');
   } catch (error) {
     msg($('mode-msg'), '获取链接失败:' + error.message, 'err');
+  }
+};
+
+$('btn-sb-start').onclick = async () => {
+  try {
+    const result = await api('sandbox/start', { method: 'POST' });
+    msg($('sb-msg'), '沙箱已启动:' + (SB_ACTIONS[result.action] || '完成') + '。');
+    if (result.url) window.open(result.url, '_blank');
+    await refresh();
+  } catch (error) {
+    msg($('sb-msg'), '启动失败:' + error.message, 'err');
+  }
+};
+
+$('btn-sb-stop').onclick = async () => {
+  try {
+    await api('sandbox/stop', { method: 'POST' });
+    msg($('sb-msg'), '沙箱已停止。');
+    await refresh();
+  } catch (error) {
+    msg($('sb-msg'), '停止失败:' + error.message, 'err');
+  }
+};
+
+$('btn-sb-open').onclick = async () => {
+  try {
+    const result = await api('sandbox/url');
+    window.open(result.url, '_blank');
+  } catch (error) {
+    msg($('sb-msg'), '获取链接失败:' + error.message, 'err');
   }
 };
 

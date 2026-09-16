@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 
 /// 启动时清空的模型类环境变量:它们会越过网关的模型目录,
 /// 让 Science 直接向上游要一个我们没路由的模型。
-const MODEL_ENV_KEYS_TO_CLEAR: &[&str] = &[
+/// 与沙箱编排(`sandbox.rs`)共享同一份清单,不复制。
+pub(crate) const MODEL_ENV_KEYS_TO_CLEAR: &[&str] = &[
     "ANTHROPIC_MODEL",
     "ANTHROPIC_REASONING_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -156,7 +157,8 @@ pub fn login_url() -> Result<String, String> {
     extract_url(&stdout).ok_or_else(|| "Science 未返回登录链接".to_string())
 }
 
-fn extract_url(text: &str) -> Option<String> {
+/// 从 CLI 输出中截取第一个 URL。沙箱的 `url --data-dir` 入口链接复用同一实现。
+pub(crate) fn extract_url(text: &str) -> Option<String> {
     text.split_whitespace()
         .find(|token| token.starts_with("http://") || token.starts_with("https://"))
         .map(|token| token.trim_end_matches(['.', ',']).to_string())
