@@ -121,7 +121,6 @@
       <button class="act" id="btn-sb-stop">停止</button>
       <button class="act" id="btn-sb-open">打开沙箱</button>
     </div>
-    <p class="hint" style="margin-top:10px">入口链接是一次性的;会话过期或沙箱重启后,回到这里重新点「打开沙箱」即可。</p>
     <div class="msg" id="sb-msg"></div>
   </section>
 
@@ -154,10 +153,6 @@
           <input type="checkbox" id="web-search">
           <span>联网搜索(web_search 兼容桥)</span>
         </label>
-        <p class="hint" style="margin:6px 0 0">
-          关闭后本渠道不提供联网搜索:Science 声明的 web_search 工具会在网关侧摘除,
-          模型拿不到它,兼容桥也不会触发。保存后下一次请求即生效,无需重启 Science。
-        </p>
       </div>
       <div class="row">
         <button type="submit" class="act primary">保存配置</button>
