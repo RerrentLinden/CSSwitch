@@ -320,10 +320,11 @@ claude-science stop | status | url
 ### 2. 签名
 
 ```text
-sandbox::start(base_url) → forge(幂等三态) → 沙箱钥匙串 → 端口检查 → daemon → 健康 → 钥匙串校验
+sandbox::start(base_url) → forge(幂等三态) → SSH/gh 桥接 → 沙箱钥匙串 → 端口检查 → daemon → 健康 → 钥匙串校验
 claude-science serve --data-dir <沙箱> --host 127.0.0.1 --port 8790 --sandbox-port 8791
   --no-browser --no-auto-update --detached
   env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>  https_proxy=<网关快速失败>
+       PATH=<沙箱>/bin:<继承>  GIT_CONFIG_COUNT/KEY_n/VALUE_n(本机装了 gh 时)
 sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护栏先行
 ```
 
@@ -346,10 +347,20 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
   实例（真实实例的 claude.ai OAuth 回调固定归一到 `localhost`）。
 - 兜底停止只杀「pid 来自沙箱 `operon.lock` + 进程存活 + argv[0] 是 claude-science
   + 含 serve + `--data-dir` 逐 token 精确等于沙箱目录」的进程。
-- SSH 桥接是唯一刻意跨出隔离边界的动作：只 symlink 真实 `~/.ssh` 的 `config` 与
-  `known_hosts` 两个非秘密文件进沙箱 HOME（Compute 按 `$HOME/.ssh/config` 找主机别名），
-  私钥一律不链接（认证走继承的 `SSH_AUTH_SOCK` / 绝对 `IdentityFile`），
-  不修改源、目标已存在（含悬空链接）绝不覆盖。
+- 刻意跨出隔离边界的动作只有两个桥接，都**不得**把真实登录钥匙串挂进沙箱搜索表
+  （真实实例的 Science 加密密钥也在里面，挂进去沙箱 daemon 就可能读到它）：
+  - SSH 桥接：只 symlink 真实 `~/.ssh` 的 `config` 与 `known_hosts` 两个非秘密文件进
+    沙箱 HOME（Compute 按 `$HOME/.ssh/config` 找主机别名），私钥一律不链接（认证走继承的
+    `SSH_AUTH_SOCK` / 绝对 `IdentityFile`），不修改源、目标已存在（含悬空链接）绝不覆盖。
+  - gh 桥接：Science 的 Credentials 按 `gh auth token` 与 `git credential fill` 探测本机
+    GitHub 登录，而 gh 令牌默认在真实登录钥匙串里，只链接 `~/.config/gh` 拿不到。做法是
+    在 `<沙箱>/bin/gh` 写一个包装脚本（`HOME=<真实 home> exec <本机 gh> "$@"`，每次启动
+    重写，本机没装 gh 时删除），放在 daemon PATH 最前面，只让 gh 进程用真实 HOME；
+    git 访问 `https://github.com` / `https://gist.github.com` 时经 `GIT_CONFIG_*` 环境先写
+    空值清掉系统级 osxkeychain（沙箱 HOME 下只查沙箱钥匙串），再指向
+    `gh auth git-credential`，不写沙箱 `~/.gitconfig`。继承环境已有 `GIT_CONFIG_COUNT`
+    时不覆盖；继承的 PATH 不可用时不改 PATH（只剩包装目录会让 daemon 找不到系统命令）。
+    启动日志记 `gh_bridge=on|off`。
 - token/key/钥匙串密码不进日志、不进控制面响应；`security` 命令输出全丢弃。
 
 ### 4. 校验与错误矩阵
@@ -369,6 +380,9 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
 - 兜底停止的命令行匹配：正例命中、pid 复用/真实实例/前缀相似目录/瞬时 CLI 四组负例拒绝。
 - 入口链接主机名改写：localhost → 127.0.0.1、带路径前缀、已是 127.0.0.1 时幂等、
   非法 URL 原样返回，四例都钉住；并断言沙箱主机名不等于 `localhost`。
+- gh 桥接：包装脚本行为级校验（假 gh 在沙箱 HOME 下被执行时看到的是真实 HOME、参数原样
+  透传、临时文件已改名）；查找本机 gh 时跳过沙箱 bin 与不可执行文件；环境注入的 PATH 前置
+  与 git 凭据「先清空再指向 gh」两对都钉住；已有 `GIT_CONFIG_COUNT` / PATH 缺失两个负例。
 
 ---
 

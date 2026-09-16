@@ -16,9 +16,12 @@
 //!   清空沙箱钥匙串旧条目——0.1.48 以 Keychain 为权威,不一致时把 file 回写成旧值
 //!   (research/science-0148-login-gate.md §2.2),不清则修复被回写吃掉形成死循环;
 //! - 兜底停止只杀「pid 来自沙箱 operon.lock 且命令行含精确 `--data-dir`」的进程;
-//! - 唯一刻意跨出隔离边界的动作是 SSH 桥接:把真实 `~/.ssh` 的 `config`/`known_hosts`
-//!   两个非秘密文件 symlink 进沙箱 HOME(私钥不链接,认证走继承的 SSH_AUTH_SOCK);
-//!   只读、不修改源,目标已存在绝不覆盖。
+//! - 刻意跨出隔离边界的动作只有两个桥接,都不把真实登录钥匙串挂进沙箱搜索表(真实实例的
+//!   Science 加密密钥也在里面):
+//!   - SSH 桥接:把真实 `~/.ssh` 的 `config`/`known_hosts` 两个非秘密文件 symlink 进沙箱
+//!     HOME(私钥不链接,认证走继承的 SSH_AUTH_SOCK);只读、不修改源,目标已存在绝不覆盖;
+//!   - gh 桥接:沙箱 PATH 最前面放一个 gh 包装脚本,只让 gh 进程以真实 HOME 运行,从而读到
+//!     本机 gh 登录(令牌在真实登录钥匙串里);git 访问 GitHub 时经环境变量改用 gh 取凭据。
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -92,9 +95,10 @@ pub fn status() -> Value {
     })
 }
 
-/// 一键启动:forge(幂等)→ SSH 桥接 → 沙箱钥匙串就位 → 端口检查 → 拉起 daemon →
-/// 健康检查 → 钥匙串正向校验。SSH 桥接与钥匙串配置步骤失败仅警告(桥接缺失只影响
-/// Compute 找主机别名),其余任一步失败都显式报错;健康/校验不过会先停 daemon 再报错。
+/// 一键启动:forge(幂等)→ SSH / gh 桥接 → 沙箱钥匙串就位 → 端口检查 → 拉起 daemon →
+/// 健康检查 → 钥匙串正向校验。桥接与钥匙串配置步骤失败仅警告(桥接缺失只影响 Compute 找
+/// 主机别名、沙箱读不到本机 gh 登录),其余任一步失败都显式报错;健康/校验不过会先停
+/// daemon 再报错。
 pub fn start(proxy_base_url: &str) -> Result<Value, String> {
     if sandbox_process_pid().is_some() {
         return Ok(json!({
@@ -112,6 +116,8 @@ pub fn start(proxy_base_url: &str) -> Result<Value, String> {
     chmod_best_effort(&home, 0o700);
     // 1.5 SSH 桥接:让沙箱 Science 的 Compute 功能按 HOME 相对路径找得到主机别名/指纹。
     ensure_ssh_bridge();
+    // 1.6 gh 桥接:让沙箱 Science 的 Credentials 读到本机 gh 登录。
+    let gh_wrapper = ensure_gh_bridge();
     // 2. 沙箱钥匙串必须先就位:daemon 启动时会把 encryption keys 迁入 Keychain。
     setup_sandbox_keychain()?;
     // 2b. 修复/铸新后清掉沙箱钥匙串里的旧密钥条目:0.1.48 以 Keychain 为权威,与 file
@@ -125,7 +131,15 @@ pub fn start(proxy_base_url: &str) -> Result<Value, String> {
     ensure_port_free(PREVIEW_PORT)?;
     // 4. 拉起隔离 daemon。沙箱与真实实例共享同一个二进制,自更新由真实实例负责,
     //    沙箱侧钉 `--no-auto-update` 避免它自己去碰更新通道。
-    let output = run_cli(&bin, &serve_args(&data_dir), &daemon_env(&home, proxy_base_url))?;
+    let mut env = daemon_env(&home, proxy_base_url);
+    if let Some(wrapper) = gh_wrapper.as_deref() {
+        env.extend(gh_bridge_env(
+            wrapper,
+            std::env::var("PATH").ok().as_deref(),
+            std::env::var_os("GIT_CONFIG_COUNT").is_some(),
+        ));
+    }
+    let output = run_cli(&bin, &serve_args(&data_dir), &env)?;
     if !output.status.success() {
         return Err(format!(
             "启动沙箱 daemon 失败:{}",
@@ -147,8 +161,9 @@ pub fn start(proxy_base_url: &str) -> Result<Value, String> {
         .and_then(|lock| lock.get("version").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| "unknown".into());
     crate::log_line!(
-        "沙箱 daemon 已启动:port={DAEMON_PORT} version={version} login_action={}",
-        action.as_str()
+        "沙箱 daemon 已启动:port={DAEMON_PORT} version={version} login_action={} gh_bridge={}",
+        action.as_str(),
+        if gh_wrapper.is_some() { "on" } else { "off" }
     );
     Ok(json!({
         "ok": true,
@@ -369,6 +384,116 @@ fn link_ssh_entries(real_ssh: &Path, sandbox_ssh: &Path) {
             crate::log_line!("警告:沙箱 SSH 桥接 {name} 链接失败(不影响其他功能)");
         }
     }
+}
+
+// ---------- gh 桥接 ----------
+/// 沙箱专用可执行目录,排在沙箱 daemon PATH 的最前面。
+fn sandbox_bin_dir() -> PathBuf {
+    sandbox_root().join("bin")
+}
+
+/// 让沙箱 Science 读到本机 gh 登录(它的 Credentials 页按 `gh auth token` 与
+/// `git credential fill` 探测)。gh 的令牌默认存在 macOS 登录钥匙串,沙箱 HOME 换向后钥匙串
+/// 搜索表只剩沙箱钥匙串,所以只链接 `~/.config/gh` 拿不到令牌;把真实登录钥匙串挂进沙箱
+/// 搜索表又会让沙箱 daemon 读到真实实例的加密密钥。折中是在沙箱 PATH 最前面放一个 gh
+/// 包装脚本:只有 gh 进程以真实 HOME 运行。脚本每次启动重写(本机 gh 路径可能变);
+/// 本机没装 gh 时删掉旧脚本,返回 `None`。
+fn ensure_gh_bridge() -> Option<PathBuf> {
+    let bin_dir = sandbox_bin_dir();
+    let wrapper = bin_dir.join("gh");
+    let real_gh = std::env::var_os("PATH")
+        .and_then(|path| find_executable("gh", &path, &bin_dir));
+    let Some(real_gh) = real_gh else {
+        let _ = std::fs::remove_file(&wrapper);
+        return None;
+    };
+    match write_gh_wrapper(&wrapper, &crate::profile::home(), &real_gh) {
+        Ok(()) => Some(wrapper),
+        Err(error) => {
+            crate::log_line!("警告:沙箱 gh 桥接写入失败({error}),沙箱内读不到本机 gh 登录");
+            None
+        }
+    }
+}
+
+/// 按 PATH 顺序找可执行文件,跳过沙箱自己的 bin 目录(否则会找到包装脚本自身)。
+fn find_executable(name: &str, path: &std::ffi::OsStr, skip_dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .filter(|dir| dir != skip_dir)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// POSIX sh 单引号转义。
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn gh_wrapper_script(real_home: &str, real_gh: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # 由 CSSwitch 生成,每次启动沙箱时重写。以真实 HOME 运行本机 gh,\n\
+         # 让沙箱 Science 读到本机 gh 登录(配置文件与登录钥匙串)。\n\
+         HOME={} exec {} \"$@\"\n",
+        shell_quote(real_home),
+        shell_quote(real_gh)
+    )
+}
+
+/// 先写临时文件再改名,避免 daemon 恰好执行到半截脚本。
+fn write_gh_wrapper(wrapper: &Path, real_home: &Path, real_gh: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let (Some(home), Some(gh)) = (real_home.to_str(), real_gh.to_str()) else {
+        return Err("路径不是 UTF-8".into());
+    };
+    let dir = wrapper.parent().ok_or("包装脚本路径没有父目录")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tmp = wrapper.with_extension("tmp");
+    std::fs::write(&tmp, gh_wrapper_script(home, gh)).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, wrapper).map_err(|e| e.to_string())
+}
+
+/// gh 桥接需要的 daemon 环境。
+///
+/// - `PATH`:包装脚本目录排最前。继承的 PATH 不可用时不覆盖(只剩一个目录会让 daemon
+///   找不到任何系统命令),此时 `gh auth token` 探测不通,git 部分仍然有效。
+/// - git:对 github.com / gist.github.com 先写空值清掉已有凭据助手(系统级 osxkeychain 在
+///   沙箱 HOME 下只会查沙箱钥匙串),再改用 `gh auth git-credential`——与
+///   `gh auth setup-git` 写入的配置等价,但只经 `GIT_CONFIG_*` 环境注入,不写沙箱
+///   `~/.gitconfig`。继承环境里已有 `GIT_CONFIG_COUNT` 时不覆盖,只留 PATH 部分。
+fn gh_bridge_env(
+    wrapper: &Path,
+    inherited_path: Option<&str>,
+    git_config_env_taken: bool,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let bin_dir = wrapper.parent().map(|dir| dir.display().to_string()).unwrap_or_default();
+    match inherited_path.filter(|path| !path.is_empty()) {
+        Some(path) => env.push(("PATH".to_string(), format!("{bin_dir}:{path}"))),
+        None => crate::log_line!("警告:继承的 PATH 不可用,沙箱 gh 桥接只对 git 生效"),
+    }
+    if git_config_env_taken {
+        crate::log_line!("警告:环境里已有 GIT_CONFIG_COUNT,沙箱 git 不改用 gh 凭据");
+        return env;
+    }
+    let helper = format!("!{} auth git-credential", shell_quote(&wrapper.display().to_string()));
+    let mut index = 0;
+    for host in ["https://github.com", "https://gist.github.com"] {
+        for value in ["", helper.as_str()] {
+            env.push((format!("GIT_CONFIG_KEY_{index}"), format!("credential.{host}.helper")));
+            env.push((format!("GIT_CONFIG_VALUE_{index}"), value.to_string()));
+            index += 1;
+        }
+    }
+    env.push(("GIT_CONFIG_COUNT".to_string(), index.to_string()));
+    env
 }
 
 // ---------- 沙箱钥匙串 ----------
@@ -691,6 +816,98 @@ mod tests {
              /Users/x/.csswitch/science-sandbox/home/.claude-science",
             data_dir
         ));
+    }
+
+    // ---------- gh 桥接 ----------
+    fn gh_test_dir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "csswitch-gh-test-{tag}-{}-{}",
+            std::process::id(),
+            crate::sandbox_forge::rand_hex(4).unwrap()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn write_exec(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn shell_quote_survives_single_quotes_and_spaces() {
+        assert_eq!(shell_quote("/Users/a b/c"), "'/Users/a b/c'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn gh_wrapper_forces_the_real_home_and_forwards_arguments() {
+        // 行为级校验:用一个打印 HOME 与参数的假 gh,在「沙箱 HOME」下执行包装脚本。
+        let base = gh_test_dir("wrap");
+        let real_home = base.join("real home");
+        let fake_gh = base.join("tools/gh");
+        write_exec(&fake_gh, "#!/bin/sh\necho \"$HOME|$*\"\n");
+        let wrapper = base.join("sandbox/bin/gh");
+        write_gh_wrapper(&wrapper, &real_home, &fake_gh).unwrap();
+        let output = std::process::Command::new(&wrapper)
+            .args(["auth", "token"])
+            .env("HOME", base.join("sandbox-home"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("{}|auth token", real_home.display())
+        );
+        assert!(!wrapper.with_extension("tmp").exists(), "临时文件必须被改名掉");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn find_executable_skips_the_sandbox_bin_and_non_executables() {
+        let base = gh_test_dir("find");
+        let sandbox_bin = base.join("sandbox-bin");
+        let plain = base.join("plain");
+        let tools = base.join("tools");
+        write_exec(&sandbox_bin.join("gh"), "#!/bin/sh\n");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("gh"), "not executable").unwrap();
+        write_exec(&tools.join("gh"), "#!/bin/sh\n");
+        let path = std::env::join_paths([&sandbox_bin, &plain, &tools]).unwrap();
+        assert_eq!(find_executable("gh", &path, &sandbox_bin), Some(tools.join("gh")));
+        let only_sandbox = std::env::join_paths([&sandbox_bin]).unwrap();
+        assert_eq!(find_executable("gh", &only_sandbox, &sandbox_bin), None);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn gh_bridge_env_prepends_path_and_routes_github_git_credentials_to_gh() {
+        let env = gh_bridge_env(Path::new("/sb/bin/gh"), Some("/usr/bin:/bin"), false);
+        let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        assert_eq!(get("PATH"), Some("/sb/bin:/usr/bin:/bin"));
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("4"));
+        for (index, host) in [(0, "github.com"), (2, "gist.github.com")] {
+            let key = format!("credential.https://{host}.helper");
+            // 先清空(去掉沙箱 HOME 下无效的 osxkeychain),再指向 gh。
+            assert_eq!(get(&format!("GIT_CONFIG_KEY_{index}")), Some(key.as_str()));
+            assert_eq!(get(&format!("GIT_CONFIG_VALUE_{index}")), Some(""));
+            assert_eq!(get(&format!("GIT_CONFIG_KEY_{}", index + 1)), Some(key.as_str()));
+            assert_eq!(
+                get(&format!("GIT_CONFIG_VALUE_{}", index + 1)),
+                Some("!'/sb/bin/gh' auth git-credential")
+            );
+        }
+    }
+
+    #[test]
+    fn gh_bridge_env_never_clobbers_existing_git_config_env_or_a_missing_path() {
+        let env = gh_bridge_env(Path::new("/sb/bin/gh"), Some("/usr/bin"), true);
+        assert_eq!(env, vec![("PATH".to_string(), "/sb/bin:/usr/bin".to_string())]);
+        // PATH 不可用时不能只留包装目录,否则 daemon 找不到任何系统命令。
+        let env = gh_bridge_env(Path::new("/sb/bin/gh"), None, false);
+        assert!(env.iter().all(|(k, _)| k != "PATH"));
+        assert!(env.iter().any(|(k, _)| k == "GIT_CONFIG_COUNT"));
     }
 
     // ---------- SSH 桥接 ----------
