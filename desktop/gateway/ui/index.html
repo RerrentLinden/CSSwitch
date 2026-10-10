@@ -26,6 +26,8 @@
   .wrap { max-width: 940px; margin: 0 auto; padding: 32px 24px 64px; }
   header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 28px; }
   h1 { font-size: 22px; margin: 0; letter-spacing: .2px; }
+  /* 图标自带深色底板:深色主题下靠一圈细线与页面背景分开(圆角与底板一致,185/824)。 */
+  .logo { align-self: center; flex: none; border-radius: 22.5%; box-shadow: 0 0 0 1px var(--line); }
   .sub { color: var(--muted); font-size: 13px; }
   .card {
     background: var(--panel); border: 1px solid var(--line);
@@ -90,8 +92,25 @@
 <body>
 <div class="wrap">
   <header>
+    <!-- 图形来自 packaging/icon/console-glyph.svg(gen.py 生成),内联以保持单文件;
+         页签图标由下面的脚本取这同一份,不另存一份拷贝。 -->
+    <svg class="logo" id="logo" viewBox="100 100 824 824" width="30" height="30" aria-hidden="true">
+    <defs>
+    <linearGradient id="lg-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a332e"/><stop offset="1" stop-color="#171412"/></linearGradient>
+    <linearGradient id="lg-track" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff9d6e"/><stop offset="1" stop-color="#dd5a2e"/></linearGradient>
+    </defs>
+    <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#lg-bg)"/>
+    <g fill="none" stroke="#f6efe4" stroke-linecap="round" stroke-linejoin="round">
+    <path stroke-width="50" d="M362 512H402M622 512H662"/>
+    <polyline stroke-width="60" points="340,188 353,206 369,224 387,242 407,260 428,278 451,296 475,314 499,332 523,350 546,368 569,386 589,404 608,422 624,440 638,458 649,476 657,494 662,512 664,530 662,548 658,566 650,584 640,602 627,620 612,638 596,656 578,674 559,692 539,710 519,728 500,746 482,764 464,782 448,800 435,818 423,836"/>
+    <polyline stroke-width="60" points="601,188 589,206 576,224 560,242 542,260 524,278 505,296 485,314 465,332 446,350 428,368 412,386 397,404 384,422 374,440 366,458 362,476 360,494 362,512 367,530 375,548 386,566 400,584 416,602 435,620 455,638 478,656 501,674 525,692 549,710 573,728 596,746 617,764 637,782 655,800 671,818 684,836"/>
+    </g>
+    <rect x="394" y="437" width="236" height="150" rx="75" fill="url(#lg-track)"/>
+    <circle cx="555" cy="512" r="61" fill="#ffffff"/>
+    </svg>
     <h1>CSSwitch</h1>
     <span class="sub">Claude Science 模型连接</span>
+    <span class="sub" id="version" style="margin-left:auto"></span>
   </header>
 
   <section class="card">
@@ -175,7 +194,8 @@
         <span>记录请求日志</span>
       </label>
       <p class="hint" style="margin:6px 0 0">
-        关闭后不再记录每条请求:终端里的请求明细行与下方列表都停止记录。
+        关闭后不再记录每条请求:服务日志(安装版在 <code>~/.csswitch/service.log</code>,
+        <code>./csswitch</code> 打在终端)里的请求明细行与下方列表都停止记录。
         启动信息、警告与错误始终保留。切换立即生效,无需重启。
       </p>
       <div class="msg" id="log-msg"></div>
@@ -210,6 +230,16 @@ let channel = 'kimi';
 let scienceUrl = null;
 
 const $ = (id) => document.getElementById(id);
+
+// 页签图标就是页眉里那份内联 SVG:只留一份图形,也不引任何外部文件。
+// 在读状态之前设置,服务连不上、或退出后页眉被换掉,页签图标都还在。
+(() => {
+  const icon = document.createElement('link');
+  icon.rel = 'icon';
+  icon.type = 'image/svg+xml';
+  icon.href = 'data:image/svg+xml,' + encodeURIComponent(new XMLSerializer().serializeToString($('logo')));
+  document.head.append(icon);
+})();
 
 function msg(el, text, kind) {
   el.textContent = text;
@@ -256,6 +286,12 @@ function renderSlots() {
   }).join('');
 }
 
+// 版本号取自正在运行的服务,不写死在页面里:页面与服务编在同一个二进制中,
+// 这里显示的就是后台实际在跑的版本。更早的服务不报告版本号,那时留空。
+function renderVersion() {
+  $('version').textContent = state.version ? 'v' + state.version : '';
+}
+
 function renderScience() {
   const science = state.science || {};
   const running = !!science.running;
@@ -286,6 +322,7 @@ function renderSandbox() {
 
 async function refresh() {
   state = await api('status');
+  renderVersion();
   renderModes();
   renderSlots();
   renderScience();
@@ -298,6 +335,7 @@ async function refresh() {
 // 模型槽会被无声覆盖回已保存值,正在提交的开关会被弹回去。
 async function poll() {
   state = await api('status');
+  renderVersion();
   renderModes();
   renderScience();
   renderSandbox();
@@ -465,7 +503,7 @@ $('btn-quit').onclick = async () => {
     errors.forEach((error) => line(error, 'msg err show'));
   }
   card.insertAdjacentHTML('beforeend',
-    '<p class="sub">重新运行 <code>./csswitch</code> 即可再次启动。</p>');
+    '<p class="sub">再次启动:重新打开 CSSwitch 应用;从源码运行的,重新运行 <code>./csswitch</code>。</p>');
   document.querySelector('.wrap').replaceChildren(card);
 };
 

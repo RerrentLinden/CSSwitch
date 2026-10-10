@@ -9,18 +9,47 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=_cargo_path.sh
 source "$ROOT/test/_cargo_path.sh"
-ensure_rust_toolchain_on_path || { echo "env-blocked: 找不到 cargo 工具链" >&2; exit 3; }
 
-MANIFEST="$ROOT/desktop/gateway/Cargo.toml"
-cargo build --manifest-path "$MANIFEST" --quiet || exit 1
-BIN="$ROOT/desktop/gateway/target/debug/csswitch-gateway"
+# 默认测刚构建出来的 debug 二进制。CSSWITCH_LOOPBACK_BIN 可以显式指向别的产物
+# (例如 dist/CSSwitch.app/Contents/MacOS/CSSwitch),让应用包里的那个二进制过同一套断言;
+# 这时不需要 cargo。
+if [ -n "${CSSWITCH_LOOPBACK_BIN:-}" ]; then
+  BIN="$CSSWITCH_LOOPBACK_BIN"
+  [ -x "$BIN" ] || { echo "CSSWITCH_LOOPBACK_BIN 指向的文件不可执行:$BIN" >&2; exit 1; }
+else
+  ensure_rust_toolchain_on_path || { echo "env-blocked: 找不到 cargo 工具链" >&2; exit 3; }
+  MANIFEST="$ROOT/desktop/gateway/Cargo.toml"
+  cargo build --manifest-path "$MANIFEST" --quiet || exit 1
+  BIN="$ROOT/desktop/gateway/target/debug/csswitch-gateway"
+fi
 
 SANDBOX="$(mktemp -d)"
 PORT=$(( 18800 + RANDOM % 400 ))
+# 启动器拉起的服务脱离了启动器,也就不是本脚本的子进程,kill $! 够不着它。
+# 先请它自己退出;再按命令行里的日志路径兜底(路径在本次运行的临时目录里,唯一)。
+stop_launched() { # stop_launched <端口> <service.log 路径>
+  pgrep -f -- "--log-file $2" >/dev/null 2>&1 || return 0
+  curl -s --max-time 30 -X POST "http://127.0.0.1:$1/control/quit" >/dev/null 2>&1
+  for _ in $(seq 1 25); do
+    pgrep -f -- "--log-file $2" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  pkill -f -- "--log-file $2" 2>/dev/null
+}
 cleanup() {
   [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null
   [ -n "${LEGACY_PID:-}" ] && kill "$LEGACY_PID" 2>/dev/null
   [ -n "${SB_PID:-}" ] && kill "$SB_PID" 2>/dev/null
+  # 后台那个启动器要等它自己跑完(有超时,几秒):先放掉它占着的端口,它反而会真的起一个服务。
+  [ -n "${L_BUSY_JOB:-}" ] && wait "$L_BUSY_JOB" 2>/dev/null
+  [ -n "${L_BUSY_NC:-}" ] && kill "$L_BUSY_NC" 2>/dev/null
+  [ -n "${L_OLD_NC:-}" ] && kill "$L_OLD_NC" 2>/dev/null
+  if [ -n "${L_PORT:-}" ]; then
+    stop_launched "$L_PORT" "$L_LOG"
+    # 另外几个场景本不该留下服务;万一留下了(被测逻辑出错),同样不能漏。
+    pkill -f -- "--log-file $SANDBOX/" 2>/dev/null
+    pkill -f -- "$SANDBOX/hung-shell" 2>/dev/null
+  fi
   rm -rf "$SANDBOX"
 }
 trap cleanup EXIT
@@ -119,11 +148,22 @@ relay_line_for_search_request() {
 }
 
 echo "loopback @ 127.0.0.1:$PORT (HOME=$SANDBOX)"
+echo "被测二进制:$BIN"
 
 check "WebUI 可达"        200 "$(code "http://127.0.0.1:$PORT/")"
 check "控制面状态可达"     200 "$(code "http://127.0.0.1:$PORT/control/status")"
 check "未知路径显式 404"   404 "$(code "http://127.0.0.1:$PORT/v1/unknown")"
 check "未知控制操作报错"   400 "$(code -X POST "http://127.0.0.1:$PORT/control/nope")"
+
+# 版本号只有一个来源:状态接口报告的,就是这个二进制 --version 打印的。
+# 顶层 version 是状态对象的第一个键(沙箱状态里另有一个嵌套的 version,那是 Science 的)。
+bin_version="$("$BIN" --version)"
+case "$bin_version" in
+  [0-9]*.[0-9]*.[0-9]*) echo "  ok   --version 打印版本号($bin_version)" ;;
+  *) echo "  FAIL --version 没有打印版本号:「$bin_version」"; fail=1 ;;
+esac
+check "状态接口的版本与 --version 一致" "$bin_version" \
+  "$(body "http://127.0.0.1:$PORT/control/status" | sed -n 's/^{"version":"\([^"]*\)".*/\1/p')"
 
 # 默认是官方模式。
 mode="$(body "http://127.0.0.1:$PORT/control/status" | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p')"
@@ -384,5 +424,214 @@ if kill -0 "$PID" 2>/dev/null; then
 else
   echo "  ok   退出服务后进程已退出"
 fi
-[ "$fail" = "0" ] || { echo; echo "服务输出:"; cat "$SANDBOX/out.log"; }
+
+# ── 安装版启动器 ────────────────────────────────────────────────────────────
+# 应用包的主可执行文件经 Finder 打开时以启动器角色运行:无参数 + CSSWITCH_APP_LAUNCH=1
+# (Info.plist 的 LSEnvironment)。这里用同样的方式直接执行二进制,不经 LaunchServices。
+# 环境按 Finder 启动的样子给:PATH 只有系统目录,没有 CLAUDE_SCIENCE_BIN —— 这些只能从
+# 登录 shell 来(这里是假的),所以它们出现在服务进程里就证明环境真的传到了。
+# open / osascript 换成只记录参数的假命令,不会打开浏览器,也不会弹任何窗口。
+L_HELPERS="$SANDBOX/launcher-helpers"
+L_SCI="$SANDBOX/launcher-science"
+L_CALLS="$L_HELPERS/calls.log"
+mkdir -p "$L_HELPERS" "$L_SCI"
+for helper in open osascript; do
+  cat >"$L_HELPERS/$helper" <<'EOF'
+#!/bin/bash
+# 一次调用记一行:参数里的换行写成字面量 \n。
+{ printf '%s' "$(basename "$0")"; for arg in "$@"; do printf ' [%s]' "${arg//$'\n'/\\n}"; done; printf '\n'; } \
+  >>"$(dirname "$0")/calls.log"
+EOF
+  chmod +x "$L_HELPERS/$helper"
+done
+# 假 claude-science:每次被调用都记下自己看到的环境(服务每次读状态都会调它一次 status)。
+cat >"$L_SCI/claude-science" <<'EOF'
+#!/bin/bash
+echo "canary=${CSSWITCH_LOOPBACK_CANARY:-absent} path=$PATH" >>"$(dirname "$0")/env.log"
+[ "$1" = status ] && echo '{"running":false}'
+exit 0
+EOF
+chmod +x "$L_SCI/claude-science"
+# 假登录 shell:像 rc 文件那样先打印横幅、导出变量,再执行启动器交给它的命令。
+# 不是以 -l -i -c 调用就直接失败:真实 shell 少了这两个开关就不会读用户的配置。
+cat >"$SANDBOX/login-shell" <<EOF
+#!/bin/bash
+echo "Last login: rc 文件打印的横幅"
+echo "PATH=/from/the/banner"
+[ "\$1 \$2 \$3" = "-l -i -c" ] || exit 64
+export CLAUDE_SCIENCE_BIN="$L_SCI/claude-science"
+export PATH="$L_SCI/only-in-login-shell:/usr/bin:/bin:/usr/sbin:/sbin"
+export CSSWITCH_LOOPBACK_CANARY="must-not-reach-the-service"
+exec /bin/sh -c "\$4"
+EOF
+# 卡住的登录 shell(rc 文件在等什么东西):启动器必须超时放弃、把它结束掉,服务照常启动。
+cat >"$SANDBOX/hung-shell" <<'EOF'
+#!/bin/bash
+exec -a "$0.hung" /bin/sleep 600
+EOF
+chmod +x "$SANDBOX/login-shell" "$SANDBOX/hung-shell"
+
+# launcher_home <目录> <端口>:建一个隔离 HOME,配置文件只为了指定端口。
+launcher_home() {
+  mkdir -p "$1/.csswitch"
+  cat >"$1/.csswitch/service.v1.json" <<EOF
+{"mode":"official","port":$2,
+ "kimi":{"base_url":"https://api.example.invalid","api_key":"",
+         "default_model":{"model_id":"m1","display_name":"M1"}},
+ "deepseek":{"base_url":"https://api.example.invalid","api_key":"",
+             "default_model":{"model_id":"d1","display_name":""}}}
+EOF
+}
+# launch <HOME> <登录 shell>:返回启动器的退出码。
+launch() {
+  env -i HOME="$1" SHELL="$2" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    CSSWITCH_APP_HELPER_DIR="$L_HELPERS" CSSWITCH_APP_LAUNCH=1 "$BIN" 2>/dev/null
+}
+launched_pids() { pgrep -f -- "--log-file $1" | tr '\n' ' ' | sed 's/ $//'; }
+wait_for_listener() {
+  for _ in $(seq 1 25); do
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    sleep 0.2
+  done
+}
+
+L_HOME="$SANDBOX/launcher-home"
+L_PORT=$(( PORT + 2 ))
+L_LOG="$L_HOME/.csswitch/service.log"
+L_STATUS="http://127.0.0.1:$L_PORT/control/status"
+launcher_home "$L_HOME" "$L_PORT"
+
+# 端口被占的场景要等一次响应超时(占着端口的 nc 不回话),放到后台与下面的主动线并行。
+L_BUSY_HOME="$SANDBOX/launcher-busy-home"
+L_BUSY_PORT=$(( PORT + 3 ))
+launcher_home "$L_BUSY_HOME" "$L_BUSY_PORT"
+nc -lk 127.0.0.1 "$L_BUSY_PORT" </dev/null >/dev/null 2>&1 &
+L_BUSY_NC=$!
+wait_for_listener "$L_BUSY_PORT"
+( launch "$L_BUSY_HOME" "$SANDBOX/login-shell"; echo $? >"$SANDBOX/busy.exit" ) &
+L_BUSY_JOB=$!
+
+# 首次启动:拉起后台服务、请求打开控制台,启动器自己退出。
+launch "$L_HOME" "$SANDBOX/login-shell"
+check "首次启动:启动器退出码 0" 0 $?
+check "首次启动:请求打开的是控制台地址" "open [http://127.0.0.1:$L_PORT/]" \
+  "$(grep ":$L_PORT/" "$L_CALLS" 2>/dev/null | tail -1)"
+first_pid="$(launched_pids "$L_LOG")"
+case "$first_pid" in
+  ''|*' '*) echo "  FAIL 首次启动后应当恰好有一个后台服务,实际 pid:「$first_pid」"; fail=1 ;;
+  *) echo "  ok   首次启动拉起了一个后台服务" ;;
+esac
+check "启动器退出后服务仍在,且已脱离启动器" 1 \
+  "$(ps -o ppid= -p "${first_pid:-0}" 2>/dev/null | tr -d ' ')"
+launched_status="$(body "$L_STATUS")"
+has "服务以配置里的端口提供控制面" "\"port\":$L_PORT" "$launched_status"
+check "service.log 权限 0600" 600 \
+  "$(stat -f '%Lp' "$L_LOG" 2>/dev/null || stat -c '%a' "$L_LOG" 2>/dev/null)"
+
+# 登录 shell 的环境真的到了服务进程:白名单内的到,白名单外的不到。
+has "登录 shell 导出的 CLAUDE_SCIENCE_BIN 到达服务进程" \
+  "\"binary\":\"$L_SCI/claude-science\"" "$launched_status"
+has "登录 shell 的 PATH 到达服务进程" "path=$L_SCI/only-in-login-shell:" \
+  "$(tail -1 "$L_SCI/env.log" 2>/dev/null)"
+lacks "白名单之外的变量没有进入服务进程" "must-not-reach-the-service" \
+  "$(cat "$L_SCI/env.log" 2>/dev/null)"
+has "启动器在日志里记下导入了哪些变量" "已从登录 shell 导入" "$(cat "$L_LOG")"
+has "命令目录 override 在日志里留痕" "CSSWITCH_APP_HELPER_DIR 生效" "$(cat "$L_LOG")"
+
+# 再次启动:服务已在跑,只再开一次控制台,不拉起第二个。
+launch "$L_HOME" "$SANDBOX/login-shell"
+check "再次启动:启动器退出码 0" 0 $?
+check "再次启动:没有换进程,也没有第二个服务" "$first_pid" "$(launched_pids "$L_LOG")"
+check "再次启动:又请求打开了一次控制台" 2 \
+  "$(grep -c "^open \[http://127.0.0.1:$L_PORT/\]$" "$L_CALLS")"
+# 多拉起的那个服务会因端口被占立刻退出,数进程看不出来,但它一定会在日志里留下一行。
+check "再次启动:服务只启动过一次" 1 "$(grep -c 'CSSwitch 控制台:' "$L_LOG")"
+lacks "再次启动:没有第二个服务去抢端口" "无法监听" "$(cat "$L_LOG")"
+# 此刻唯一可能已经出现的提示,是后台那个「端口被占」场景的(正文里带着它自己的日志路径)。
+check "正常启动不弹任何提示" 0 "$(grep '^osascript ' "$L_CALLS" | grep -vc "$L_BUSY_HOME/")"
+
+# 退出服务后能重新启动;这一次登录 shell 卡住:留日志、结束掉它、服务照常起来。
+stop_launched "$L_PORT" "$L_LOG"
+check "退出服务后进程消失" "" "$(launched_pids "$L_LOG")"
+launch "$L_HOME" "$SANDBOX/hung-shell"
+check "登录 shell 卡住:启动器仍以 0 退出" 0 $?
+has "登录 shell 卡住:日志里写明没有取到环境" "没有取到登录 shell 的环境" "$(cat "$L_LOG")"
+check "登录 shell 卡住:被启动器结束,没有留下" "" \
+  "$(pgrep -f -- "$SANDBOX/hung-shell" | tr '\n' ' ')"
+hung_status="$(body "$L_STATUS")"
+has "登录 shell 卡住:服务仍然启动" "\"port\":$L_PORT" "$hung_status"
+# 没有登录 shell 的环境,服务就只有启动器自己的那一份:里面找不到任何 claude-science。
+has "登录 shell 卡住:服务沿用启动器自身的环境" '"science":{"installed":false' "$hung_status"
+stop_launched "$L_PORT" "$L_LOG"
+
+# 真的 zsh(macOS 的默认 shell)读隔离 HOME 里的 .zshrc:上面的假 shell 只证明了管道接得上,
+# 这一条证明我们调用登录 shell 的方式(-l -i -c、printf 的引号、env -0)在真实 shell 里成立。
+cat >"$L_HOME/.zshrc" <<EOF
+echo "来自 .zshrc 的横幅"
+export CLAUDE_SCIENCE_BIN="$L_SCI/claude-science"
+export PATH="$L_SCI/only-in-zshrc:\$PATH"
+EOF
+# 同一次启动顺带验证日志有上限:先把日志撑过 5 MiB(5242880 字节),服务一启动就该把它挪到
+# service.log.1、另起新文件,并把自己正在写的 stdout / stderr 接过去。
+yes '(填充行:把 service.log 撑过 5 MiB 的上限)' | head -c 5300000 >>"$L_LOG"
+launch "$L_HOME" /bin/zsh
+check "真实 zsh:启动器退出码 0" 0 $?
+has "真实 zsh:.zshrc 里的 CLAUDE_SCIENCE_BIN 到达服务进程" \
+  "\"binary\":\"$L_SCI/claude-science\"" "$(body "$L_STATUS")"
+has "真实 zsh:.zshrc 里的 PATH 到达服务进程" "path=$L_SCI/only-in-zshrc:" \
+  "$(tail -1 "$L_SCI/env.log" 2>/dev/null)"
+stop_launched "$L_PORT" "$L_LOG"
+file_size() { wc -c <"$1" 2>/dev/null | tr -d ' '; }
+check "超限的日志整份挪到 service.log.1" yes \
+  "$([ "$(file_size "$L_LOG.1")" -ge 5300000 ] 2>/dev/null && echo yes || echo "no($(file_size "$L_LOG.1") 字节)")"
+check "轮转后的新日志从头开始,仍是 0600" "small 600" \
+  "$([ "$(file_size "$L_LOG")" -lt 100000 ] && echo small || echo big) $(stat -f '%Lp' "$L_LOG" 2>/dev/null || stat -c '%a' "$L_LOG" 2>/dev/null)"
+# 退出时服务写的那一行必须出现在新文件里:证明进程正在写的描述符真的被接到了新文件上,
+# 而不是继续往改了名的旧文件里写。
+has "轮转后服务的日志写进新文件" "退出服务" "$(cat "$L_LOG")"
+
+# 后台跑着的是别的版本(这里是不报告版本号的更早服务):提示,然后只打开控制台,不拉起新服务。
+L_OLD_HOME="$SANDBOX/launcher-old-home"
+L_OLD_PORT=$(( PORT + 4 ))
+launcher_home "$L_OLD_HOME" "$L_OLD_PORT"
+old_status='{"mode":"official","mode_label":"official","port":0}'
+printf 'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %s\r\nconnection: close\r\n\r\n%s' \
+  "${#old_status}" "$old_status" | nc -l 127.0.0.1 "$L_OLD_PORT" >/dev/null 2>&1 &
+L_OLD_NC=$!
+wait_for_listener "$L_OLD_PORT"
+launch "$L_OLD_HOME" "$SANDBOX/login-shell"
+check "后台是别的版本:启动器退出码 0" 0 $?
+old_alert="$(grep '^osascript ' "$L_CALLS" 2>/dev/null | grep '不是当前版本' | tail -1)"
+has "后台是别的版本:提示先退出旧服务" "退出服务" "$old_alert"
+has "后台是别的版本:提示里有当前应用的版本" "$bin_version" "$old_alert"
+check "后台是别的版本:仍然打开控制台" 1 \
+  "$(grep -c "^open \[http://127.0.0.1:$L_OLD_PORT/\]$" "$L_CALLS")"
+check "后台是别的版本:不拉起新服务" "" "$(launched_pids "$L_OLD_HOME/.csswitch/service.log")"
+kill "$L_OLD_NC" 2>/dev/null
+wait "$L_OLD_NC" 2>/dev/null
+L_OLD_NC=
+
+# 端口被别的程序占着(开头放到后台的那一个):非零退出、弹提示、不开控制台、不留服务。
+wait "$L_BUSY_JOB" 2>/dev/null
+L_BUSY_JOB=
+check "端口被占:启动器退出码非零" 1 "$(cat "$SANDBOX/busy.exit" 2>/dev/null)"
+busy_alert="$(grep '^osascript ' "$L_CALLS" 2>/dev/null | grep '无法启动' | tail -1)"
+has "端口被占:提示里指出是哪个端口" "端口 $L_BUSY_PORT" "$busy_alert"
+has "端口被占:提示里带着日志最后一行(系统的原始报错)" \
+  "无法监听 127.0.0.1:$L_BUSY_PORT" "$busy_alert"
+has "端口被占:提示里给出日志路径" "$L_BUSY_HOME/.csswitch/service.log" "$busy_alert"
+check "端口被占:没有去打开控制台" 0 \
+  "$(grep -c "^open \[http://127.0.0.1:$L_BUSY_PORT/\]$" "$L_CALLS")"
+check "端口被占:没有留下服务进程" "" "$(launched_pids "$L_BUSY_HOME/.csswitch/service.log")"
+kill "$L_BUSY_NC" 2>/dev/null
+wait "$L_BUSY_NC" 2>/dev/null
+L_BUSY_NC=
+
+if [ "$fail" != "0" ]; then
+  echo; echo "服务输出:"; cat "$SANDBOX/out.log"
+  # 只看末尾:轮转没发生时,日志里还留着上面灌进去的 5 MB 填充行。
+  echo; echo "启动器段日志(末尾):"
+  tail -n 40 "$L_LOG" "$L_BUSY_HOME/.csswitch/service.log" 2>/dev/null | grep -v '填充行'
+  echo; echo "假 open / osascript 收到的调用:"; cat "$L_CALLS" 2>/dev/null
+fi
 exit "$fail"

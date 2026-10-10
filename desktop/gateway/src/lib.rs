@@ -8,6 +8,7 @@ pub(crate) mod debug_capture;
 pub mod deepseek_compat;
 pub mod kimi_search_noise;
 pub mod kimi_web_search_adapter;
+pub mod launcher;
 pub mod messages;
 pub mod models;
 pub mod official_passthrough;
@@ -18,10 +19,16 @@ pub(crate) mod sandbox_forge;
 pub mod science;
 pub mod science_config;
 pub mod server;
+pub mod service_log;
 pub mod static_profile;
+
+/// 版本号的唯一来源是 `Cargo.toml`。`--version`、状态接口、控制台页眉都读这个常量,
+/// 构建脚本把同一个值写进应用包的 Info.plist。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// serve 路径的服务日志行:每行带 UTC 毫秒时间戳,使 `~/.csswitch/service.log`
 /// 可与 Science 侧日志直接对齐(此前无时间戳,只能靠进程启动时刻反推)。
+/// 脚本形态下这些行打在终端;安装版由 [`service_log`] 落到那个文件。
 #[macro_export]
 macro_rules! log_line {
     ($($arg:tt)*) => {
