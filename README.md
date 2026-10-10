@@ -1,12 +1,15 @@
 # CSSwitch
 
+![CSSwitch:给 Claude Science 换模型供应商](docs/assets/social-preview.png)
+
 给 [Claude Science](https://claude.com) 换模型供应商的本地小工具:官方 Claude、
 Kimi、DeepSeek 三选一,配置在浏览器里点,对话仍然留在你自己的 Science 实例里。
 
 ## 它是什么形态
 
-一个本地服务进程 + 一个浏览器控制台。没有安装包,没有常驻图标:
-跑一个脚本,浏览器里操作,用完在控制台点「退出服务」。
+一个本地服务进程 + 一个浏览器控制台。装成 macOS 应用后双击即可:服务在后台运行,
+界面就是浏览器里的控制台。没有 Dock 图标、菜单栏图标或原生窗口;
+用完在控制台点「退出服务」。
 
 ```
 Claude Science(你自己的实例、你自己的登录)
@@ -24,22 +27,50 @@ CSSwitch 服务  ── /v1/messages、/v1/models  按当前模式路由
 再多带一份镜像配置(见下文)。CSSwitch 不往 Science 自己的目录里写任何文件。
 所以历史对话、项目、MCP、Skill 全都还在原处,换供应商不会让对话分家。
 
-## 用法
+## 安装与使用
+
+### 安装版(macOS,Apple 芯片)
+
+1. 打开 `CSSwitch-<版本>-arm64.dmg`,把 CSSwitch 拖进「应用程序」。
+2. 双击 CSSwitch(或从 Launchpad / Spotlight 打开):服务在后台启动,默认浏览器打开控制台。
+   服务已经在运行时,再次打开只会再开一次控制台,不会起第二个服务。
+3. 在「渠道配置」里填好 base_url 与 API Key,点上方的模式卡片切换。切换会重启
+   Science daemon(它只在启动时读 base_url),控制台会给出新的登录链接。
+4. 用完在控制台点「退出服务」:它会先停掉 Science 与免登录沙箱,再结束后台服务。
+
+安装版不需要 Rust、Python 或源码;Claude Science 仍然要你自己安装并登录。
+
+**首次打开需要放行。** 应用只做了 ad-hoc 签名,没有 Apple 开发者签名,也没有公证。
+经下载得到的应用首次打开时会被 macOS 拦下:到「系统设置 → 隐私与安全性」里对 CSSwitch
+选择仍要打开,之后就不再提示。在本机自己构建出来的不会被拦。
+
+几件与从终端运行不同的事:
+
+- **日志**在 `~/.csswitch/service.log`(仅本人可读;超过 5 MiB 自动轮转,旧的一份留在
+  `service.log.1`)。启动失败时会弹出提示框,里面有这条路径和日志的最后一行。
+- **代理与 PATH**:从 Finder 打开的应用拿不到你在 shell 里配置的环境变量。CSSwitch 启动服务前
+  会读一次登录 shell 的环境,只导入代理变量(`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
+  `NO_PROXY` 及小写形式)、`PATH` 与 `CLAUDE_SCIENCE_BIN`,所以终端里能用的代理、本机的 `gh`
+  对安装版同样生效。改了 shell 配置后,要「退出服务」再重新打开才会读到。读不到时服务照常启动,
+  并在日志里写明原因。
+- **升级**:先在控制台「退出服务」,再换成新版应用。后台还跑着另一个版本的服务时,
+  打开应用会提示你先退出它,不会替你重启(重启会打断进行中的会话)。
+- **端口**是配置文件 `~/.csswitch/service.v1.json` 里的 `port`,默认 8788。
+
+### 从源码运行(开发入口)
 
 ```bash
 ./csswitch
 ```
 
-首次运行会自己构建,随后打开控制台。在「渠道配置」里填好 base_url 与 API Key,
-点上方的模式卡片切换。切换会重启 Science daemon(它只在启动时读 base_url),
-控制台会给出新的登录链接。
+首次运行会自己构建(需要 Rust 工具链),随后在前台启动服务并打开控制台,日志打在这个终端里。
 
 ```bash
 ./csswitch status    # 当前模式与 Science 状态
 ./csswitch stop      # 先停掉 Science 与免登录沙箱,再停止服务(等同控制台里的「退出服务」)
 ```
 
-端口默认 8788,`CSSWITCH_PORT` 可改。
+端口默认 8788,`CSSWITCH_PORT` 可改。两种方式用同一份配置、同一个默认端口,同一时间只运行其中一个。
 
 ## 模型配置
 
@@ -84,8 +115,11 @@ Science 只在启动时读配置,所以切换开关会重启正在运行的 Scie
 ## 开发
 
 ```bash
-bash test/run_all.sh     # 三层门禁:fmt+clippy / 单测 / 真实服务进程 loopback
+bash test/run_all.sh          # 三层门禁:fmt+clippy / 单测 / 真实服务进程 loopback
+bash packaging/build_app.sh   # 从干净的 commit 构建 dist/CSSwitch.app 与 dist/CSSwitch-<版本>-<架构>.dmg
 ```
+
+构建脚本只写 `dist/`,不安装到「应用程序」;图标的重新生成见 [packaging/](packaging/README.md)。
 
 真机验收(官方登录、真实 provider key、工具轮次)见 [test/LIVE_ACCEPTANCE.md](test/LIVE_ACCEPTANCE.md)。
 

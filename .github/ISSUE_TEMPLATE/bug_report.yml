@@ -1,5 +1,5 @@
 name: Bug 反馈
-description: 报告一个问题（崩溃、报错、行为不对）
+description: 报告一个问题（起不来、报错、行为不对）
 title: "[Bug] "
 labels: ["bug"]
 body:
@@ -11,8 +11,17 @@ body:
     id: version
     attributes:
       label: CSSwitch 版本
-      description: 面板右下角显示（如 v0.1.2），或点「检查更新」查看
-      placeholder: v0.1.2
+      description: 控制台页眉右侧显示的版本号；从源码运行的请同时给出 commit（`git rev-parse --short HEAD`）
+      placeholder: v0.9.0
+    validations:
+      required: true
+  - type: dropdown
+    id: form
+    attributes:
+      label: 使用方式
+      options:
+        - 安装版（CSSwitch.app）
+        - 从源码运行（./csswitch）
     validations:
       required: true
   - type: input
@@ -22,23 +31,32 @@ body:
       placeholder: macOS 15.5 / Apple M2
     validations:
       required: true
-  - type: dropdown
-    id: provider
+  - type: input
+    id: science
     attributes:
-      label: 用的是哪个 provider
-      options:
-        - DeepSeek
-        - 通义千问 Qwen
-        - 自定义 / 其它
+      label: Claude Science 版本
+      description: Science 设置页 → About
+      placeholder: 0.1.60
     validations:
       required: false
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 出问题时的连接模式
+      options:
+        - 官方 Claude
+        - Kimi
+        - DeepSeek
+        - 与模式无关（启动、控制台、免登录沙箱等）
+    validations:
+      required: true
   - type: textarea
     id: steps
     attributes:
       label: 复现步骤
       placeholder: |
-        1. 打开面板
-        2. 填 key，点「一键越过登录」
+        1. 打开 CSSwitch，控制台切换到 Kimi
+        2. 在 Science 里新开一个会话，发送……
         3. ……
     validations:
       required: true
@@ -52,7 +70,10 @@ body:
     id: logs
     attributes:
       label: 日志（可选，强烈建议）
-      description: 面板「日志」链接会打开 `~/.csswitch/logs/`；把 `proxy.log` / `sandbox.log` 里相关几行贴上来。
+      description: |
+        安装版：`~/.csswitch/service.log` 里出问题那一刻前后的几行。
+        从源码运行：运行 `./csswitch` 的那个终端里的输出。
+        控制台「请求日志」卡片里对应的那一行也有帮助。日志不含 key 与对话内容，但贴之前请自己再看一眼。
       render: text
   - type: checkboxes
     id: safety

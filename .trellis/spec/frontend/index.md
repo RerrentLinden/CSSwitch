@@ -5,4 +5,4 @@
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Quality Guidelines](./quality-guidelines.md) | 单文件约束、凭证不回显、可视化验收 | Active |
+| [Quality Guidelines](./quality-guidelines.md) | 单文件约束(含内联图标与页签图标)、凭证不回显、可视化验收 | Active |

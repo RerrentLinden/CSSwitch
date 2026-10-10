@@ -822,6 +822,148 @@ RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT =
 
 ---
 
+## 场景：打包为安装版与启动器
+
+### 1. 范围 / 触发条件
+
+改动 `launcher.rs`、`service_log.rs`、`main.rs` 的入口判定、状态接口的 `version`,或
+`packaging/` 下的构建脚本、Info.plist 模板、图标时适用。安装版是在 `./csswitch` 之外新增的
+一种启动方式:服务本身(`serve`)两者共用,脚本形态的行为不因安装版而改变。
+
+### 2. 签名
+
+```text
+main.rs::entry(args, app_launch) -> Launcher | Version | Serve | OfficialPassthrough | Gateway
+launcher::run() -> ExitCode                       # 0 = 已请求打开控制台;1 = 起不来(已提示)
+serve [--port N] [--log-file PATH]
+service_log::open(path) -> io::Result<File>       # 追加、0600、路径是符号链接时拒绝
+service_log::attach(path) -> Result<(), String>   # fd 1 / 2 接到文件 + 轮转线程
+GET /control/status -> {"version": <CARGO_PKG_VERSION>, "mode": …}    # version 是第一个键
+bash packaging/build_app.sh [--allow-dirty]
+  -> dist/CSSwitch.app、dist/CSSwitch-<版本>-<架构>.dmg
+
+env  CSSWITCH_APP_LAUNCH=1           只由 Info.plist 的 LSEnvironment 设置
+     CSSWITCH_APP_HELPER_DIR=<目录>   只供隔离测试替换 open / osascript,生效时写日志
+     CSSWITCH_LOOPBACK_BIN=<路径>     让 loopback 层去测指定的二进制(例如应用包里的那个)
+```
+
+### 3. 合同
+
+- **应用包里只有一个可执行文件**,它就是网关二进制;启动器与服务是同一个文件的两个角色。
+  不加 shell 脚本主可执行文件(签名存在扩展属性里,拷贝易丢)、不加 Swift 壳、不加托盘 /
+  Dock 图标 / 原生窗口。界面只有浏览器里的控制台,退出只有控制台的「退出服务」。
+- **启动器干完就退。** LaunchServices 以「应用主进程是否还活着」判断应用是否在运行;主进程
+  若常驻,第二次双击不会再执行任何代码。提示框也不能无限期地挂住启动器(`giving up after`)。
+- **入口靠显式的环境变量,不靠路径嗅探。** `CSSWITCH_APP_LAUNCH=1` 只在**没有参数**时把二进制
+  变成启动器;显式子命令永远优先。启动器拉起服务时显式带 `serve` 并移除这个变量 —— 两道
+  保险少了任何一道,服务都可能再次判成启动器、无限拉起自己。无参数且没有这个变量时必须仍是
+  前台 `serve`(`./csswitch` 与 loopback 都依赖它)。
+- **「服务已在跑」的判据**是状态接口回 200、JSON、带字符串 `mode`,不是「端口连得上」。
+  别的程序占着端口时照常去拉起服务,由它撞上端口,把系统的原始报错带进提示框。
+  探测走回环且显式不走代理(用户环境里的 `HTTP_PROXY` 会把 127.0.0.1 的请求带到代理上)。
+  连接超时 1 秒;连上之后等回话 5 秒:状态接口要先执行 `claude-science status`,不是纯回环往返。
+- **版本只有一个来源**(`Cargo.toml`)。启动器拿状态接口的 `version` 与自己比:不同、或没有
+  这个字段(更早的服务),都先提示再打开控制台,**不自动重启** —— 退出服务会停掉 Science 与
+  沙箱、打断进行中的会话,必须由用户决定。状态里嵌套的 `sandbox.version` 是 Science 的版本,
+  不得拿来比。
+- **登录 shell 环境按白名单导入**:`PATH`、`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
+  `NO_PROXY` 及其小写形式、`CLAUDE_SCIENCE_BIN`。只解析标记之后的内容(rc 文件会打印横幅);
+  shell 里有就覆盖继承值(置空也算有),没有就保留继承值。`ANTHROPIC_*` 等模型与凭证类变量
+  永不导入。取不到(超时、非零退出、没有标记)是**显式降级**:写日志、沿用继承环境、照常启动。
+  日志只记变量名,不记值(代理地址可能带口令)。shell 起在独立会话里,超时按进程组结束。
+- **日志**:安装版落在 `~/.csswitch/service.log`(0600)。轮转在服务进程内做(每 60 秒按
+  **正在写的那个文件**量大小,超过 5 MiB → 改名 `.1` → 0600 新建 → `dup2` 到 fd 1 / 2):
+  fd 重定向之后外部改名不改变进程在写的文件;按路径量大小,文件被外部删掉后就永远「没超限」。
+  `log_line!` / `request_log_line!` 不改;不带 `--log-file` 时服务行为与没有这个参数时相同。
+- **提示与打开控制台**只用 `/usr/bin/open` 与 `/usr/bin/osascript`。提示的标题与正文经 argv
+  传给脚本,不拼进 AppleScript 源码(正文带着日志的最后一行,内容不受控)。正常启动不弹任何东西。
+- **构建脚本**只写 `dist/`,不碰 `/Applications`;工作区有任何未提交改动(含未跟踪文件 ——
+  它们同样会被编进产物)时拒绝,除非显式 `--allow-dirty`;自检任一项不过即非零退出并删掉
+  这次的半成品。它不并入 `test/run_all.sh`:三层门禁的合同是离线、快,release 构建与 DMG 是
+  发布侧的独立结论。签名是 ad-hoc,bundle id `io.github.rerrentlinden.csswitch`
+  (不沿用上游的 `com.csswitch.menubar`:不是同一个应用,不共享系统里按 bundle id 记的状态)。
+- **图标**:`packaging/icon/` 里 `gen.py` → 三张 SVG → `build_icon.sh` → `AppIcon.icns`,
+  全部入库;应用构建只拷贝 `.icns`,不依赖 Chrome。16 / 32 px 三档取自简化稿,其余取自主稿。
+  控制台里的内联图形是 `console-glyph.svg` 的拷贝,改图后要同步。
+
+### 4. 校验与错误矩阵
+
+| 条件 | 要求行为 |
+| --- | --- |
+| 服务已在跑,版本相同 | 只打开控制台,退出 0;不拉起、不提示 |
+| 服务已在跑,版本不同或没有 `version` | 先提示,提示关掉后打开控制台,退出 0;不重启、不拉起 |
+| 端口被别的程序占着 | 不当成服务在跑;拉起的服务撞端口退出 → 提示(原因、日志路径、日志最后一行)→ 退出 1 |
+| 登录 shell 超时 / 非零退出 / 没有标记 | 结束那个 shell,日志写原因,沿用继承环境照常启动 |
+| 服务 10 秒内没有就绪 | 结束它,提示,退出 1 |
+| `open` 失败(服务已在跑) | 提示标题说明服务已启动、只是没打开控制台,正文给出地址,退出 1;不附日志最后一行(与此无关) |
+| 日志文件打不开 | 提示,退出 1 |
+| `--log-file` 后面没有路径 | 报错并以 2 退出,不悄悄退回 stderr |
+| 轮转时原路径已不存在 | 不算错,照样在原路径另起新文件 |
+| 构建时工作区不干净且没有 `--allow-dirty` | 拒绝 |
+| Info.plist 版本、`LSEnvironment`、`LSUIElement`、架构、图标、签名任一不对 | 自检失败,非零退出,删除半成品 |
+
+### 5. 正常 / 基线 / 错误案例
+
+- 正常:双击 → 后台服务起来、浏览器打开控制台、启动器退出;再双击只再开一次控制台。
+- 基线:`./csswitch`、不带参数直接运行二进制,行为与引入启动器之前相同;`bash test/run_all.sh`
+  不依赖 `packaging/`。
+- 错误:让常驻服务做应用主进程(第二次双击没反应);把登录 shell 的全部变量导进服务(旧的
+  `ANTHROPIC_*` 跟着进来);为了验证去 `open dist/CSSwitch.app`(用真实 HOME 起真实服务,
+  还会打开用户的浏览器)。
+
+### 6. 必需测试
+
+- 单测 `launcher::tests`:标记之前的横幅不被当成变量;白名单之外(凭证、`HOME`、启动器自己的
+  变量)不导入;置空的值作为「有」保留;没有标记、或标记后面不是 NUL 时是失败而不是空环境;
+  版本比对三态,嵌套的 `sandbox.version` 不算;别的程序的 200 JSON 不算服务在跑。
+- 单测 `main::tests`:无参数默认是 `Serve`;显式子命令压过 `CSSWITCH_APP_LAUNCH`;
+  `--log-file` 缺路径是错误。
+- 单测 `service_log::tests`:用一个代替 fd 1 / 2 的描述符做真实的 `dup2` —— 轮转后**沿用同一个
+  描述符号**写出的内容落在新文件、旧内容在 `.1` 且覆盖更早的历史、新文件 0600;文件被外部删掉后
+  仍会轮转;已有文件权限被收紧、内容不截断;符号链接被拒绝且目标不变。
+- loopback「安装版启动器」一段:以应用包同样的方式执行二进制(无参数 + `CSSWITCH_APP_LAUNCH=1`),
+  环境按 Finder 启动的样子给(PATH 只有系统目录),`open` / `osascript` / 登录 shell /
+  `claude-science` 全是假的。断言:首次启动拉起且服务脱离启动器(父进程是 1);再次启动 pid 不变、
+  日志里只有一次启动横幅且没有抢端口的报错;`service.log` 0600;假 shell 导出的
+  `CLAUDE_SCIENCE_BIN` 与 `PATH` 到了服务进程、白名单外的变量没到;登录 shell 卡住时被结束、
+  服务照常启动、日志有记录;**真实的 `/bin/zsh`** 读隔离 HOME 里的 `.zshrc` 同样导入成功(假 shell
+  只证明管道接得上,这一条证明调用方式在真实 shell 里成立);预先撑过 5 MiB 的日志在服务启动时被
+  挪到 `.1`,之后服务写的行落在新文件里;后台是别的版本时提示并只开控制台;端口被占时非零退出、
+  提示里有端口、日志路径与系统原始报错。
+- 启动器拉起的服务不是测试脚本的子进程:正常路径与 `trap` 都要显式收口(先 `POST /control/quit`,
+  再按命令行里唯一的日志路径兜底),跑完用 `pgrep` 确认没有残留。
+- 发布侧:`packaging/build_app.sh` 的自检;需要确认包内二进制的运行行为时用
+  `CSSWITCH_LOOPBACK_BIN=dist/CSSwitch.app/Contents/MacOS/CSSwitch bash test/run_loopback.sh`。
+- 经 Finder 的真实双击、提示框是否看得见、系统放行流程属于真机验收
+  (`test/LIVE_ACCEPTANCE.md` §F),离线结论不能替代。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// 用路径猜角色:从终端直接运行包内二进制会意外变成启动器;
+// 而且 serve 子进程同样位于 .app 里,少一道保险就会无限拉起自己
+if std::env::current_exe()?.to_string_lossy().contains(".app/Contents/MacOS") {
+    return launcher::run();
+}
+```
+
+#### Correct
+
+```rust
+// 显式变量只在没有参数时生效;显式子命令永远优先
+match args.get(1).map(String::as_str) {
+    None if app_launch => Entry::Launcher,
+    None | Some("serve") => Entry::Serve,
+    …
+}
+// 启动器拉起服务:显式 serve + 移除变量
+command.args(["serve", "--port", &port, "--log-file"]).arg(log).env_remove(APP_LAUNCH_ENV);
+```
+
+---
+
 ## Test Gate: 三层门禁合同（2026-08-19）
 
 `bash test/run_all.sh` 是唯一入口，三层全绿才算通过：
@@ -830,10 +972,11 @@ RULE_PROVIDER_KIMI_SEARCH_PAIR_ID_ADOPT =
 | --- | --- | --- |
 | 1 static | `cargo fmt --check` + clippy（本仓库代码零告警） | 传递依赖的 future-incompat 提示不计入 |
 | 2 unit | `cargo test` | 补偿链、配置、模型目录、控制面 |
-| 3 loopback | 起真实服务进程打真实 HTTP | 路由、显式 404、配置权限、凭证不回显、配置文件名隔离 |
+| 3 loopback | 起真实服务进程打真实 HTTP | 路由、显式 404、配置权限、凭证不回显、配置文件名隔离、安装版启动器(拉起 / 不重复拉起 / 环境导入 / 失败提示) |
 
 - 三层全部离线。真机验收（官方登录、真实 provider key、工具轮次）在
   `test/LIVE_ACCEPTANCE.md`，结论必须单独写，不能并入门禁结果。
 - Rust 工具链发现必须走 `test/_cargo_path.sh`（本机没有 rustup shim）；
   找不到时以 env-blocked 退出，**不得计为通过**。
 - loopback 层必须用隔离 HOME，不得读写用户真实的 `~/.csswitch`。
+- 应用构建（`packaging/build_app.sh`）不属于三层门禁：它是发布侧的独立结论，单独运行、单独记录。

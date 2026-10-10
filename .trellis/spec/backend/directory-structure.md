@@ -6,7 +6,9 @@
 desktop/gateway/
 ├── ui/index.html            控制台(单文件,include_str! 内嵌)
 └── src/
-    ├── main.rs              子命令分发:serve(默认) / official-passthrough
+    ├── main.rs              入口判定:启动器 / --version / serve(默认) / official-passthrough
+    ├── launcher.rs          安装版启动器:状态探测、版本比对、登录 shell 环境白名单、脱离式拉起、提示
+    ├── service_log.rs       serve --log-file:日志落盘(0600)与进程内按大小轮转
     ├── control.rs           单进程装配:HTTP 路由、控制面 API、WebUI
     ├── profile.rs           用户配置:模式、渠道、四模型槽、静态目录生成
     ├── science.rs           Science daemon 控制器(启停/状态/登录链接)
@@ -30,6 +32,22 @@ desktop/gateway/
 ```
 
 配置与契约在 `catalog/`(JSON,编进二进制)。测试在 `test/`(三层门禁)。
+
+安装版的打包在仓库根的 `packaging/`,产物写到 `dist/`(不入库):
+
+```
+packaging/
+├── build_app.sh             构建 + 组装 .app + ad-hoc 签名 + 自检 + DMG
+├── Info.plist.in            Info.plist 模板(@VERSION@ / @MIN_MACOS@ 由构建脚本填)
+├── icon/
+│   ├── gen.py               按参数生成三张 SVG(图形的唯一来源)
+│   ├── AppIcon.svg          主稿(64 px 及以上)
+│   ├── AppIcon-small.svg    简化稿(16 / 32 px)
+│   ├── console-glyph.svg    控制台页眉 / 页签图标用的精简版(内联进 ui/index.html)
+│   ├── build_icon.sh        SVG → 十张 PNG → AppIcon.icns(需要 Google Chrome)
+│   └── AppIcon.icns         入库;应用构建只拷贝它
+└── brand/                   宣传图源文件
+```
 
 ## 约定
 

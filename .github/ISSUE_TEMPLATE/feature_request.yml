@@ -1,5 +1,5 @@
-name: 功能建议 / 想支持的 API
-description: 提想法，或希望支持的模型 / API / Skill / MCP
+name: 功能建议
+description: 提想法，或希望接入的模型供应商
 title: "[Feature] "
 labels: ["enhancement"]
 body:
@@ -7,7 +7,9 @@ body:
     id: idea
     attributes:
       label: 你希望的功能
-      placeholder: 例如：希望支持某个第三方 API（Kimi / 智谱 GLM / OpenRouter / 本地 Ollama…）、某个学科的 Skill 或 MCP。
+      placeholder: |
+        例如：希望接入某个提供 Anthropic 兼容端点的供应商（请附它的文档链接），
+        或控制台里缺少的某个操作。目前支持的是官方 Claude、Kimi、DeepSeek。
     validations:
       required: true
   - type: textarea
