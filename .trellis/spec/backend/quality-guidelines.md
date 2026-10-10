@@ -369,9 +369,15 @@ sandbox::start(base_url, web_search) → forge(幂等三态) → SSH/gh 桥接 �
 claude-science serve --data-dir <沙箱> [--config <镜像>] --host 127.0.0.1 --port 8790 --sandbox-port 8791
   --no-browser --no-auto-update --detached
   镜像: source = <沙箱 data-dir>/config.toml(只读)  mirror = ~/.csswitch/science-config/sandbox.toml
-  env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>  https_proxy=<网关快速失败>
+  env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>/sandbox  https_proxy=<网关>(快速失败,不带前缀)
        PATH=<沙箱>/bin:<继承>  GIT_CONFIG_COUNT/KEY_n/VALUE_n(本机装了 gh 时)
 sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护栏先行
+
+配置: service.v1.json 顶层 sandbox_mode = "kimi" | "deepseek"      # 与正式实例的 mode 互相独立
+路由: /sandbox/v1/messages | /sandbox/v1/models → Instance::Sandbox  # 前缀在路由处剥掉
+POST /control/sandbox/switch {"mode": "kimi"|"deepseek", "force"?: bool}
+  → {"ok", "mode", "mode_label", "changed", "sandbox_restarted"}
+GET  /control/status → 顶层 sandbox_mode / sandbox_mode_label
 ```
 
 ### 3. 合同
@@ -413,12 +419,38 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
     时不覆盖；继承的 PATH 不可用时不改 PATH（只剩包装目录会让 daemon 找不到系统命令）。
     启动日志记 `gh_bridge=on|off`。
 - token/key/钥匙串密码不进日志、不进控制面响应；`security` 命令输出全丢弃。
+- **沙箱的渠道与正式实例各选各的**（`Profile.sandbox_mode` 对 `Profile.mode`）：
+  - 网关靠沙箱 base_url 的路径前缀 `/sandbox` 认出沙箱的请求。前缀只定义一次
+    （`sandbox::INFERENCE_PREFIX`，沙箱环境与路由共用），只加在 `ANTHROPIC_BASE_URL` 上，
+    两个代理变量不加。正式实例的 base_url 不带路径，`science.rs` 不因此改动。依据是
+    Science 0.1.60 内置 SDK 以 `baseURL + path` 直接拼接（静态证据；真机见
+    `test/LIVE_ACCEPTANCE.md` §G）。
+  - `sandbox_mode` 永不为官方：沙箱是虚拟登录，官方直通对它只会 401。两个入口归一——
+    读配置（`Profile::parse`：键缺失或值为 `official` → 推导：`mode` 是渠道就取它，否则取
+    第一个配置完整的渠道，都不完整取 Kimi；推导值不在读入时回写）与切换（拒绝并说明原因）。
+    `handle_inference` 的官方直通只对「正式实例 + 官方模式」开放，沙箱一侧一律走
+    `GatewayConfig::for_channel(profile, mode)`，它对官方模式返回错误。
+  - 切换沙箱渠道的顺序固定，与联网搜索总开关同一套：解析 → 目标渠道 `validate()` →
+    纯函数判定 → 存盘并更新快照 → `stop` → `start`。一切拒绝都在存盘**之前**；重启失败
+    **不回滚**，报错写明渠道已保存、停在了哪一步。
+  - 沙箱只要在运行，切换就要先确认（未带 `force` → 拒绝）：路由按 `sandbox_mode` 每请求
+    生效，只存不重启会让运行中的沙箱立刻被改道，而它手里还是旧渠道的模型目录。沙箱没有
+    可靠的会话数（`status --data-dir` 的输出形状没有实测记录），所以不区分有没有会话。
+  - 启动沙箱只看 `sandbox_mode` 对应的渠道是否完整，与正式实例的模式无关。
+  - 状态接口里新增的键不得叫 `mode`：`serde_json` 开了 `preserve_order`，
+    `test/run_loopback.sh` 用贪婪正则取顶层 `"mode":"…"`，更靠后的同名键会被它取走。
+  - 请求日志条目带 `instance`（`official` / `sandbox`）；路径一栏是剥掉前缀之后的。
 
 ### 4. 校验与错误矩阵
 
 | 条件 | 要求行为 |
 | --- | --- |
-| 官方模式或渠道配置不完整时点启动 | 启动前拒绝，不拉起注定 401 的沙箱 |
+| 沙箱渠道配置不完整时点启动 | 启动前拒绝，报错点名渠道与缺项；不看正式实例的模式 |
+| 把沙箱渠道切成官方 | 拒绝并说明原因（虚拟登录，官方接口会拒绝它），不改任何状态 |
+| 切到配置不完整的渠道 | 拒绝，不改任何状态 |
+| 沙箱在运行、未带 `force` | 拒绝（文案含「沙箱正在运行」，控制台据此转确认框），配置与沙箱都不变 |
+| 切换后停止或启动沙箱失败 | 不回滚；原文报出，并写明渠道已保存、沙箱停在哪一步 |
+| 沙箱入口之外的 `/sandbox…` 路径 | 显式 404，不进推理层（`/sandbox`、`/sandbox/`、`/sandboxx/…`、叠两层前缀） |
 | 健康检查超时 / 钥匙串校验失败 | 先停 daemon 再报错，不带病运行 |
 | CLI 报 not running 但 lock pid 仍活 | 兜底 SIGTERM 仍要收口，不漏杀 |
 | blob 被判 free / 过期 / 结构损坏 | 不得复用，修复回 max 并沿用原 org |
@@ -436,6 +468,54 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
 - gh 桥接：包装脚本行为级校验（假 gh 在沙箱 HOME 下被执行时看到的是真实 HOME、参数原样
   透传、临时文件已改名）；查找本机 gh 时跳过沙箱 bin 与不可执行文件；环境注入的 PATH 前置
   与 git 凭据「先清空再指向 gh」两对都钉住；已有 `GIT_CONFIG_COUNT` / PATH 缺失两个负例。
+- 独立渠道：
+  - 路由函数：四条推理路径（含 query，前缀被剥、query 保留）与近似路径
+    （`/sandbox`、`/sandbox/`、`/sandbox/v1/unknown`、`/sandboxx/…`、叠两层前缀、`//sandbox/…`）。
+  - `daemon_env`：base_url 带前缀，两个代理变量不带。
+  - 切换判定的四条分支，拒绝文案含「沙箱正在运行」；请求解析拒绝 `official`、未知模式、
+    非布尔 `force`。
+  - 启动前置检查要抽成函数来测（`sandbox_start_precheck`）：正式实例为官方而沙箱渠道完整 →
+    通过；沙箱渠道缺 Key → 报错点名渠道。检查内联在处理函数里时，把它改回看 `profile.mode`
+    没有任何测试会红（变异检查实测）。
+  - `Profile::parse` 的推导四例、显式值优先、手改成 `official` 被归一、存盘读回。
+  - `for_channel(profile, mode)` 取传入的模式，不读 `profile.mode`。
+  - loopback：两个入口的请求日志与本地合成的模型清单分别来自各自渠道；正式实例切到官方后
+    沙箱入口仍走渠道（这时不得向正式入口发推理请求，那会连到真实官方接口）；切换被拒后配置
+    逐字节不变；切换沙箱渠道不触发正式实例的 stop / serve；正式实例收到的 base_url 始终不带
+    路径。带 `force` 的重启路径不进 loopback：真实启动要调 `security`、占固定端口。
+
+### 6. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// 沙箱跟着全局模式走,与正式实例共用一个入口
+// env: ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+let cfg = GatewayConfig::for_channel(&profile)?; // 内部读 profile.mode
+
+// 切换时先存盘,再判断要不要确认:被拒绝时路由已经改了
+profile.sandbox_mode = mode;
+profile.save()?;
+if running && !force {
+    return Err(sandbox_running_refusal());
+}
+```
+
+#### Correct
+
+```rust
+// env: ANTHROPIC_BASE_URL=http://127.0.0.1:8788/sandbox(代理变量仍是不带路径的网关地址)
+let mode = profile.mode_for(instance); // 沙箱 → sandbox_mode
+let cfg = GatewayConfig::for_channel(&profile, mode)?; // 官方直通只给「正式实例 + 官方模式」
+
+// 判定是纯函数,拒绝发生在存盘之前
+match plan_sandbox_switch(&profile.sandbox_mode, &mode, running, force) {
+    SandboxSwitch::NeedsConfirmation => return Err(sandbox_running_refusal()),
+    // ...
+}
+profile.sandbox_mode = mode;
+profile.save()?;
+```
 
 ---
 

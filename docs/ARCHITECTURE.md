@@ -3,7 +3,8 @@
 ## 一句话
 
 一个本地 Rust 服务进程,把用户自己的 Claude Science 实例的推理流量转到
-官方 Anthropic、Kimi 或 DeepSeek,并在必要处做窄补偿。
+官方 Anthropic、Kimi 或 DeepSeek,并在必要处做窄补偿。同一个进程还能拉起一个免登录沙箱
+(隔离的第二个 Science 实例),它自己选用 Kimi 或 DeepSeek,与正式实例互不影响。
 
 ## 进程与端口
 
@@ -15,16 +16,28 @@
 
 两条路起的是同一个 serve,它是唯一的常驻进程:
         监听 127.0.0.1:8788
-                /                 WebUI(内嵌 HTML,单文件)
-                /control/*        控制面 API(含 /control/quit 退出服务)
-                /v1/messages      推理
-                /v1/models        模型清单
-                其余              显式 404
+                /                     WebUI(内嵌 HTML,单文件)
+                /control/*            控制面 API(含 /control/quit 退出服务)
+                /v1/messages          正式实例的推理
+                /v1/models            正式实例的模型清单
+                /sandbox/v1/messages  免登录沙箱的推理
+                /sandbox/v1/models    免登录沙箱的模型清单
+                其余                  显式 404(含 /sandbox、/sandbox/v1/别的、/sandboxx/…)
 ```
 
 应用包里的 `CSSwitch` 与 `csswitch-gateway` 是同一个二进制,见下文「安装版与启动器」。
 
-Science daemon 由服务用 CLI 拉起,注入 `ANTHROPIC_BASE_URL=http://127.0.0.1:8788`。
+Science daemon 由服务用 CLI 拉起,两个实例拿到的 base_url 不同,网关就靠这一点分清请求来自谁:
+
+| 实例 | 注入的 `ANTHROPIC_BASE_URL` | 请求落在 | 按哪个模式路由 |
+| --- | --- | --- | --- |
+| 正式实例 | `http://127.0.0.1:8788` | `/v1/*` | `mode` |
+| 免登录沙箱 | `http://127.0.0.1:8788/sandbox` | `/sandbox/v1/*` | `sandbox_mode` |
+
+前缀只在服务层路由这一处剥离(query 保留),推理层看到的路径与实例无关;常量只定义一次
+(`sandbox::INFERENCE_PREFIX`),沙箱环境与路由共用。沙箱的 `https_proxy` / `HTTPS_PROXY`
+(外联快速失败)仍是不带路径的网关地址。详见下文「两个实例各选各的」。
+
 官方实例固定监听 `127.0.0.1:8686`(预览端口 8687),免登录沙箱监听 8790/8791。
 手动 `claude-science serve` 仍用 Science 自己的默认 8000,与经 CSSwitch 启动的地址不同。
 两者都绑 loopback。
@@ -49,6 +62,8 @@ Science daemon 由服务用 CLI 拉起,注入 `ANTHROPIC_BASE_URL=http://127.0.0
 切换立即生效)控制每条请求的明细:服务日志里的
 `POST /v1/messages relay …` / `relay stream|nonstream rules=…` / Web Search 桥接统计行,
 以及卡片里的请求列表。启动横幅、沙箱生命周期、警告与上游错误不受开关影响,始终输出。
+卡片里的每条请求带着它来自哪个实例、走了哪个渠道(`正式 · kimi` / `沙箱 · deepseek`);
+服务日志里的 relay 明细行不带实例,两个实例的请求路径在那里同为 `/v1/messages`。
 
 ## 安装版与启动器
 
@@ -133,7 +148,73 @@ CSSwitch.app/Contents/
 | Kimi | relay 契约 + Kimi 补偿链 | 由用户四槽配置本地合成 |
 | DeepSeek | deepseek 契约 + DeepSeek 补偿链 | 同上 |
 
-模式存在配置里,切换需重启 Science daemon(它只在启动时读 base_url)。
+模式是**每个实例各一个**,都存在配置里:正式实例是 `mode`(三种都可选),免登录沙箱是
+`sandbox_mode`(只有 Kimi / DeepSeek,没有官方)。上表对两个实例同样适用,沙箱的路径多一段
+`/sandbox` 前缀。渠道配置(地址 / API Key / 四槽)每个渠道一份,两个实例共用。
+切换正式实例的模式需重启 Science daemon(它只在启动时读 base_url)。
+
+## 两个实例各选各的
+
+正式实例与免登录沙箱各自选择渠道,互不影响:可以正式实例走官方、沙箱走 Kimi,也可以两边各用
+一个第三方渠道,或者选同一个。切换其中一个不改另一个的模式,也不重启另一个。
+
+**沙箱没有官方这一项。** 沙箱的登录是 CSSwitch 在隔离目录里铸造的虚拟登录,没有真实的 Claude
+凭证;官方模式是零改写直通、鉴权头原样透传,带着它去 `api.anthropic.com` 只会 401。把真实
+登录借给沙箱不在选项里(不读 OAuth token 与 Keychain)。这条约束在两个入口归一:
+
+- 读配置(`Profile::parse`):`sandbox_mode` 不存在或被手改成 `official` 时按下面的规则推导;
+- 切换(`POST /control/sandbox/switch`):目标是 `official` 时拒绝并说明原因。
+
+推理层里官方直通只对正式实例开放;沙箱的请求一律经 `GatewayConfig::for_channel` 装配渠道,
+它对官方模式返回错误,所以沙箱一侧不存在通往官方直通的路径。
+
+**旧配置没有 `sandbox_mode` 时**:正式实例的 `mode` 是 Kimi / DeepSeek 就沿用它(升级前沙箱
+本来就跟着它走);是官方时取第一个配置完整的渠道(Kimi → DeepSeek),都不完整取 Kimi。
+推导结果不立刻回写,之后任何一次存盘都会把它写出去。
+
+**启动沙箱**(`POST /control/sandbox/start`)只看 `sandbox_mode` 对应的渠道是否配置完整,
+不完整时报错点名渠道与缺项;正式实例处于什么模式与它无关。
+
+**切换沙箱渠道**(`POST /control/sandbox/switch`,请求体 `{"mode": "kimi" | "deepseek", "force"?: bool}`):
+
+```text
+解析(official / 未知模式 / 非布尔 force → 拒绝)
+  → 目标渠道配置完整性校验(不完整 → 拒绝,点名渠道)
+  → 判定:
+       目标 == 当前            不存盘、不重启
+       沙箱没在运行            只存盘,下次启动沙箱时生效
+       沙箱在运行、未带 force  拒绝(文案含「沙箱正在运行」,控制台据此弹确认框)
+       沙箱在运行、带 force    存盘 → 停止沙箱 → 启动沙箱
+```
+
+- 一切拒绝都发生在存盘**之前**:被拒绝、或用户在确认框里取消时,配置与沙箱都不变。
+- 沙箱在运行就必须重启:路由按 `sandbox_mode` 每请求生效,只存不重启会让运行中的沙箱立刻被
+  改道到新渠道,而它手里的模型目录还是旧渠道的。沙箱没有可靠的会话数可查,所以不区分有没有
+  会话 —— 只要在运行就先要确认。
+- 重启失败不回滚(回滚再重启可能循环),报错写明渠道已保存为哪一个、停在了哪一步。
+- 响应 `{"ok", "mode", "mode_label", "changed", "sandbox_restarted"}`;切换后不自动打开新标签页。
+
+**状态接口**在顶层报告 `sandbox_mode` / `sandbox_mode_label`。键不叫 `mode`、也不放进
+`sandbox` 对象:序列化保留写入顺序,而取顶层模式的脚本用的是贪婪匹配,任何更靠后的
+`"mode":"…"` 都会被它当成正式实例的模式。
+
+**两个渠道同时有流量是安全的**:渠道运行配置与模型缓存都是每请求新建,网关里没有按渠道共享的
+缓存或会话状态。
+
+**升级与回滚**:
+
+- 升级时仍在运行的旧沙箱带的是不含前缀的 base_url,它的请求落在正式实例的路由上,继续跟着
+  正式实例的模式走,与升级前相同;重启沙箱后才按 `sandbox_mode` 走。正常的升级路径
+  (控制台「退出服务」)本来就会先停掉沙箱。
+- 回滚到旧版本:旧二进制不认识 `sandbox_mode`,读入时忽略、下次存盘时丢掉,沙箱回到跟随
+  正式实例的模式。新版本启动的沙箱要重启一次 —— 旧网关对 `/sandbox/v1/*` 回 404。
+
+**证据边界**:「Science 把请求发到 `base_url + path`」来自对已安装的 0.1.60 二进制的只读静态
+检查(SDK 的 `buildURL` 是直接拼接),旧版 CSSwitch 也给过 Science 带路径的 base_url。
+离线门禁证明的是网关一侧:带前缀的两条路径按 `sandbox_mode` 路由、其余显式 404。真实 Science
+带着前缀跑通一轮推理属于真机验收([test/LIVE_ACCEPTANCE.md](../test/LIVE_ACCEPTANCE.md) §G),
+截至 2026-10-10 未执行。若真机发现 Science 不按带前缀的 base_url 发请求,备选是给沙箱开第二个
+监听端口:只动沙箱环境与路由两处,用户可见行为不变。
 
 ## 联网搜索总开关
 
@@ -188,6 +269,7 @@ Science 一侧要重启:`POST /control/web-search` 在官方实例运行时会�
 2026-08 实测:Science 经 base_url 只调这两个端点,登录 / 会话存储 / 内核 /
 Reviewer 都走 daemon 自身。所以没有第三类端点需要处理,其余一律显式 404 ——
 新版本 Science 若开始调别的端点,会立刻暴露而不是被静默兜底。
+免登录沙箱调的是同样两个端点,只是前面多一段 `/sandbox`;前缀下的其它路径同样显式 404。
 `csswitch-gateway official-passthrough --port N --log F` 是诊断子命令,
 catch-all 转发并记录脱敏端点清单,用于回归这个结论。
 
@@ -222,7 +304,8 @@ catch-all 转发并记录脱敏端点清单,用于回归这个结论。
 
 ## 配置
 
-`~/.csswitch/service.v1.json`(0600):模式、端口、两个渠道的 base_url / key / 四槽、
+`~/.csswitch/service.v1.json`(0600):`mode`(正式实例的模式)、`sandbox_mode`(免登录沙箱的
+渠道,`kimi` | `deepseek`)、端口、两个渠道的 base_url / key / 四槽(两个实例共用)、
 `request_log`(请求日志开关)、`web_search`(联网搜索总开关)。
 
 `~/.csswitch/science-config/`(0700,文件 0600):联网搜索关闭时交给 Science 的镜像配置,
