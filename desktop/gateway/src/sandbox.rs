@@ -13,6 +13,8 @@
 //!   实例的模式走。前缀只加在 base_url 上,快速失败代理仍是不带路径的网关地址;
 //!   模型类/凭证类环境变量一律清除(与真实实例共享 `science::MODEL_ENV_KEYS_TO_CLEAR`
 //!   同一份清单);
+//! - 沙箱不向 Anthropic 上报:daemon 环境带 `DO_NOT_TRACK=1`(Science 官方开关,关使用统计与
+//!   错误上报)。只加在沙箱一侧,真实实例的环境不因此多带任何变量;
 //! - 沙箱的渠道只会是 Kimi / DeepSeek,永不为官方:它的登录是这里铸造的虚拟登录,没有真实
 //!   Claude 凭证,官方接口必然拒绝(配置入口归一、切换入口拒绝,见 `profile.rs` /
 //!   `control.rs`);
@@ -58,6 +60,9 @@ const VIRTUAL_EMAIL: &str = "virtual@localhost.invalid";
 /// conda/pip 通道也直连:沙箱首次启动要下载内核/MCP 环境,经快速失败代理只会 404
 /// (E2E 实测 `Skeleton environment provisioning: 2/2 failed` 与 pypi.org 被拒)。
 const NO_PROXY_LIST: &str = "127.0.0.1,localhost,::1,pubmed.mcp.claude.com,hcls.mcp.claude.com,conda.anaconda.org,repo.anaconda.com,pypi.org,files.pythonhosted.org";
+/// Science 官方的遥测开关:关掉使用统计与错误上报。取值非空且不是 `0` / `false` 才算开启,
+/// 只在 daemon 启动时读。只给沙箱带:真实实例的遥测设置是用户自己的。
+const TELEMETRY_OPT_OUT_ENV: (&str, &str) = ("DO_NOT_TRACK", "1");
 const LOCK_FILE: &str = "operon.lock";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 /// 0.1.48 把 encryption keys 迁入 macOS Keychain 时用的 service 名(二进制内硬编码,
@@ -335,6 +340,12 @@ fn daemon_env(sandbox_home: &Path, proxy_base_url: &str) -> Vec<(String, String)
         ("HTTPS_PROXY".to_string(), fastfail),
         ("no_proxy".to_string(), NO_PROXY_LIST.to_string()),
         ("NO_PROXY".to_string(), NO_PROXY_LIST.to_string()),
+        // 沙箱的登录是铸造的,不以这个身份向 Anthropic 上报。错误上报的主机不在快速失败代理
+        // 拦截的域名里(`connect::is_blocked_host` 只认 Anthropic / Claude 域名),所以从源头关。
+        (
+            TELEMETRY_OPT_OUT_ENV.0.to_string(),
+            TELEMETRY_OPT_OUT_ENV.1.to_string(),
+        ),
     ]
 }
 
@@ -849,6 +860,18 @@ mod tests {
         // 模型/凭证类变量不在注入清单里(它们走 env_remove 清除,清单与 science.rs 共享)。
         assert!(get("ANTHROPIC_MODEL").is_none());
         assert!(get("ANTHROPIC_API_KEY").is_none());
+    }
+
+    #[test]
+    fn daemon_env_opts_the_sandbox_out_of_telemetry() {
+        let env = daemon_env(Path::new("/tmp/sandbox/home"), "http://127.0.0.1:8788");
+        let value = env
+            .iter()
+            .find(|(key, _)| key == "DO_NOT_TRACK")
+            .map(|(_, value)| value.to_ascii_lowercase())
+            .expect("沙箱 daemon 必须带 DO_NOT_TRACK");
+        // Science 把空串、`0`、`false`(不分大小写)当作没设:写成这三个之一等于没关。
+        assert!(!matches!(value.as_str(), "" | "0" | "false"));
     }
 
     #[test]
