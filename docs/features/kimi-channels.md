@@ -174,8 +174,10 @@ Science 版本不认识 `enable_web_search` 时,声明仍会到达网关,仍在�
 
 2026-08-20 真机验收(渠道级开关,只覆盖网关一侧):用户在真实 Science + Kimi 渠道上实测通过,
 开关行为符合预期,未发现问题。上面那条历史回放形状不在该次取证范围内,仍按未验证记录。
-总开关的 Science 一侧(关闭后 Science 是否不再声明 typed `web_search`)**尚未真机验证**,
-判据在 `test/LIVE_ACCEPTANCE.md` §E。
+2026-10-10 真机验收(总开关,免登录沙箱 + Kimi `k3`,Science 0.1.60):关闭并重启沙箱后,
+Science 自己不再声明 typed `web_search`(relay 日志里没有摘除规则,也没有搜索工具);
+沙箱未重启时由网关摘除;重新开启并重启后搜索经桥恢复。官方模式与 DeepSeek 未测。
+逐项记录与判据在 `test/LIVE_ACCEPTANCE.md` §E。
 
 #### 当前净结果
 
