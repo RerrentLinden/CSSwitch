@@ -287,7 +287,11 @@ fn resolve_guarded(
 
 /// 在已通过护栏的 `resolved` 写一套虚拟登录。`prefer_org` 为 Some 则复用(修复时保住 org,
 /// 令旧对话 DB 仍挂得上),为 None 则新铸;account_uuid 每次写入都重新生成。
-fn write_login(resolved: &Path, email: &str, prefer_org: Option<String>) -> Result<ForgeResult, String> {
+fn write_login(
+    resolved: &Path,
+    email: &str,
+    prefer_org: Option<String>,
+) -> Result<ForgeResult, String> {
     std::fs::create_dir_all(resolved).map_err(|e| format!("建 auth_dir 失败:{e}"))?;
     chmod_best_effort(resolved, 0o700);
 
@@ -363,7 +367,9 @@ fn write_login(resolved: &Path, email: &str, prefer_org: Option<String>) -> Resu
         "tier_unmappable": false
     });
     let plaintext = serde_json::to_vec(&blob).map_err(|e| format!("序列化 blob 失败:{e}"))?;
-    let oauth_key = keys.get("OAUTH_ENCRYPTION_KEY").ok_or("缺 OAUTH_ENCRYPTION_KEY")?;
+    let oauth_key = keys
+        .get("OAUTH_ENCRYPTION_KEY")
+        .ok_or("缺 OAUTH_ENCRYPTION_KEY")?;
     let enc_body = encrypt_token_v2(&plaintext, oauth_key)?;
 
     // —— 写 .oauth-tokens/<sanitized>.enc;先清其它 .enc 保证唯一 ——
@@ -569,8 +575,7 @@ fn read_intact_login(resolved: &Path, email: &str) -> Option<ForgeResult> {
         .and_then(|v| v.as_str())
         .map(token_not_expired)
         .unwrap_or(false);
-    let subscription_ok =
-        blob.get("subscription_type").and_then(|v| v.as_str()) == Some("max");
+    let subscription_ok = blob.get("subscription_type").and_then(|v| v.as_str()) == Some("max");
     if blob_org != active_org
         || blob_email != email
         || !blob_email.ends_with("localhost.invalid")
@@ -1035,7 +1040,8 @@ mod tests {
         let token_org = read_active_org_uuid(&dir);
         std::fs::remove_file(dir.join("active-org.json")).unwrap();
 
-        let (created, action) = ensure_virtual_login_guarded(&dir, EMAIL, &dir, &fake_real).unwrap();
+        let (created, action) =
+            ensure_virtual_login_guarded(&dir, EMAIL, &dir, &fake_real).unwrap();
         assert_eq!(action, LoginAction::Created);
         assert_ne!(created.org_uuid, token_org, "不得从可解 token 借用组织身份");
         for d in [dir, fake_real] {

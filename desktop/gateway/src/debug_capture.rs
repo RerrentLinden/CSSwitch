@@ -124,7 +124,10 @@ mod tests {
 
     #[test]
     fn file_name_parts_cannot_escape_the_capture_dir() {
-        assert_eq!(sanitize("2026-09-16T08:26:50.073Z"), "2026-09-16T08_26_50.073Z");
+        assert_eq!(
+            sanitize("2026-09-16T08:26:50.073Z"),
+            "2026-09-16T08_26_50.073Z"
+        );
         assert_eq!(sanitize("../../etc/passwd"), ".._.._etc_passwd");
         assert_eq!(sanitize("kimi-for-coding"), "kimi-for-coding");
     }
