@@ -1,11 +1,16 @@
 //! 官方 Claude Science daemon 控制器。
 //!
 //! 用户自己安装的 Science、用户自己的默认 profile(`~/.claude-science`)、
-//! 用户自己的真实登录 —— CSSwitch 只在启动时注入 `ANTHROPIC_BASE_URL`
-//! 把推理指向本机网关,别的一概不碰。
+//! 用户自己的真实登录 —— CSSwitch 只在启动时注入:`ANTHROPIC_BASE_URL` 把推理指向
+//! 本机网关;联网搜索总开关关闭时再多带一份镜像配置(见下)。别的一概不碰,
+//! 对 `~/.claude-science/` 不写任何文件。
 //!
 //! 硬约束(经实测确认,违反会伤到用户的真实实例或改变它的行为):
-//! - 不传 `--data-dir` / `--config`:那会造出隔离实例,对话从此分家;
+//! - 不传 `--data-dir`:那会造出隔离实例,对话从此分家;
+//! - `--config` 只允许出现在联网搜索关闭态,且只指向 CSSwitch 生成的镜像
+//!   (`science_config.rs`:用户原配置 + `enable_web_search = false`)。`--config` 只换
+//!   配置文件、不换数据目录(2026-10-10 用 0.1.60 隔离实测);开关开启时不带它,
+//!   启动参数与没有这个开关时逐项相同;
 //! - 不传 `--no-auto-update`:官方实例必须保留自身的自动更新;
 //! - 端口固定为 [`OFFICIAL_PORT`] / [`OFFICIAL_SANDBOX_PORT`],不用 `0` 随机端口:
 //!   控制台地址必须稳定可收藏。不沿用 Science 默认的 8000/8001,那两个端口常被
@@ -13,7 +18,7 @@
 //!   与经 CSSwitch 启动的地址不同;
 //! - 不写、不读、不伪造任何 auth 状态。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
@@ -137,24 +142,32 @@ pub fn stop() -> Result<(), String> {
     }
 }
 
-/// 官方实例的 `serve` 参数。不带 --data-dir / --config / --no-auto-update:
-/// 见模块文档的硬约束;端口固定,理由同上。
-fn serve_args() -> Vec<String> {
-    vec![
-        "serve".into(),
-        "--port".into(),
+/// 官方实例的 `serve` 参数。永不带 --data-dir / --no-auto-update;`--config` 只在
+/// `mirror_config` 有值(联网搜索关闭态)时出现,见模块文档的硬约束。端口固定,理由同上。
+fn serve_args(mirror_config: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["serve".to_string()];
+    if let Some(config) = mirror_config {
+        args.push("--config".into());
+        args.push(config.display().to_string());
+    }
+    args.extend([
+        "--port".to_string(),
         OFFICIAL_PORT.to_string(),
-        "--sandbox-port".into(),
+        "--sandbox-port".to_string(),
         OFFICIAL_SANDBOX_PORT.to_string(),
-        "--detached".into(),
-        "--no-browser".into(),
-    ]
+        "--detached".to_string(),
+        "--no-browser".to_string(),
+    ]);
+    args
 }
 
-/// 以官方默认 profile 启动 daemon,仅注入 base_url。
-pub fn start(proxy_base_url: &str) -> Result<(), String> {
+/// 以官方默认 profile 启动 daemon:注入 base_url;`web_search` 为 `false`(联网搜索总开关
+/// 关闭)时再带上镜像配置。镜像生成失败(例如用户的 `config.toml` 无法解析)直接报错,
+/// 不启动 —— 不能让开关看起来生效而 Science 实际照旧。
+pub fn start(proxy_base_url: &str, web_search: bool) -> Result<(), String> {
     let bin = find_binary()?;
-    let args = serve_args();
+    let mirror_config = crate::science_config::official_launch_config(web_search)?;
+    let args = serve_args(mirror_config.as_deref());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(
         &bin,
@@ -202,18 +215,49 @@ mod tests {
 
     #[test]
     fn official_serve_args_pin_ports_and_never_isolate() {
-        let args = serve_args();
-        let pair = |flag: &str| {
-            args.iter()
-                .position(|arg| arg == flag)
-                .and_then(|index| args.get(index + 1))
-                .cloned()
-        };
-        assert_eq!(pair("--port").as_deref(), Some("8686"));
-        assert_eq!(pair("--sandbox-port").as_deref(), Some("8687"));
-        // 回归:这三个参数任何一个出现,都会伤到用户的真实实例。
-        for forbidden in ["--data-dir", "--config", "--no-auto-update"] {
-            assert!(!args.iter().any(|arg| arg == forbidden), "{forbidden} 不得出现");
+        // 开启态:与引入联网搜索总开关之前逐项相同。这份字面量就是那时的参数向量,
+        // 多一项少一项都意味着用户的官方实例被换了一种方式启动。
+        let enabled = serve_args(None);
+        assert_eq!(
+            enabled,
+            [
+                "serve",
+                "--port",
+                "8686",
+                "--sandbox-port",
+                "8687",
+                "--detached",
+                "--no-browser"
+            ]
+        );
+
+        // 关闭态:只多出一对 `--config <镜像>`,其余原样。
+        let mirror = Path::new("/home/u/.csswitch/science-config/official.toml");
+        let disabled = serve_args(Some(mirror));
+        assert_eq!(disabled[0], "serve", "子命令必须在最前");
+        let flags: Vec<usize> = disabled
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (arg == "--config").then_some(index))
+            .collect();
+        assert_eq!(flags.len(), 1, "--config 恰好出现一次:{disabled:?}");
+        assert_eq!(
+            disabled[flags[0] + 1],
+            mirror.display().to_string(),
+            "--config 只指向 CSSwitch 生成的镜像"
+        );
+        let mut rest = disabled.clone();
+        rest.drain(flags[0]..=flags[0] + 1);
+        assert_eq!(rest, enabled, "去掉这一对之后与开启态逐项相同");
+
+        // 回归:这两个参数任何一个出现,都会伤到用户的真实实例。
+        for args in [&enabled, &disabled] {
+            for forbidden in ["--data-dir", "--no-auto-update"] {
+                assert!(
+                    !args.iter().any(|arg| arg == forbidden),
+                    "{forbidden} 不得出现"
+                );
+            }
         }
     }
 

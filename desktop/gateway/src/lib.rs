@@ -16,6 +16,7 @@ pub(crate) mod provider_contracts;
 pub mod sandbox;
 pub(crate) mod sandbox_forge;
 pub mod science;
+pub mod science_config;
 pub mod server;
 pub mod static_profile;
 

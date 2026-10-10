@@ -105,6 +105,17 @@
       <button class="act" id="btn-open">打开 Science</button>
       <button class="act" id="btn-quit" style="margin-left:auto">退出服务</button>
     </div>
+    <div class="field" style="margin:16px 0 0">
+      <label class="check">
+        <input type="checkbox" id="web-search">
+        <span>联网搜索</span>
+      </label>
+      <p class="hint" style="margin:6px 0 0">
+        关闭后,经 CSSwitch 启动的 Science 不再提供联网搜索(官方 / Kimi / DeepSeek 与免登录沙箱都适用),
+        Kimi 的 web_search 兼容桥同时断开。开启时沿用 Science 自己的配置,CSSwitch 不干预。
+        切换会重启正在运行的 Science;免登录沙箱不会自动重启,需要手动重启后生效。
+      </p>
+    </div>
     <div class="msg" id="mode-msg"></div>
   </section>
 
@@ -148,12 +159,6 @@
         默认模型必填;高质量、快速与 Fable 留空时自动继承默认模型。
         模型 ID 用于上游请求,显示名用于 Science 的模型菜单。
       </p>
-      <div class="field" id="web-search-field" hidden>
-        <label class="check">
-          <input type="checkbox" id="web-search">
-          <span>联网搜索(web_search 兼容桥)</span>
-        </label>
-      </div>
       <div class="row">
         <button type="submit" class="act primary">保存配置</button>
         <span class="sub">保存只更新配置;运行中的链路不变,下次切换或重启 Science 时生效。</span>
@@ -233,9 +238,6 @@ function renderSlots() {
   const config = state.channels[channel];
   $('base').value = config.base_url || '';
   $('key').placeholder = config.has_api_key ? '已保存,留空则保持不变' : '尚未配置';
-  // 只有 Kimi 有 web_search 兼容桥;别的渠道不渲染一个按不动的开关。
-  $('web-search-field').hidden = channel !== 'kimi';
-  $('web-search').checked = config.web_search !== false;
   $('slots').innerHTML = SLOTS.map((slot) => {
     const value = config[slot.key] || { model_id: '', display_name: '' };
     return `<fieldset>
@@ -289,10 +291,11 @@ async function refresh() {
   renderScience();
   renderSandbox();
   $('request-log').checked = state.request_log !== false;
+  $('web-search').checked = state.web_search !== false;
 }
 
-// 周期轮询只刷状态,不重绘配置表单:否则用户填到一半的地址、模型槽或还没保存的
-// 联网搜索开关会被无声覆盖回已保存值。
+// 周期轮询只刷状态,不重绘配置表单,也不给两个开关赋值:否则用户填到一半的地址、
+// 模型槽会被无声覆盖回已保存值,正在提交的开关会被弹回去。
 async function poll() {
   state = await api('status');
   renderModes();
@@ -336,7 +339,6 @@ $('tabs').onclick = (event) => {
 $('cfg').onsubmit = async (event) => {
   event.preventDefault();
   const payload = { channel, base_url: $('base').value, api_key: $('key').value };
-  if (channel === 'kimi') payload.web_search = $('web-search').checked;
   SLOTS.forEach((slot) => { payload[slot.key] = { model_id: '', display_name: '' }; });
   document.querySelectorAll('#slots input').forEach((input) => {
     payload[input.dataset.slot][input.dataset.part] = input.value.trim();
@@ -466,6 +468,62 @@ $('btn-quit').onclick = async () => {
     '<p class="sub">重新运行 <code>./csswitch</code> 即可再次启动。</p>');
   document.querySelector('.wrap').replaceChildren(card);
 };
+
+// 成功提示按响应逐项拼:Science、网关、沙箱三层的生效时机不同,每一句都只说已经成立的事。
+function webSearchNote(result) {
+  if (!result.changed) return '联网搜索设置没有变化。';
+  const on = result.web_search;
+  const parts = [on ? '已开启联网搜索。' : '已关闭联网搜索。'];
+  if (result.science_restarted) {
+    parts.push(on ? 'Science 已重启,沿用它自己的配置。' : 'Science 已带着关闭设置重启。');
+  } else {
+    parts.push('Science 未在运行,下次从这里启动时生效。');
+  }
+  parts.push(on
+    ? '网关一侧已生效:从下一次请求起不再摘除搜索声明,Kimi 的 web_search 兼容桥恢复。'
+    : '网关一侧已生效:Kimi / DeepSeek 的请求从下一次起不再带搜索声明,Kimi 的 web_search 兼容桥已断开。');
+  if (result.sandbox_restart_required) {
+    parts.push('免登录沙箱正在运行,需要重启沙箱后它那一侧才生效。');
+  }
+  return parts.join('');
+}
+
+// 改动即提交。失败时不猜结果:重启失败那一类错误发生在存盘之后,
+// 所以以服务端当前状态为准重新赋值,问不到才退回操作前的勾选。
+async function setWebSearch(enabled, force) {
+  const box = $('web-search');
+  box.disabled = true;
+  try {
+    const result = await api('web-search', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(force ? { enabled, force: true } : { enabled }),
+    });
+    box.checked = result.web_search;
+    if (result.science_restarted) scienceUrl = result.url || null;
+    msg($('mode-msg'), webSearchNote(result));
+    await poll().catch(() => {});
+  } catch (error) {
+    // 有会话在跑时服务会要求确认,而不是默默打断它们;此时服务端什么都没改。
+    if (!force && /会话正在进行/.test(error.message)) {
+      // await 是必需的:否则 finally 会在重试还没回来时就把复选框放开。
+      if (confirm(error.message + '\n\n仍要切换吗?')) return await setWebSearch(enabled, true);
+      box.checked = !enabled;
+      return;
+    }
+    try {
+      await poll();
+      box.checked = state.web_search !== false;
+    } catch (unreachable) {
+      box.checked = !enabled;
+    }
+    msg($('mode-msg'), '切换失败:' + error.message, 'err');
+  } finally {
+    box.disabled = false;
+  }
+}
+
+$('web-search').onchange = (event) => setWebSearch(event.target.checked);
 
 $('request-log').onchange = async (event) => {
   const enabled = event.target.checked;

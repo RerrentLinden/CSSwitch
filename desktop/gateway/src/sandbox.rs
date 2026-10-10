@@ -16,6 +16,9 @@
 //!   清空沙箱钥匙串旧条目——0.1.48 以 Keychain 为权威,不一致时把 file 回写成旧值
 //!   (research/science-0148-login-gate.md §2.2),不清则修复被回写吃掉形成死循环;
 //! - 兜底停止只杀「pid 来自沙箱 operon.lock 且命令行含精确 `--data-dir`」的进程;
+//! - `--config` 只在联网搜索总开关关闭态出现,且只指向 CSSwitch 生成的镜像
+//!   (`science_config.rs`:沙箱原配置 + `enable_web_search = false`)。它只换配置文件,
+//!   数据目录仍由 `--data-dir` 钉死;开关开启时启动参数与没有这个开关时逐项相同;
 //! - 刻意跨出隔离边界的动作只有两个桥接,都不把真实登录钥匙串挂进沙箱搜索表(真实实例的
 //!   Science 加密密钥也在里面):
 //!   - SSH 桥接:把真实 `~/.ssh` 的 `config`/`known_hosts` 两个非秘密文件 symlink 进沙箱
@@ -84,8 +87,11 @@ fn lock_path() -> PathBuf {
 /// 服务进程重启后仍能识别残留的沙箱 daemon;找不到二进制不影响状态判定。
 pub fn status() -> Value {
     let pid = sandbox_process_pid();
-    let version = read_lock()
-        .and_then(|lock| lock.get("version").and_then(Value::as_str).map(str::to_string));
+    let version = read_lock().and_then(|lock| {
+        lock.get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     json!({
         "initialized": sandbox_data_dir().is_dir(),
         "running": pid.is_some(),
@@ -95,11 +101,14 @@ pub fn status() -> Value {
     })
 }
 
-/// 一键启动:forge(幂等)→ SSH / gh 桥接 → 沙箱钥匙串就位 → 端口检查 → 拉起 daemon →
-/// 健康检查 → 钥匙串正向校验。桥接与钥匙串配置步骤失败仅警告(桥接缺失只影响 Compute 找
-/// 主机别名、沙箱读不到本机 gh 登录),其余任一步失败都显式报错;健康/校验不过会先停
-/// daemon 再报错。
-pub fn start(proxy_base_url: &str) -> Result<Value, String> {
+/// 一键启动:forge(幂等)→ SSH / gh 桥接 → 沙箱钥匙串就位 → 端口检查 → 镜像配置(仅
+/// 联网搜索关闭态)→ 拉起 daemon → 健康检查 → 钥匙串正向校验。桥接与钥匙串配置步骤失败
+/// 仅警告(桥接缺失只影响 Compute 找主机别名、沙箱读不到本机 gh 登录),其余任一步失败都
+/// 显式报错;健康/校验不过会先停 daemon 再报错。
+///
+/// `web_search` 是联网搜索总开关的当前值,由调用方传入。沙箱已在运行时原样返回,不重启:
+/// 开关的新值要等下一次启动才到沙箱一侧(网关一侧的摘除不依赖它)。
+pub fn start(proxy_base_url: &str, web_search: bool) -> Result<Value, String> {
     if sandbox_process_pid().is_some() {
         return Ok(json!({
             "ok": true,
@@ -111,7 +120,8 @@ pub fn start(proxy_base_url: &str) -> Result<Value, String> {
     let home = sandbox_home();
     let data_dir = sandbox_data_dir();
     // 1. 铸造/修复虚拟登录(三道护栏在写任何文件之前)。
-    let (_forge, action) = crate::sandbox_forge::ensure_virtual_login(&data_dir, VIRTUAL_EMAIL, &home)?;
+    let (_forge, action) =
+        crate::sandbox_forge::ensure_virtual_login(&data_dir, VIRTUAL_EMAIL, &home)?;
     chmod_best_effort(&sandbox_root(), 0o700);
     chmod_best_effort(&home, 0o700);
     // 1.5 SSH 桥接:让沙箱 Science 的 Compute 功能按 HOME 相对路径找得到主机别名/指纹。
@@ -129,6 +139,10 @@ pub fn start(proxy_base_url: &str) -> Result<Value, String> {
     // 3. 固定端口,占用即报错,不自动改绑。
     ensure_port_free(DAEMON_PORT)?;
     ensure_port_free(PREVIEW_PORT)?;
+    // 3.5 联网搜索关闭时生成镜像配置,生成不出来就不拉起。放在钥匙串清理之后:
+    //     forge 已重写登录而旧钥匙串条目还没清就中途退出,下次启动会判成 Reused
+    //     跳过清理,修复被 Keychain 回写吃掉。
+    let mirror_config = crate::science_config::sandbox_launch_config(web_search)?;
     // 4. 拉起隔离 daemon。沙箱与真实实例共享同一个二进制,自更新由真实实例负责,
     //    沙箱侧钉 `--no-auto-update` 避免它自己去碰更新通道。
     let mut env = daemon_env(&home, proxy_base_url);
@@ -139,7 +153,7 @@ pub fn start(proxy_base_url: &str) -> Result<Value, String> {
             std::env::var_os("GIT_CONFIG_COUNT").is_some(),
         ));
     }
-    let output = run_cli(&bin, &serve_args(&data_dir), &env)?;
+    let output = run_cli(&bin, &serve_args(&data_dir, mirror_config.as_deref()), &env)?;
     if !output.status.success() {
         return Err(format!(
             "启动沙箱 daemon 失败:{}",
@@ -158,7 +172,11 @@ pub fn start(proxy_base_url: &str) -> Result<Value, String> {
     }
     // 记录版本号便于事后归因(共享二进制会随真实实例自更新漂移)。
     let version = read_lock()
-        .and_then(|lock| lock.get("version").and_then(Value::as_str).map(str::to_string))
+        .and_then(|lock| {
+            lock.get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "unknown".into());
     crate::log_line!(
         "沙箱 daemon 已启动:port={DAEMON_PORT} version={version} login_action={} gh_bridge={}",
@@ -262,11 +280,19 @@ fn pin_cookie_host(url: &str) -> String {
 }
 
 // ---------- 启动组装(纯函数,供单测钉死) ----------
-fn serve_args(data_dir: &Path) -> Vec<String> {
-    vec![
+/// `mirror_config` 只在联网搜索关闭态有值,指向 `science_config.rs` 生成的镜像;
+/// `--config` 只换配置文件,数据目录仍由 `--data-dir` 决定。
+fn serve_args(data_dir: &Path, mirror_config: Option<&Path>) -> Vec<String> {
+    let mut args = vec![
         "serve".to_string(),
         "--data-dir".to_string(),
         data_dir.display().to_string(),
+    ];
+    if let Some(config) = mirror_config {
+        args.push("--config".to_string());
+        args.push(config.display().to_string());
+    }
+    args.extend([
         "--host".to_string(),
         "127.0.0.1".to_string(),
         "--port".to_string(),
@@ -276,7 +302,8 @@ fn serve_args(data_dir: &Path) -> Vec<String> {
         "--no-browser".to_string(),
         "--no-auto-update".to_string(),
         "--detached".to_string(),
-    ]
+    ]);
+    args
 }
 
 fn daemon_env(sandbox_home: &Path, proxy_base_url: &str) -> Vec<(String, String)> {
@@ -401,8 +428,7 @@ fn sandbox_bin_dir() -> PathBuf {
 fn ensure_gh_bridge() -> Option<PathBuf> {
     let bin_dir = sandbox_bin_dir();
     let wrapper = bin_dir.join("gh");
-    let real_gh = std::env::var_os("PATH")
-        .and_then(|path| find_executable("gh", &path, &bin_dir));
+    let real_gh = std::env::var_os("PATH").and_then(|path| find_executable("gh", &path, &bin_dir));
     let Some(real_gh) = real_gh else {
         let _ = std::fs::remove_file(&wrapper);
         return None;
@@ -474,7 +500,10 @@ fn gh_bridge_env(
     git_config_env_taken: bool,
 ) -> Vec<(String, String)> {
     let mut env = Vec::new();
-    let bin_dir = wrapper.parent().map(|dir| dir.display().to_string()).unwrap_or_default();
+    let bin_dir = wrapper
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
     match inherited_path.filter(|path| !path.is_empty()) {
         Some(path) => env.push(("PATH".to_string(), format!("{bin_dir}:{path}"))),
         None => crate::log_line!("警告:继承的 PATH 不可用,沙箱 gh 桥接只对 git 生效"),
@@ -483,11 +512,17 @@ fn gh_bridge_env(
         crate::log_line!("警告:环境里已有 GIT_CONFIG_COUNT,沙箱 git 不改用 gh 凭据");
         return env;
     }
-    let helper = format!("!{} auth git-credential", shell_quote(&wrapper.display().to_string()));
+    let helper = format!(
+        "!{} auth git-credential",
+        shell_quote(&wrapper.display().to_string())
+    );
     let mut index = 0;
     for host in ["https://github.com", "https://gist.github.com"] {
         for value in ["", helper.as_str()] {
-            env.push((format!("GIT_CONFIG_KEY_{index}"), format!("credential.{host}.helper")));
+            env.push((
+                format!("GIT_CONFIG_KEY_{index}"),
+                format!("credential.{host}.helper"),
+            ));
             env.push((format!("GIT_CONFIG_VALUE_{index}"), value.to_string()));
             index += 1;
         }
@@ -518,7 +553,8 @@ fn setup_sandbox_keychain() -> Result<(), String> {
             .map(|status| status.success())
             .unwrap_or(false)
     };
-    if !keychain.is_file() && !security(&["create-keychain", "-p", password.as_str(), path.as_str()])
+    if !keychain.is_file()
+        && !security(&["create-keychain", "-p", password.as_str(), path.as_str()])
     {
         crate::log_line!("警告:沙箱钥匙串创建失败(原始输出可能含路径,未记录)");
     }
@@ -567,7 +603,12 @@ fn purge_sandbox_keychain_entries() {
     let mut purged = 0_u32;
     for _ in 0..8 {
         let deleted = Command::new("security")
-            .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, path.as_str()])
+            .args([
+                "delete-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                path.as_str(),
+            ])
             .env("HOME", &home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -591,7 +632,12 @@ fn verify_keychain_isolation() -> Result<(), String> {
     // 迁入发生在 daemon 启动早期,健康就绪后短暂重试以吸收时序差。
     for _ in 0..10 {
         let found = Command::new("security")
-            .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, path.as_str()])
+            .args([
+                "find-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                path.as_str(),
+            ])
             .env("HOME", &home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -603,10 +649,12 @@ fn verify_keychain_isolation() -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    Err("沙箱钥匙串正向校验失败:未在沙箱钥匙串中找到 daemon 迁入的加密密钥,\
+    Err(
+        "沙箱钥匙串正向校验失败:未在沙箱钥匙串中找到 daemon 迁入的加密密钥,\
          已停止沙箱 daemon(防止密钥落入真实钥匙串)。\
          请把 daemon 版本与启动日志一并反馈。"
-        .into())
+            .into(),
+    )
 }
 
 // ---------- 进程探测 ----------
@@ -685,17 +733,57 @@ mod tests {
 
     #[test]
     fn serve_args_pin_the_sandbox_layout() {
+        // 开启态:与引入联网搜索总开关之前逐项相同(字面量就是那时的参数向量)。
         let data_dir = Path::new("/tmp/sandbox/home/.claude-science");
-        let args = serve_args(data_dir);
-        let joined = args.join(" ");
-        assert!(joined.contains("--data-dir /tmp/sandbox/home/.claude-science"));
-        assert!(joined.contains("--host 127.0.0.1"));
-        assert!(joined.contains("--port 8790"));
-        assert!(joined.contains("--sandbox-port 8791"));
-        assert!(joined.contains("--no-browser"));
-        assert!(joined.contains("--no-auto-update"));
-        assert!(joined.contains("--detached"));
-        assert!(!joined.contains("8765"), "绝不碰真实实例保留端口");
+        let enabled = serve_args(data_dir, None);
+        assert_eq!(
+            enabled,
+            [
+                "serve",
+                "--data-dir",
+                "/tmp/sandbox/home/.claude-science",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8790",
+                "--sandbox-port",
+                "8791",
+                "--no-browser",
+                "--no-auto-update",
+                "--detached"
+            ]
+        );
+        assert!(
+            !enabled.join(" ").contains("8765"),
+            "绝不碰真实实例保留端口"
+        );
+    }
+
+    #[test]
+    fn serve_args_add_only_the_mirror_config_when_web_search_is_off() {
+        let data_dir = Path::new("/tmp/sandbox/home/.claude-science");
+        let mirror = Path::new("/tmp/csswitch/science-config/sandbox.toml");
+        let disabled = serve_args(data_dir, Some(mirror));
+        let flags: Vec<usize> = disabled
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (arg == "--config").then_some(index))
+            .collect();
+        assert_eq!(flags.len(), 1, "--config 恰好出现一次:{disabled:?}");
+        assert_eq!(disabled[flags[0] + 1], mirror.display().to_string());
+        let mut rest = disabled.clone();
+        rest.drain(flags[0]..=flags[0] + 1);
+        assert_eq!(
+            rest,
+            serve_args(data_dir, None),
+            "去掉这一对之后与开启态逐项相同"
+        );
+        // 兜底停止与运行状态都靠命令行里的 `--data-dir <沙箱目录>` 认出沙箱 daemon:
+        // 多带一个 --config 之后它必须仍然被认出来,否则关着搜索的沙箱停不掉。
+        assert!(command_line_contains_data_dir(
+            &format!("/usr/local/bin/claude-science {}", disabled.join(" ")),
+            data_dir
+        ));
     }
 
     #[test]
@@ -727,11 +815,7 @@ mod tests {
     #[test]
     fn daemon_env_injects_home_base_url_and_fastfail_proxy() {
         let env = daemon_env(Path::new("/tmp/sandbox/home"), "http://127.0.0.1:8788");
-        let get = |key: &str| {
-            env.iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-        };
+        let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!(get("HOME"), Some("/tmp/sandbox/home"));
         assert_eq!(get("ANTHROPIC_BASE_URL"), Some("http://127.0.0.1:8788"));
         // 外联快速失败代理 = 网关自身(非推理路径显式 404)。
@@ -860,7 +944,10 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             format!("{}|auth token", real_home.display())
         );
-        assert!(!wrapper.with_extension("tmp").exists(), "临时文件必须被改名掉");
+        assert!(
+            !wrapper.with_extension("tmp").exists(),
+            "临时文件必须被改名掉"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -875,7 +962,10 @@ mod tests {
         std::fs::write(plain.join("gh"), "not executable").unwrap();
         write_exec(&tools.join("gh"), "#!/bin/sh\n");
         let path = std::env::join_paths([&sandbox_bin, &plain, &tools]).unwrap();
-        assert_eq!(find_executable("gh", &path, &sandbox_bin), Some(tools.join("gh")));
+        assert_eq!(
+            find_executable("gh", &path, &sandbox_bin),
+            Some(tools.join("gh"))
+        );
         let only_sandbox = std::env::join_paths([&sandbox_bin]).unwrap();
         assert_eq!(find_executable("gh", &only_sandbox, &sandbox_bin), None);
         let _ = std::fs::remove_dir_all(base);
@@ -892,7 +982,10 @@ mod tests {
             // 先清空(去掉沙箱 HOME 下无效的 osxkeychain),再指向 gh。
             assert_eq!(get(&format!("GIT_CONFIG_KEY_{index}")), Some(key.as_str()));
             assert_eq!(get(&format!("GIT_CONFIG_VALUE_{index}")), Some(""));
-            assert_eq!(get(&format!("GIT_CONFIG_KEY_{}", index + 1)), Some(key.as_str()));
+            assert_eq!(
+                get(&format!("GIT_CONFIG_KEY_{}", index + 1)),
+                Some(key.as_str())
+            );
             assert_eq!(
                 get(&format!("GIT_CONFIG_VALUE_{}", index + 1)),
                 Some("!'/sb/bin/gh' auth git-credential")
@@ -903,7 +996,10 @@ mod tests {
     #[test]
     fn gh_bridge_env_never_clobbers_existing_git_config_env_or_a_missing_path() {
         let env = gh_bridge_env(Path::new("/sb/bin/gh"), Some("/usr/bin"), true);
-        assert_eq!(env, vec![("PATH".to_string(), "/sb/bin:/usr/bin".to_string())]);
+        assert_eq!(
+            env,
+            vec![("PATH".to_string(), "/sb/bin:/usr/bin".to_string())]
+        );
         // PATH 不可用时不能只留包装目录,否则 daemon 找不到任何系统命令。
         let env = gh_bridge_env(Path::new("/sb/bin/gh"), None, false);
         assert!(env.iter().all(|(k, _)| k != "PATH"));
@@ -967,7 +1063,12 @@ mod tests {
             std::fs::read_to_string(sand.join("config")).unwrap(),
             "Host mine"
         );
-        assert!(sand.join("config").symlink_metadata().unwrap().file_type().is_file());
+        assert!(sand
+            .join("config")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_file());
         let _ = std::fs::remove_dir_all(base);
     }
 

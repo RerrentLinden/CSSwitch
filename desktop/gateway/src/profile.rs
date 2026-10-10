@@ -106,18 +106,6 @@ pub struct Channel {
     pub fast_model: ModelSlot,
     #[serde(default)]
     pub fable_model: ModelSlot,
-    /// 本渠道是否提供联网搜索。关闭后 Science 声明的 typed `web_search`
-    /// 会在网关请求入口被摘除,模型拿不到该工具,兼容桥也就不触发。
-    ///
-    /// **默认必须是 `true`**:`#[serde(default)]` 对 `bool` 给的是 `false`,
-    /// 而存量 `service.v1.json` 里没有这个字段,用它等于给所有老用户静默
-    /// 关掉联网搜索。
-    #[serde(default = "default_web_search")]
-    pub web_search: bool,
-}
-
-fn default_web_search() -> bool {
-    true
 }
 
 impl Channel {
@@ -135,7 +123,6 @@ impl Channel {
             quality_model: ModelSlot::new("k3", "Kimi K3"),
             fast_model: ModelSlot::new("kimi-for-coding", "Kimi K2.7"),
             fable_model: ModelSlot::default(),
-            web_search: default_web_search(),
         }
     }
 
@@ -147,7 +134,6 @@ impl Channel {
             quality_model: ModelSlot::default(),
             fast_model: ModelSlot::new("deepseek-v4-flash", "DeepSeek V4 Flash"),
             fable_model: ModelSlot::default(),
-            web_search: default_web_search(),
         }
     }
 
@@ -271,6 +257,14 @@ pub struct Profile {
     /// `service.v1.json` 没有这个键,直接用它等于升级后静默关掉日志。
     #[serde(default = "default_request_log")]
     pub request_log: bool,
+    /// 联网搜索总开关(全局,不分渠道)。`false` 时经 CSSwitch 启动的 Science 以
+    /// `enable_web_search = false` 运行,网关同时断开 web_search 桥。
+    ///
+    /// **默认必须是 `true`**:`bool` 的 serde 原生默认是 `false`,而存量
+    /// `service.v1.json` 没有这个键,直接用它等于升级后静默关掉联网搜索。
+    /// 存量文件里渠道级旧键的迁移见 [`Profile::parse`]。
+    #[serde(default = "default_web_search")]
+    pub web_search: bool,
 }
 
 fn default_port() -> u16 {
@@ -278,6 +272,10 @@ fn default_port() -> u16 {
 }
 
 fn default_request_log() -> bool {
+    true
+}
+
+fn default_web_search() -> bool {
     true
 }
 
@@ -289,6 +287,7 @@ impl Default for Profile {
             kimi: Channel::kimi_default(),
             deepseek: Channel::deepseek_default(),
             request_log: default_request_log(),
+            web_search: default_web_search(),
         }
     }
 }
@@ -315,7 +314,25 @@ impl Profile {
             return Self::default();
         };
         // 配置损坏时不猜测:回落到默认值,让用户在 WebUI 里重填。
-        serde_json::from_str(&text).unwrap_or_default()
+        Self::parse(&text).unwrap_or_default()
+    }
+
+    /// 解析 `service.v1.json` 的文本,并迁移旧的渠道级联网搜索开关。
+    ///
+    /// 旧版本把开关存在每个渠道里(`kimi.web_search`),界面只在 Kimi 页签暴露过它。
+    /// 迁移只有一条:顶层没有 `web_search` 且 `kimi.web_search == false` → 总开关为
+    /// `false`;其余一律按默认值读成开启。用户显式关掉的东西不能在升级后悄悄打开。
+    /// 顶层字段一旦存在就以它为准,不再回看旧键;旧键是未知字段,读入时被丢弃,
+    /// 下次保存不再写出。
+    pub fn parse(text: &str) -> Result<Self, serde_json::Error> {
+        let raw: Value = serde_json::from_str(text)?;
+        let disabled_in_legacy_kimi = raw.get("web_search").is_none()
+            && raw.pointer("/kimi/web_search") == Some(&Value::Bool(false));
+        let mut profile: Self = serde_json::from_value(raw)?;
+        if disabled_in_legacy_kimi {
+            profile.web_search = false;
+        }
+        Ok(profile)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -367,7 +384,6 @@ mod tests {
             quality_model: ModelSlot::default(),
             fast_model: ModelSlot::new("m-fast", "Fast"),
             fable_model: ModelSlot::default(),
-            web_search: true,
         };
         let catalog = channel.static_catalog("relay");
         let bindings = &catalog["role_bindings"];
@@ -414,37 +430,72 @@ mod tests {
         assert!(channel.validate().is_err(), "默认槽必填");
     }
 
-    #[test]
-    fn legacy_config_without_web_search_stays_enabled() {
-        // 存量 ~/.csswitch/service.v1.json 里没有这个字段。bool 的 serde 默认是
-        // false,直接用它等于给所有老用户静默关掉联网搜索 —— 这条测试钉死默认值。
-        let legacy = r#"{
+    /// 存量 `service.v1.json` 的形状:没有顶层 `web_search`,`kimi` 里按需带旧键。
+    fn legacy_config(kimi_extra: &str, top_extra: &str) -> String {
+        format!(
+            r#"{{
             "mode": "kimi",
             "port": 8788,
-            "kimi": {
+            "kimi": {{
                 "base_url": "https://api.kimi.com/coding",
                 "api_key": "k",
-                "default_model": {"model_id": "k3", "display_name": "Kimi K3"}
-            },
-            "deepseek": {
+                "default_model": {{"model_id": "k3", "display_name": "Kimi K3"}}{kimi_extra}
+            }},
+            "deepseek": {{
                 "base_url": "https://api.deepseek.com/anthropic",
                 "api_key": "k",
-                "default_model": {"model_id": "deepseek-v4-pro", "display_name": ""}
-            }
-        }"#;
-        let profile: Profile = serde_json::from_str(legacy).unwrap();
-        assert!(profile.kimi.web_search, "缺字段的老配置必须读成开启");
-        assert!(profile.deepseek.web_search, "缺字段的老配置必须读成开启");
+                "default_model": {{"model_id": "deepseek-v4-pro", "display_name": ""}}
+            }}{top_extra}
+        }}"#
+        )
     }
 
     #[test]
-    fn web_search_false_survives_a_serde_round_trip() {
-        let mut profile = Profile::default();
-        profile.kimi.web_search = false;
-        let text = serde_json::to_string(&profile).unwrap();
-        let restored: Profile = serde_json::from_str(&text).unwrap();
-        assert!(!restored.kimi.web_search, "关闭态必须能存盘并读回");
-        assert!(restored.deepseek.web_search, "另一渠道不受影响");
+    fn web_search_defaults_on_for_new_and_untouched_legacy_configs() {
+        // bool 的 serde 原生默认是 false:少写一个自定义默认值,所有没碰过开关的
+        // 老用户升级后就被静默关掉联网搜索。
+        assert!(Profile::default().web_search, "新配置默认开启");
+        let untouched = Profile::parse(&legacy_config("", "")).unwrap();
+        assert!(untouched.web_search, "没有任何开关字段的老配置读成开启");
+        let kept_on = Profile::parse(&legacy_config(r#", "web_search": true"#, "")).unwrap();
+        assert!(kept_on.web_search, "旧开关为开的老配置读成开启");
+    }
+
+    #[test]
+    fn legacy_kimi_switch_off_migrates_to_the_global_switch() {
+        // 用户在旧界面的 Kimi 页签关过搜索:升级后不能悄悄打开。
+        let migrated = Profile::parse(&legacy_config(r#", "web_search": false"#, "")).unwrap();
+        assert!(!migrated.web_search, "Kimi 关过 → 总开关为关");
+
+        // 保存后只剩顶层新字段;渠道级旧键不再写出,读回仍是关。
+        let saved = serde_json::to_value(&migrated).unwrap();
+        assert_eq!(saved["web_search"], json!(false));
+        for channel in ["kimi", "deepseek"] {
+            assert!(
+                saved[channel].get("web_search").is_none(),
+                "{channel} 不得再写出渠道级旧键:{saved}"
+            );
+        }
+        let reloaded = Profile::parse(&saved.to_string()).unwrap();
+        assert!(!reloaded.web_search, "关闭态必须能存盘并读回");
+    }
+
+    #[test]
+    fn top_level_web_search_wins_over_the_legacy_channel_key() {
+        // 顶层字段一旦存在就是唯一真相:用户在新界面重新打开之后,文件里就算还留着
+        // 旧键(例如手工编辑、从备份恢复),也不能把开关再迁回关闭。
+        let reopened = Profile::parse(&legacy_config(
+            r#", "web_search": false"#,
+            r#", "web_search": true"#,
+        ))
+        .unwrap();
+        assert!(reopened.web_search, "顶层为开时不回看旧键");
+        let closed = Profile::parse(&legacy_config(
+            r#", "web_search": true"#,
+            r#", "web_search": false"#,
+        ))
+        .unwrap();
+        assert!(!closed.web_search, "顶层为关时同样以顶层为准");
     }
 
     #[test]

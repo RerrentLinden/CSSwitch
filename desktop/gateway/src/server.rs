@@ -170,7 +170,12 @@ fn report_upstream_failure(
     crate::log_line!("{}", messages::upstream_failure_metadata(operation, error));
     crate::debug_capture::write(
         "error.txt",
-        format!("{}\n{}", messages::upstream_failure_metadata(operation, error), error.detail).as_bytes(),
+        format!(
+            "{}\n{}",
+            messages::upstream_failure_metadata(operation, error),
+            error.detail
+        )
+        .as_bytes(),
     );
     api_error_json(stream, error.status, &error.detail);
 }
@@ -1604,15 +1609,13 @@ mod tests {
         stream_strip_rules, strip_stats_suffix, StreamTermination,
     };
 
-    #[test]
-    fn disabled_channel_web_search_never_reaches_upstream() {
-        // 只测 strip 函数证明不了 `cfg.web_search` 真的被读到了 —— 本仓库刚被
-        // 一个恒假的门控谓词坑过(整条主路径成死代码而单测仍绿)。这条测试从
-        // handle_messages 一路打到 fake 上游,看真正发出去的报文。
-        //
-        // 断言落在"上游收到的 tools 只有 Bash"这一条上,它同时排除两种失败:
-        // 摘除没生效(会看到 typed web_search),以及桥仍然触发(会看到桥的私有
-        // 查询工具 —— 它同样叫 web_search)。
+    /// 从 `handle_messages` 一路打到 fake 上游,返回上游真正收到的 `tools`。
+    /// 请求声明了 typed `web_search` 与一个普通客户端工具 `Bash`。
+    fn upstream_tools_for_search_request(
+        adapter: &str,
+        contract_id: &str,
+        web_search: bool,
+    ) -> Vec<Value> {
         let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let upstream_url = format!("http://{}/v1/messages", upstream.local_addr().unwrap());
         let (requests_tx, requests_rx) = mpsc::channel();
@@ -1622,7 +1625,7 @@ mod tests {
             write_http_json(
                 &mut stream,
                 &json!({
-                    "id": "main", "type": "message", "role": "assistant", "model": "k3",
+                    "id": "main", "type": "message", "role": "assistant", "model": "m",
                     "content": [{"type": "text", "text": "我这边没有联网检索能力。"}],
                     "stop_reason": "end_turn", "stop_sequence": null,
                     "usage": {"input_tokens": 3, "output_tokens": 4}
@@ -1633,30 +1636,30 @@ mod tests {
 
         let channel = crate::profile::Channel::from_defaults_for_test();
         let resolver = crate::static_profile::StaticProfileResolver::from_json(
-            &channel.static_catalog("relay").to_string(),
+            &channel.static_catalog(adapter).to_string(),
         )
         .unwrap();
         let contract = crate::provider_contracts::load_runtime_contract(
-            "relay",
-            Some("kimi-anthropic-relay"),
+            adapter,
+            Some(contract_id),
             Some(&crate::provider_contracts::catalog_digest()),
         )
         .unwrap();
         let cfg = crate::config::GatewayConfig {
-            provider: "relay".into(),
+            provider: adapter.into(),
             port: 0,
             auth_secret: None,
             api_key: Some("fake-key".into()),
             upstream_url,
             models_url: None,
-            relay_thinking: None,
+            relay_thinking: crate::config::resolve_relay_thinking(None, &contract.thinking_policy),
             provider_contract: Some(contract),
             intent: crate::config::GatewayIntent::Formal,
             static_model_resolver: Some(resolver),
             shim_mode: "off".into(),
             launch_id: "web-search-toggle-test".into(),
-            // 用户在控制台把这条渠道的联网搜索关掉了。
-            web_search: false,
+            // 联网搜索总开关的当前值。
+            web_search,
         };
 
         let body = serde_json::to_vec(&json!({
@@ -1690,16 +1693,53 @@ mod tests {
         drop(downstream);
         let response = String::from_utf8(client.join().unwrap()).unwrap();
         upstream_thread.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "回答仍要正常送达");
 
-        let upstream_request = requests_rx.recv().unwrap();
-        let tools = upstream_request["tools"].as_array().unwrap();
+        requests_rx.recv().unwrap()["tools"]
+            .as_array()
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn disabled_channel_web_search_never_reaches_upstream() {
+        // 只测 strip 函数证明不了 `cfg.web_search` 真的被读到了 —— 本仓库刚被
+        // 一个恒假的门控谓词坑过(整条主路径成死代码而单测仍绿)。这条测试从
+        // handle_messages 一路打到 fake 上游,看真正发出去的报文。
+        //
+        // 断言落在"上游收到的 tools 只有 Bash"这一条上,它同时排除两种失败:
+        // 摘除没生效(会看到 typed web_search),以及桥仍然触发(会看到桥的私有
+        // 查询工具 —— 它同样叫 web_search)。
+        let tools = upstream_tools_for_search_request("relay", "kimi-anthropic-relay", false);
         assert_eq!(
             tools.len(),
             1,
             "关闭态下上游只应看到普通客户端工具,实际收到 {tools:?}"
         );
         assert_eq!(tools[0]["name"], "Bash");
-        assert!(response.starts_with("HTTP/1.1 200"), "回答仍要正常送达");
+    }
+
+    #[test]
+    fn disabled_web_search_is_stripped_for_deepseek_too() {
+        // 联网搜索总开关是全局的。DeepSeek 平时会把 typed web_search 原样留给上游
+        // 原生执行,关闭态的摘除一旦被收窄成「只对 Kimi」,DeepSeek 就会在开关关着的
+        // 时候照常搜索。先用开启态确认这条请求在 DeepSeek 上确实会带着搜索声明出去,
+        // 关闭态的差异才说明问题。
+        let enabled = upstream_tools_for_search_request("deepseek", "deepseek-native", true);
+        assert!(
+            enabled
+                .iter()
+                .any(|tool| tool["type"] == "web_search_20250305"),
+            "开启态 DeepSeek 上游应收到 typed web_search,实际收到 {enabled:?}"
+        );
+
+        let disabled = upstream_tools_for_search_request("deepseek", "deepseek-native", false);
+        assert_eq!(
+            disabled.len(),
+            1,
+            "关闭态下上游只应看到普通客户端工具,实际收到 {disabled:?}"
+        );
+        assert_eq!(disabled[0]["name"], "Bash");
     }
 
     #[test]

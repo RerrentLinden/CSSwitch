@@ -18,8 +18,9 @@ pub struct GatewayConfig {
     /// Opaque per-spawn identity supplied by the process manager.
     /// Standalone invocations may leave it empty, but managed launches always set it.
     pub launch_id: String,
-    /// 激活渠道是否提供联网搜索。`false` 时 typed `web_search` 在 relay 请求
-    /// 入口就被摘除,整条补偿链一致地按「本轮没有搜索声明」处理。
+    /// 联网搜索总开关(全局,不分渠道)。`false` 时 typed `web_search` 在 relay 请求
+    /// 入口就被摘除,整条补偿链一致地按「本轮没有搜索声明」处理,Kimi 的兼容桥也就
+    /// 不触发。这一层不依赖 Science 是否已经带着关闭设置重启。
     /// 只有单进程服务会把它置为 `false`(用户在控制台里关);standalone 网关
     /// 没有用户配置文件,恒为 `true`,不接受环境变量 override。
     pub web_search: bool,
@@ -178,7 +179,7 @@ impl GatewayConfig {
             static_model_resolver: Some(resolver),
             shim_mode: "off".to_string(),
             launch_id: String::new(),
-            web_search: channel.web_search,
+            web_search: profile.web_search,
         })
     }
 
