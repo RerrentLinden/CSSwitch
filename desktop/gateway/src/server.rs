@@ -1504,14 +1504,20 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// 单进程服务的推理入口:按当前激活模式路由。
+/// 单进程服务的推理入口:按发来请求的那个实例自己的模式路由。
 /// 官方模式整条透传官方上游;渠道模式按契约装配一次性 GatewayConfig 走补偿链。
+///
+/// `instance` 由服务层按请求路径认出(`control.rs` 的路由),`target` 到这里已经不带
+/// 沙箱前缀。官方直通只对正式实例开放:沙箱用的是 CSSwitch 铸造的虚拟登录,鉴权头
+/// 原样透传到 `api.anthropic.com` 只会 401。沙箱的请求一律走渠道装配;它的模式万一是
+/// 官方(配置入口已归一,正常到不了),得到的是一个明确的渠道配置错误。
 pub fn handle_inference(
     stream: &mut TcpStream,
     method: &str,
     target: &str,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    instance: crate::profile::Instance,
     state: &Arc<crate::control::AppState>,
 ) {
     let timer = crate::control::Timer::start();
@@ -1520,9 +1526,10 @@ pub fn handle_inference(
         .read()
         .map(|profile| profile.clone())
         .unwrap_or_default();
+    let mode = profile.mode_for(instance);
     let path = dequery(target);
 
-    if profile.mode == crate::profile::Mode::Official {
+    if instance == crate::profile::Instance::Official && *mode == crate::profile::Mode::Official {
         let outcome = crate::official_passthrough::forward(
             stream,
             method,
@@ -1534,6 +1541,7 @@ pub fn handle_inference(
         state.record_request(crate::control::log_entry(
             "inference",
             json!({
+                "instance": instance.as_str(),
                 "mode": "official",
                 "method": method,
                 "path": path,
@@ -1545,12 +1553,17 @@ pub fn handle_inference(
         return;
     }
 
-    let cfg = match crate::config::GatewayConfig::for_channel(&profile) {
+    let cfg = match crate::config::GatewayConfig::for_channel(&profile, mode) {
         Ok(cfg) => cfg,
         Err(error) => {
             state.record(crate::control::log_entry(
                 "inference",
-                json!({"mode": profile.mode.as_str(), "path": path, "error": error.clone()}),
+                json!({
+                    "instance": instance.as_str(),
+                    "mode": mode.as_str(),
+                    "path": path,
+                    "error": error.clone(),
+                }),
             ));
             api_error_json(stream, 502, &error);
             return;
@@ -1585,7 +1598,8 @@ pub fn handle_inference(
     state.record_request(crate::control::log_entry(
         "inference",
         json!({
-            "mode": profile.mode.as_str(),
+            "instance": instance.as_str(),
+            "mode": mode.as_str(),
             "method": method,
             "path": path,
             "ms": timer.elapsed_ms(),

@@ -4,7 +4,8 @@
 //! schema 当成自己的旧版本配置去迁移,结果是它把自己的 provider 列表清空。
 //! 实测踩过一次,不要合并这两个文件。
 //!
-//! 保存激活模式与各渠道的连接配置。模型配置沿用桌面端的四槽语义:
+//! 保存两个实例各自的模式(正式实例 `mode`、免登录沙箱 `sandbox_mode`)与各渠道的
+//! 连接配置;渠道配置每个渠道一份,两个实例共用。模型配置沿用桌面端的四槽语义:
 //! 默认槽必填,高质量/快速/Fable 留空自动继承默认槽;每槽可分别设置
 //! 上游模型 ID 与显示名(显示名进 Science 的模型菜单)。
 
@@ -14,7 +15,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// 激活模式。官方模式直通 api.anthropic.com,渠道模式走对应契约的补偿链。
+/// 一个实例的模式。官方模式直通 api.anthropic.com(只有正式实例可用),
+/// 渠道模式走对应契约的补偿链。
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
@@ -56,6 +58,26 @@ impl Mode {
             Mode::Official => "官方 Claude",
             Mode::Kimi => "Kimi",
             Mode::Deepseek => "DeepSeek",
+        }
+    }
+}
+
+/// 推理请求来自哪个 Science 实例。两个实例各有自己的模式(见 [`Profile::mode_for`]),
+/// 网关按请求路径认出实例:沙箱的 base_url 多带一段前缀
+/// (`sandbox::INFERENCE_PREFIX`)。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Instance {
+    /// 用户自己登录的官方实例。
+    Official,
+    /// 免登录沙箱。
+    Sandbox,
+}
+
+impl Instance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Instance::Official => "official",
+            Instance::Sandbox => "sandbox",
         }
     }
 }
@@ -244,8 +266,14 @@ fn selector_id(model_id: &str) -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
+    /// 正式实例(用户自己登录的 Science)的模式。
     #[serde(default)]
     pub mode: Mode,
+    /// 免登录沙箱的渠道,与 `mode` 互不影响。只会是 Kimi / DeepSeek:沙箱用的是
+    /// CSSwitch 铸造的虚拟登录,没有真实 Claude 凭证,官方接口必然拒绝它。
+    /// 存量文件没有这个键、或被手改成 `official` 时的取值见 [`Profile::parse`]。
+    #[serde(default = "default_sandbox_mode")]
+    pub sandbox_mode: Mode,
     #[serde(default = "default_port")]
     pub port: u16,
     pub kimi: Channel,
@@ -267,6 +295,10 @@ pub struct Profile {
     pub web_search: bool,
 }
 
+fn default_sandbox_mode() -> Mode {
+    Mode::Kimi
+}
+
 fn default_port() -> u16 {
     8788
 }
@@ -283,6 +315,7 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             mode: Mode::Official,
+            sandbox_mode: default_sandbox_mode(),
             port: default_port(),
             kimi: Channel::kimi_default(),
             deepseek: Channel::deepseek_default(),
@@ -309,6 +342,14 @@ impl Profile {
         }
     }
 
+    /// 这个实例的推理走哪个模式。
+    pub fn mode_for(&self, instance: Instance) -> &Mode {
+        match instance {
+            Instance::Official => &self.mode,
+            Instance::Sandbox => &self.sandbox_mode,
+        }
+    }
+
     pub fn load() -> Self {
         let Ok(text) = std::fs::read_to_string(config_path()) else {
             return Self::default();
@@ -317,22 +358,48 @@ impl Profile {
         Self::parse(&text).unwrap_or_default()
     }
 
-    /// 解析 `service.v1.json` 的文本,并迁移旧的渠道级联网搜索开关。
+    /// 解析 `service.v1.json` 的文本,迁移旧的渠道级联网搜索开关,并补出沙箱渠道。
     ///
-    /// 旧版本把开关存在每个渠道里(`kimi.web_search`),界面只在 Kimi 页签暴露过它。
-    /// 迁移只有一条:顶层没有 `web_search` 且 `kimi.web_search == false` → 总开关为
+    /// **联网搜索**:旧版本把开关存在每个渠道里(`kimi.web_search`),界面只在 Kimi 页签
+    /// 暴露过它。迁移只有一条:顶层没有 `web_search` 且 `kimi.web_search == false` → 总开关为
     /// `false`;其余一律按默认值读成开启。用户显式关掉的东西不能在升级后悄悄打开。
     /// 顶层字段一旦存在就以它为准,不再回看旧键;旧键是未知字段,读入时被丢弃,
     /// 下次保存不再写出。
+    ///
+    /// **沙箱渠道**:`sandbox_mode` 存在且是渠道 → 以它为准。键不存在(升级前的文件),
+    /// 或值是 `official`(只可能来自手改)→ 按 [`Profile::inferred_sandbox_mode`] 推导。
+    /// 推导结果不立刻回写;之后任何一次存盘都会把它写出去。
     pub fn parse(text: &str) -> Result<Self, serde_json::Error> {
         let raw: Value = serde_json::from_str(text)?;
         let disabled_in_legacy_kimi = raw.get("web_search").is_none()
             && raw.pointer("/kimi/web_search") == Some(&Value::Bool(false));
+        let sandbox_mode_missing = raw.get("sandbox_mode").is_none();
         let mut profile: Self = serde_json::from_value(raw)?;
         if disabled_in_legacy_kimi {
             profile.web_search = false;
         }
+        if sandbox_mode_missing || profile.sandbox_mode == Mode::Official {
+            profile.sandbox_mode = profile.inferred_sandbox_mode();
+        }
         Ok(profile)
+    }
+
+    /// 配置里没有可用的沙箱渠道时取哪个。
+    ///
+    /// 升级前沙箱跟着正式实例的模式走:它是渠道就沿用,升级前后效果一致。正式实例是官方时
+    /// 沙箱原本起不来,没有旧行为可保:取第一个配置完整的渠道(Kimi → DeepSeek),
+    /// 都不完整取 Kimi。固定取 Kimi 会让只配了 DeepSeek 的用户升级后指向一个没配的渠道。
+    fn inferred_sandbox_mode(&self) -> Mode {
+        if self.mode != Mode::Official {
+            return self.mode.clone();
+        }
+        [Mode::Kimi, Mode::Deepseek]
+            .into_iter()
+            .find(|mode| {
+                self.channel(mode)
+                    .is_some_and(|channel| channel.validate().is_ok())
+            })
+            .unwrap_or(Mode::Kimi)
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -496,6 +563,94 @@ mod tests {
         ))
         .unwrap();
         assert!(!closed.web_search, "顶层为关时同样以顶层为准");
+    }
+
+    /// 升级前的 `service.v1.json`:没有 `sandbox_mode`。两个渠道的 key 为空即「没配完整」;
+    /// `top_extra` 按需补上顶层键。
+    fn config_without_sandbox_mode(
+        mode: &str,
+        kimi_key: &str,
+        deepseek_key: &str,
+        top_extra: &str,
+    ) -> String {
+        format!(
+            r#"{{
+            "mode": "{mode}",
+            "kimi": {{
+                "base_url": "https://api.kimi.com/coding",
+                "api_key": "{kimi_key}",
+                "default_model": {{"model_id": "k3", "display_name": ""}}
+            }},
+            "deepseek": {{
+                "base_url": "https://api.deepseek.com/anthropic",
+                "api_key": "{deepseek_key}",
+                "default_model": {{"model_id": "deepseek-v4-pro", "display_name": ""}}
+            }}{top_extra}
+        }}"#
+        )
+    }
+
+    #[test]
+    fn configs_from_before_the_sandbox_channel_keep_the_sandbox_where_it_was() {
+        let sandbox_mode = |mode: &str, kimi_key: &str, deepseek_key: &str| {
+            Profile::parse(&config_without_sandbox_mode(
+                mode,
+                kimi_key,
+                deepseek_key,
+                "",
+            ))
+            .unwrap()
+            .sandbox_mode
+        };
+        // 升级前沙箱跟着正式实例走:它是渠道就沿用,升级前后是同一条链路。
+        // 两个渠道都配完整,所以这两条分不出来就说明取的不是正式实例的模式。
+        assert_eq!(sandbox_mode("kimi", "k", "k"), Mode::Kimi);
+        assert_eq!(sandbox_mode("deepseek", "k", "k"), Mode::Deepseek);
+        // 正式实例是官方(升级前沙箱起不来):取第一个配置完整的渠道。
+        // 只配了 DeepSeek 的用户不能在升级后被指到没配的 Kimi。
+        assert_eq!(sandbox_mode("official", "", "k"), Mode::Deepseek);
+        assert_eq!(sandbox_mode("official", "k", "k"), Mode::Kimi);
+        // 都不完整:Kimi。
+        assert_eq!(sandbox_mode("official", "", ""), Mode::Kimi);
+    }
+
+    #[test]
+    fn an_explicit_sandbox_channel_wins_and_is_never_official() {
+        // 配置里写了就以它为准:不回看正式实例的模式,也不看哪个渠道配置完整。
+        let explicit = Profile::parse(&config_without_sandbox_mode(
+            "kimi",
+            "k",
+            "",
+            r#", "sandbox_mode": "deepseek""#,
+        ))
+        .unwrap();
+        assert_eq!(explicit.sandbox_mode, Mode::Deepseek);
+        assert_eq!(explicit.mode, Mode::Kimi, "正式实例的模式不随沙箱渠道变");
+
+        // 手改成 official:沙箱没有真实登录,不能停在官方上 —— 按没有这个键来推导。
+        let hand_edited = Profile::parse(&config_without_sandbox_mode(
+            "official",
+            "",
+            "k",
+            r#", "sandbox_mode": "official""#,
+        ))
+        .unwrap();
+        assert_eq!(hand_edited.sandbox_mode, Mode::Deepseek);
+        assert_eq!(hand_edited.mode, Mode::Official);
+
+        // 存盘读回:两个实例各存各的。少写出这个键的话,读回时会被推导成正式实例的 Kimi。
+        let profile = Profile {
+            mode: Mode::Kimi,
+            sandbox_mode: Mode::Deepseek,
+            ..Profile::default()
+        };
+        let saved = serde_json::to_value(&profile).unwrap();
+        assert_eq!(saved["sandbox_mode"], json!("deepseek"));
+        let reloaded = Profile::parse(&saved.to_string()).unwrap();
+        assert_eq!(
+            (reloaded.mode, reloaded.sandbox_mode),
+            (Mode::Kimi, Mode::Deepseek)
+        );
     }
 
     #[test]

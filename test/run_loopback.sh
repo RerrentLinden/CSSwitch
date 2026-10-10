@@ -129,10 +129,40 @@ lacks() {
 web_search_state() {
   body "http://127.0.0.1:$PORT/control/status" | sed -nE 's/.*"web_search":(true|false).*/\1/p'
 }
+# 状态接口顶层的两个模式:正式实例的 mode,免登录沙箱的 sandbox_mode。
+# 取 mode 的匹配是贪婪的,会取到最靠后的一个 "mode":"…" —— 沙箱那个键因此不叫 mode。
+official_mode() {
+  body "http://127.0.0.1:$PORT/control/status" | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p'
+}
+sandbox_mode() {
+  body "http://127.0.0.1:$PORT/control/status" | sed -n 's/.*"sandbox_mode":"\([a-z]*\)".*/\1/p'
+}
+# 请求日志(/control/logs)里推理条目的条数。
+inference_log_count() {
+  body "http://127.0.0.1:$PORT/control/logs" | grep -o '"action":"inference"' | wc -l | tr -d ' '
+}
+# route_of <入口路径>:向该入口发一条推理请求,返回它留下的日志条目里的「实例 渠道」。
+# 上游是不存在的域名,请求必然失败,但条目照记。条目在响应写完之后才记入:按条数等它出现,
+# 没等到就返回空,不拿上一条请求的条目充数。取值只在最后一条的 detail 对象之内。
+route_of() {
+  local before detail
+  before="$(inference_log_count)"
+  body -X POST "http://127.0.0.1:$PORT$1" -H 'content-type: application/json' \
+    -d '{"model":"claude-opus-5","max_tokens":16,"stream":false,
+         "messages":[{"role":"user","content":"hi"}]}' >/dev/null
+  for _ in $(seq 1 25); do
+    [ "$(inference_log_count)" -gt "$before" ] && break
+    sleep 0.2
+  done
+  [ "$(inference_log_count)" -gt "$before" ] || return 0
+  detail="$(body "http://127.0.0.1:$PORT/control/logs" | sed -nE 's/.*"detail":\{([^{}]*)\}\}\]\}$/\1/p')"
+  echo "$(printf '%s' "$detail" | sed -nE 's/.*"instance":"([a-z]+)".*/\1/p')" \
+    "$(printf '%s' "$detail" | sed -nE 's/.*"mode":"([a-z]+)".*/\1/p')"
+}
 # 假 claude-science 收到的最后一次 serve,以及 stop / serve 的累计次数(判断有没有重启过)。
 last_serve() { grep '^serve' "$FAKE_SCI/calls.log" 2>/dev/null | tail -1; }
 restart_calls() { grep -cE '^(stop|serve)' "$FAKE_SCI/calls.log" 2>/dev/null; }
-# 向当前渠道发一条声明了 typed web_search 的推理请求,返回它留下的 relay 日志行。
+# 向正式入口(正式实例当前的渠道)发一条声明了 typed web_search 的推理请求,返回它留下的 relay 日志行。
 # 上游是不存在的域名,请求必然失败 —— 但规则行在联网之前就已写进 stderr。
 relay_line_for_search_request() {
   local before
@@ -168,6 +198,8 @@ check "状态接口的版本与 --version 一致" "$bin_version" \
 # 默认是官方模式。
 mode="$(body "http://127.0.0.1:$PORT/control/status" | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p')"
 check "默认官方模式" official "$mode"
+# 免登录沙箱有自己的渠道,默认 Kimi;它没有官方这一项。
+check "沙箱渠道默认 Kimi" kimi "$(sandbox_mode)"
 
 # 配置保存后:key 不回显、ready 变 true、文件权限 0600。
 saved="$(body -X POST "http://127.0.0.1:$PORT/control/config" \
@@ -207,13 +239,29 @@ case "$switch_bad" in
   *) echo "  FAIL 缺 key 的渠道竟然切换成功:$switch_bad"; fail=1 ;;
 esac
 
+# 免登录沙箱的渠道切换,拒绝都发生在存盘之前:配置文件逐字节不变。
+# 缺 key 的渠道:报错点名是哪个渠道、缺什么。
+SERVICE_JSON="$SANDBOX/.csswitch/service.v1.json"
+cp "$SERVICE_JSON" "$SANDBOX/service.before-sandbox-switch.json"
+sandbox_bad="$(post sandbox/switch '{"mode":"deepseek"}')"
+has "沙箱切到缺 key 的渠道被拒,报错点名渠道" "DeepSeek 渠道配置不完整" "$sandbox_bad"
+has "沙箱切到缺 key 的渠道被拒,报错说明缺什么" "缺少 API Key" "$sandbox_bad"
+# 官方 Claude:沙箱没有真实登录,不能选;报错说明原因。
+sandbox_official="$(post sandbox/switch '{"mode":"official"}')"
+has "沙箱切到官方被拒并说明原因" "虚拟登录" "$sandbox_official"
+check "两次被拒后沙箱渠道不变" kimi "$(sandbox_mode)"
+if cmp -s "$SERVICE_JSON" "$SANDBOX/service.before-sandbox-switch.json"; then
+  echo "  ok   两次被拒后配置文件逐字节不变"
+else
+  echo "  FAIL 沙箱渠道切换被拒后配置文件变了"; fail=1
+fi
+
 # ── 联网搜索总开关 ──────────────────────────────────────────────────────────
 # 一个全局开关驱动两层:Science 启动时带不带 `--config <镜像>`,以及网关桥不桥。
 # Science 自己的配置放在临时 HOME 里(服务只读它),镜像由服务写进临时 HOME 的 .csswitch。
 SCI_HOME="$SANDBOX/.claude-science"
 SCI_CONFIG="$SCI_HOME/config.toml"
 MIRROR="$SANDBOX/.csswitch/science-config/official.toml"
-SERVICE_JSON="$SANDBOX/.csswitch/service.v1.json"
 SERVE_ON="serve --port 8686 --sandbox-port 8687 --detached --no-browser"
 SERVE_OFF="serve --config $MIRROR --port 8686 --sandbox-port 8687 --detached --no-browser"
 mkdir -p "$SCI_HOME"
@@ -353,17 +401,97 @@ relay_line="$(relay_line_for_search_request)"
 has "重新开启后 Kimi 重新走兼容桥" "web-search.query-tool-adapter" "$relay_line"
 lacks "重新开启后不再摘除搜索声明" "tool.relay.web-search-disabled-by-config" "$relay_line"
 
+# ── 两个实例各用各的渠道 ────────────────────────────────────────────────────
+# 正式实例的请求落在 /v1/*,按 mode 路由;免登录沙箱的 base_url 多带 /sandbox,请求落在
+# /sandbox/v1/*,按 sandbox_mode 路由。此刻正式实例是 Kimi(假 Science 在运行),两个渠道
+# 都已配置,沙箱渠道还是默认的 Kimi,沙箱没在运行。
+
+# 沙箱没在运行时切换:只保存。正式实例的模式不变,它也没有收到 stop / serve。
+before_restarts="$(restart_calls)"
+sandbox_switched="$(post sandbox/switch '{"mode":"deepseek"}')"
+has "沙箱未运行时切换渠道:只保存,不重启" '"sandbox_restarted":false' "$sandbox_switched"
+check "沙箱渠道变成 DeepSeek,正式实例仍是 Kimi" "kimi deepseek" "$(official_mode) $(sandbox_mode)"
+check "切换沙箱渠道没有碰正式实例" "$before_restarts" "$(restart_calls)"
+
+# 同一个网关、同一时刻,两个入口各走各的渠道(沙箱入口带着 Science 实际会带的 query)。
+check "正式入口的请求记为 正式实例 + Kimi" "official kimi" "$(route_of /v1/messages)"
+check "沙箱入口的请求记为 沙箱 + DeepSeek" "sandbox deepseek" \
+  "$(route_of '/sandbox/v1/messages?beta=true')"
+# 日志之外的直接证据:模型清单由渠道的四槽配置在本地合成,不联网。
+# 两个入口给出的是两个渠道各自的模型,沙箱前缀也确实被剥掉了(否则这里是 404)。
+has "正式入口的模型清单来自 Kimi 的配置" '"display_name":"M2"' \
+  "$(body "http://127.0.0.1:$PORT/v1/models")"
+has "沙箱入口的模型清单来自 DeepSeek 的配置" '"display_name":"DeepSeek V4 Pro"' \
+  "$(body "http://127.0.0.1:$PORT/sandbox/v1/models")"
+
+# 前缀本身、前缀下的未知路径、只是长得像的路径:显式 404,而且根本没有进推理层
+# (进了就会多出日志条目)。这几条趁正式实例还是第三方渠道时测:万一被错当成正式入口,
+# 去的也只是不存在的域名。
+before_entries="$(inference_log_count)"
+check "沙箱前缀本身不是端点" 404 "$(code "http://127.0.0.1:$PORT/sandbox")"
+check "沙箱前缀下的未知路径显式 404" 404 "$(code "http://127.0.0.1:$PORT/sandbox/v1/unknown")"
+check "只是长得像沙箱前缀的路径显式 404" 404 \
+  "$(code -X POST "http://127.0.0.1:$PORT/sandboxx/v1/messages" -H 'content-type: application/json' -d '{}')"
+check "这些路径没有进入推理层" "$before_entries" "$(inference_log_count)"
+
+# 正式实例切到官方:沙箱的渠道不变,沙箱入口照旧走 DeepSeek,没有被直通官方。
+# 这一段只打带前缀的沙箱入口 —— 官方模式下正式入口的请求会被转发到真实的 api.anthropic.com。
+post switch '{"mode":"official"}' >/dev/null
+check "正式实例切到官方,沙箱渠道不变" "official deepseek" "$(official_mode) $(sandbox_mode)"
+check "正式实例是官方时,沙箱入口仍记为 沙箱 + DeepSeek" "sandbox deepseek" \
+  "$(route_of /sandbox/v1/messages)"
+has "正式实例是官方时,沙箱入口的模型清单仍来自 DeepSeek" '"display_name":"DeepSeek V4 Pro"' \
+  "$(body "http://127.0.0.1:$PORT/sandbox/v1/models")"
+post switch '{"mode":"kimi"}' >/dev/null
+check "正式实例切回 Kimi,沙箱渠道仍不变" "kimi deepseek" "$(official_mode) $(sandbox_mode)"
+# 上面两次切换都重启了(假的)正式实例:它每次拿到的 base_url 都是不带路径的网关地址,
+# 沙箱前缀没有漏到它那一侧。
+check "正式实例收到的 base_url 始终不带沙箱前缀" "http://127.0.0.1:$PORT" \
+  "$(sort -u "$FAKE_SCI/serve-base-url.log")"
+
+# 沙箱正在运行时切换渠道要先确认:不带 force 就拒绝,配置不变、沙箱不被重启。
+# 沙箱用一个命令行与真 daemon 同形的假进程模拟(argv[0] 以 claude-science 结尾 + serve +
+# 精确 --data-dir),pid 写进沙箱 lock。双层子 shell 让它脱离本脚本,被 launchd 及时回收
+# ——留成僵尸会被当成还活着。这个进程一直留到最后的「退出服务」一节。
+# 这一层永远不带 force 去切:确认后的重启会走真实的沙箱启动流程(security、固定端口)。
+SB_DATA="$SANDBOX/.csswitch/science-sandbox/home/.claude-science"
+mkdir -p "$SB_DATA"
+SB_PID="$( (exec -a "$FAKE_SCI/claude-science" /bin/bash -c 'while :; do sleep 1; done' \
+  serve --data-dir "$SB_DATA" >/dev/null 2>&1 &
+  echo $!) )"
+printf '{"pid":%s}' "$SB_PID" >"$SB_DATA/operon.lock"
+case "$(body "http://127.0.0.1:$PORT/control/status")" in
+  *'"sandbox":{'*'"running":true'*) echo "  ok   假沙箱 daemon 被识别为运行中" ;;
+  *) echo "  FAIL 假沙箱 daemon 未被识别,运行中切换与退出两个场景都不成立"; fail=1 ;;
+esac
+cp "$SERVICE_JSON" "$SANDBOX/service.before-sandbox-switch.json"
+sandbox_refused="$(post sandbox/switch '{"mode":"kimi"}')"
+has "沙箱运行中且未确认时拒绝切换渠道" "沙箱正在运行" "$sandbox_refused"
+if cmp -s "$SERVICE_JSON" "$SANDBOX/service.before-sandbox-switch.json"; then
+  echo "  ok   被拒绝后配置文件逐字节不变"
+else
+  echo "  FAIL 沙箱运行中切换被拒后配置文件变了"; fail=1
+fi
+check "被拒绝后沙箱渠道不变" deepseek "$(sandbox_mode)"
+if kill -0 "$SB_PID" 2>/dev/null; then
+  echo "  ok   被拒绝后沙箱进程仍在"
+else
+  echo "  FAIL 未经确认,沙箱进程就被停掉了"; fail=1
+fi
+
 # 存量配置的迁移(另起一个服务进程读一份旧格式的 service.v1.json):
 # 在旧界面的 Kimi 页签关过搜索 → 总开关读成关闭;保存后只剩顶层新字段。
+# 这份配置也没有沙箱渠道(sandbox_mode):正式实例是官方,只有 DeepSeek 配置完整,
+# 所以读出来是 DeepSeek —— 固定取 Kimi 的话,这个用户的沙箱会指向一个没配的渠道。
 LEGACY_HOME="$SANDBOX/legacy-home"
 LEGACY_JSON="$LEGACY_HOME/.csswitch/service.v1.json"
 LEGACY_PORT=$(( PORT + 1 ))
 mkdir -p "$LEGACY_HOME/.csswitch"
 cat >"$LEGACY_JSON" <<'EOF'
 {"mode":"official",
- "kimi":{"base_url":"https://api.example.invalid","api_key":"sk-legacy",
+ "kimi":{"base_url":"https://api.example.invalid","api_key":"",
          "default_model":{"model_id":"m1","display_name":"M1"},"web_search":false},
- "deepseek":{"base_url":"https://api.example.invalid","api_key":"",
+ "deepseek":{"base_url":"https://api.example.invalid","api_key":"sk-legacy",
              "default_model":{"model_id":"d1","display_name":""},"web_search":true}}
 EOF
 HOME="$LEGACY_HOME" CLAUDE_SCIENCE_BIN="$FAKE_SCI/claude-science" \
@@ -375,29 +503,26 @@ for _ in $(seq 1 40); do
 done
 check "存量配置里 Kimi 关过搜索 → 总开关读成关闭" false \
   "$(body "http://127.0.0.1:$LEGACY_PORT/control/status" | sed -nE 's/.*"web_search":(true|false).*/\1/p')"
+check "存量配置没有沙箱渠道 → 取配置完整的 DeepSeek" deepseek \
+  "$(body "http://127.0.0.1:$LEGACY_PORT/control/status" | sed -n 's/.*"sandbox_mode":"\([a-z]*\)".*/\1/p')"
+check "推导出的沙箱渠道不在读入时回写" 0 "$(grep -c 'sandbox_mode' "$LEGACY_JSON")"
 body -X POST "http://127.0.0.1:$LEGACY_PORT/control/config" -H 'content-type: application/json' \
   -d '{"channel":"kimi","default_model":{"model_id":"m2","display_name":"M2"}}' >/dev/null
 check "保存后只写顶层新字段,渠道级旧字段消失" '"web_search": false' \
   "$(grep -o '"web_search": *[a-z]*' "$LEGACY_JSON" | tr '\n' ';' | sed 's/;$//')"
+check "保存后沙箱渠道写进了配置文件" '"sandbox_mode": "deepseek"' \
+  "$(grep -o '"sandbox_mode": *"[a-z]*"' "$LEGACY_JSON")"
 kill "$LEGACY_PID" 2>/dev/null
 wait "$LEGACY_PID" 2>/dev/null
 LEGACY_PID=
 
 # 退出服务必须先停掉两个实例,再退出进程(放在最后:之后服务就不在了)。
-# 官方实例:假脚本报告在跑。沙箱:一个命令行与真 daemon 同形的假进程
-# (argv[0] 以 claude-science 结尾 + serve + 精确 --data-dir),pid 写进沙箱 lock。
-# 双层子 shell 让它脱离本脚本,被 launchd 及时回收——留成僵尸会被当成还活着。
+# 官方实例:假脚本报告在跑。沙箱:上面「两个实例各用各的渠道」一节起的那个假进程。
 touch "$FAKE_SCI/running"
 stops_before_quit="$(grep -cx 'stop' "$FAKE_SCI/calls.log")"
-SB_DATA="$SANDBOX/.csswitch/science-sandbox/home/.claude-science"
-mkdir -p "$SB_DATA"
-SB_PID="$( (exec -a "$FAKE_SCI/claude-science" /bin/bash -c 'while :; do sleep 1; done' \
-  serve --data-dir "$SB_DATA" >/dev/null 2>&1 &
-  echo $!) )"
-printf '{"pid":%s}' "$SB_PID" >"$SB_DATA/operon.lock"
 case "$(body "http://127.0.0.1:$PORT/control/status")" in
-  *'"sandbox":{'*'"running":true'*) echo "  ok   假沙箱 daemon 被识别为运行中" ;;
-  *) echo "  FAIL 假沙箱 daemon 未被识别,退出场景不成立"; fail=1 ;;
+  *'"sandbox":{'*'"running":true'*) echo "  ok   退出前假沙箱 daemon 仍在运行" ;;
+  *) echo "  FAIL 退出前假沙箱 daemon 已不在,退出场景不成立"; fail=1 ;;
 esac
 
 quit="$(curl -s --max-time 30 -X POST "http://127.0.0.1:$PORT/control/quit")"

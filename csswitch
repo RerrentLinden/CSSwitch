@@ -3,7 +3,7 @@
 #
 #   ./csswitch          启动(已在跑则只打开控制台)
 #   ./csswitch stop     停止(先停掉正在运行的 Science 与免登录沙箱)
-#   ./csswitch status   看一眼当前模式
+#   ./csswitch status   看一眼正式实例的模式与免登录沙箱的渠道
 #
 # 服务在前台运行。控制台里的「退出服务」与 ./csswitch stop 会先停掉 Science
 # 与免登录沙箱再退出;Ctrl-C 只结束服务进程本身。
@@ -45,7 +45,14 @@ print("服务正在退出。")' 2>/dev/null \
   status)
     if running; then
       curl -s --max-time 5 "$CONSOLE/control/status" \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin); print("模式:",d["mode_label"],"| 控制台:",d["base_url"],"| Science:","运行中" if d["science"]["running"] else "未运行")'
+        | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+# 模式是正式实例的;免登录沙箱另有自己的渠道(更早的服务不报告它,那时如实写出来)。
+print("模式:", d["mode_label"],
+      "| 沙箱渠道:", d.get("sandbox_mode_label", "未报告(运行中的是旧版本)"),
+      "| 控制台:", d["base_url"],
+      "| Science:", "运行中" if d["science"]["running"] else "未运行")'
     else
       echo "服务未在运行。"
     fi

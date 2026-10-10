@@ -146,11 +146,16 @@ impl GatewayConfig {
     /// 从用户配置直接装配渠道运行配置(单进程服务用)。
     /// 与 `from_env_args` 的差别只是输入来源:策略仍旧来自 provider contract,
     /// 模型目录来自用户在 WebUI 里填的四个槽。
-    pub fn for_channel(profile: &crate::profile::Profile) -> Result<Self, String> {
-        let (adapter, contract_id) = profile.mode.contract().ok_or("官方模式不使用渠道配置")?;
-        let channel = profile
-            .channel(&profile.mode)
-            .ok_or("当前模式没有渠道配置")?;
+    ///
+    /// 走哪个渠道由调用方给出(`Profile::mode_for` 按实例取),这里不读 `profile.mode`:
+    /// 正式实例与免登录沙箱各有自己的模式。`Mode::Official` 没有渠道,返回错误 ——
+    /// 沙箱一侧因此不存在通往官方直通的路径。
+    pub fn for_channel(
+        profile: &crate::profile::Profile,
+        mode: &crate::profile::Mode,
+    ) -> Result<Self, String> {
+        let (adapter, contract_id) = mode.contract().ok_or("官方模式不使用渠道配置")?;
+        let channel = profile.channel(mode).ok_or("该模式没有渠道配置")?;
         channel.validate()?;
 
         let contract = crate::provider_contracts::load_runtime_contract(
@@ -364,6 +369,46 @@ mod tests {
             Some("deepseek_native".to_string())
         );
         assert_eq!(super::resolve_relay_thinking(None, ""), None);
+    }
+
+    #[test]
+    fn channel_config_follows_the_requested_mode_not_the_official_instance() {
+        use crate::profile::{Mode, Profile};
+
+        // 回归:曾经自己读 profile.mode。那样免登录沙箱只能跟着正式实例走,
+        // 正式实例是官方时沙箱选的渠道根本装配不出来。
+        let mut profile = Profile {
+            mode: Mode::Official,
+            ..Profile::default()
+        };
+        profile.kimi.api_key = "kimi-test-key".into();
+        profile.deepseek.api_key = "deepseek-test-key".into();
+
+        let deepseek = super::GatewayConfig::for_channel(&profile, &Mode::Deepseek).unwrap();
+        assert_eq!(deepseek.provider, "deepseek");
+        assert_eq!(
+            deepseek.provider_contract.as_ref().unwrap().contract_id,
+            "deepseek-native"
+        );
+        assert_eq!(deepseek.api_key.as_deref(), Some("deepseek-test-key"));
+        assert_eq!(
+            deepseek.upstream_url,
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
+
+        // 反过来也一样:正式实例是 DeepSeek 时要 Kimi,拿到的是 Kimi 的契约、地址与 key。
+        profile.mode = Mode::Deepseek;
+        let kimi = super::GatewayConfig::for_channel(&profile, &Mode::Kimi).unwrap();
+        assert_eq!(kimi.provider, "relay");
+        assert_eq!(
+            kimi.provider_contract.as_ref().unwrap().contract_id,
+            "kimi-anthropic-relay"
+        );
+        assert_eq!(kimi.api_key.as_deref(), Some("kimi-test-key"));
+        assert_eq!(kimi.upstream_url, "https://api.kimi.com/coding/v1/messages");
+
+        // 官方没有渠道配置。沙箱的推理只走这个函数,所以它没有通往官方直通的路径。
+        assert!(super::GatewayConfig::for_channel(&profile, &Mode::Official).is_err());
     }
 
     #[test]

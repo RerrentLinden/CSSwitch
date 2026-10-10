@@ -8,8 +8,14 @@
 //!   明确错误,永不自动改绑;全部监听回环;
 //! - 入口链接的主机名固定 `127.0.0.1`,真实实例留给 `localhost`:浏览器 cookie 只按主机名
 //!   划作用域、不看端口,两实例同主机时会互相顶掉登录(见 `pin_cookie_host`);
-//! - 推理只经 `ANTHROPIC_BASE_URL` 指向本网关,模型类/凭证类环境变量一律清除
-//!   (与真实实例共享 `science::MODEL_ENV_KEYS_TO_CLEAR` 同一份清单);
+//! - 推理只经 `ANTHROPIC_BASE_URL` 指向本网关,而且比真实实例多带一段路径前缀
+//!   (`INFERENCE_PREFIX`):网关靠它认出请求来自沙箱,按沙箱自己选的渠道路由,不跟着真实
+//!   实例的模式走。前缀只加在 base_url 上,快速失败代理仍是不带路径的网关地址;
+//!   模型类/凭证类环境变量一律清除(与真实实例共享 `science::MODEL_ENV_KEYS_TO_CLEAR`
+//!   同一份清单);
+//! - 沙箱的渠道只会是 Kimi / DeepSeek,永不为官方:它的登录是这里铸造的虚拟登录,没有真实
+//!   Claude 凭证,官方接口必然拒绝(配置入口归一、切换入口拒绝,见 `profile.rs` /
+//!   `control.rs`);
 //! - 沙箱钥匙串必须真正生效并经启动后正向校验:0.1.48 起 daemon 会把 encryption keys
 //!   迁入 macOS Keychain(research/science-0148-smoke.md),校验不过即停 daemon 报错,
 //!   不带病运行——否则沙箱密钥会落进用户真实 login keychain;forge 修复/铸新后还要先
@@ -38,6 +44,11 @@ use crate::sandbox_forge::LoginAction;
 /// 沙箱 daemon 与预览端口。
 const DAEMON_PORT: u16 = 8790;
 const PREVIEW_PORT: u16 = 8791;
+/// 沙箱推理请求的路径前缀:沙箱的 `ANTHROPIC_BASE_URL` 是「网关地址 + 这一段」,请求于是
+/// 落在 `/sandbox/v1/messages` 与 `/sandbox/v1/models`(Science 内置的 SDK 是
+/// `baseURL + path` 直接拼接)。这是网关区分两个实例的唯一依据,沙箱环境与服务层路由
+/// 共用这一个常量。
+pub(crate) const INFERENCE_PREFIX: &str = "/sandbox";
 /// 沙箱入口链接对外使用的主机名。真实实例走 `localhost`,两边分开 cookie 作用域
 /// (理由见 `pin_cookie_host`)。监听地址仍是 `127.0.0.1`,这里只换链接里的写法。
 const COOKIE_HOST: &str = "127.0.0.1";
@@ -105,6 +116,10 @@ pub fn status() -> Value {
 /// 联网搜索关闭态)→ 拉起 daemon → 健康检查 → 钥匙串正向校验。桥接与钥匙串配置步骤失败
 /// 仅警告(桥接缺失只影响 Compute 找主机别名、沙箱读不到本机 gh 登录),其余任一步失败都
 /// 显式报错;健康/校验不过会先停 daemon 再报错。
+///
+/// `proxy_base_url` 是不带路径的网关地址(与交给真实实例的是同一个),沙箱前缀由
+/// `daemon_env` 加在 `ANTHROPIC_BASE_URL` 上。沙箱走哪个渠道不在这里决定:网关每请求按
+/// `Profile::sandbox_mode` 路由,调用方在启动前检查那个渠道配置完整。
 ///
 /// `web_search` 是联网搜索总开关的当前值,由调用方传入。沙箱已在运行时原样返回,不重启:
 /// 开关的新值要等下一次启动才到沙箱一侧(网关一侧的摘除不依赖它)。
@@ -308,10 +323,14 @@ fn serve_args(data_dir: &Path, mirror_config: Option<&Path>) -> Vec<String> {
 
 fn daemon_env(sandbox_home: &Path, proxy_base_url: &str) -> Vec<(String, String)> {
     // Anthropic HTTPS 全部指向网关快速失败(网关对非推理路径显式 404),而不是挂住。
+    // 代理地址不带沙箱前缀:代理只认主机与端口。
     let fastfail = proxy_base_url.to_string();
     vec![
         ("HOME".to_string(), sandbox_home.display().to_string()),
-        ("ANTHROPIC_BASE_URL".to_string(), proxy_base_url.to_string()),
+        (
+            "ANTHROPIC_BASE_URL".to_string(),
+            format!("{proxy_base_url}{INFERENCE_PREFIX}"),
+        ),
         ("https_proxy".to_string(), fastfail.clone()),
         ("HTTPS_PROXY".to_string(), fastfail),
         ("no_proxy".to_string(), NO_PROXY_LIST.to_string()),
@@ -817,8 +836,12 @@ mod tests {
         let env = daemon_env(Path::new("/tmp/sandbox/home"), "http://127.0.0.1:8788");
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!(get("HOME"), Some("/tmp/sandbox/home"));
-        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("http://127.0.0.1:8788"));
-        // 外联快速失败代理 = 网关自身(非推理路径显式 404)。
+        // base_url 带沙箱前缀:漏掉它,沙箱的请求就落回正式实例的路由,跟着正式实例的模式走。
+        assert_eq!(
+            get("ANTHROPIC_BASE_URL"),
+            Some("http://127.0.0.1:8788/sandbox")
+        );
+        // 外联快速失败代理 = 网关自身(非推理路径显式 404)。代理地址不带前缀。
         assert_eq!(get("https_proxy"), Some("http://127.0.0.1:8788"));
         assert_eq!(get("HTTPS_PROXY"), Some("http://127.0.0.1:8788"));
         assert_eq!(get("no_proxy"), Some(NO_PROXY_LIST));

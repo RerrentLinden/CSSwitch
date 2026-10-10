@@ -36,6 +36,8 @@
   .card h2 { font-size: 15px; margin: 0 0 14px; letter-spacing: .3px; }
   .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  /* 免登录沙箱只有两个渠道可选(没有官方 Claude),两列排满。 */
+  .modes.two { grid-template-columns: repeat(2, 1fr); }
   .mode {
     border: 1px solid var(--line); border-radius: 10px; padding: 14px;
     background: transparent; color: var(--ink); cursor: pointer; text-align: left;
@@ -43,6 +45,8 @@
   }
   .mode:hover { border-color: var(--accent); }
   .mode[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+  /* 切换请求进行中:不响应点击,也不出悬停态。 */
+  .mode:disabled { opacity: .5; pointer-events: none; }
   .mode b { display: block; font-size: 15px; margin-bottom: 3px; }
   .mode span { color: var(--muted); font-size: 12px; }
   .pill {
@@ -115,6 +119,9 @@
 
   <section class="card">
     <h2>当前连接</h2>
+    <p class="hint" style="margin-top:0">
+      这里选的是正式实例(你自己登录的 Science)用哪个 AI。免登录沙箱在下面的卡片里单独选,两边互不影响。
+    </p>
     <div class="modes" id="modes"></div>
     <div class="row" style="margin-top:16px">
       <span class="pill"><span class="dot" id="sci-dot"></span><span id="sci-text">检查中…</span></span>
@@ -141,10 +148,14 @@
   <section class="card">
     <h2>免登录沙箱</h2>
     <p class="hint" style="margin-top:0">
-      无 Claude 订阅时,用当前第三方渠道驱动一个隔离的 Science 实例(127.0.0.1:8790)。
+      无 Claude 订阅时,用下面选中的渠道驱动一个隔离的 Science 实例(127.0.0.1:8790)。
+      沙箱没有真实的 Claude 登录,所以没有「官方 Claude」这一项。
+      渠道与上面的正式实例各选各的,共用「渠道配置」里的同一份地址、API Key 与模型;
+      沙箱运行中切换会先确认,再重启沙箱。
       沙箱的对话历史与正式实例相互独立,数据保存在 <code>~/.csswitch/science-sandbox/</code>;
       正式实例不受任何影响。
     </p>
+    <div class="modes two" id="sb-modes" style="margin-bottom:16px"></div>
     <div class="row">
       <span class="pill"><span class="dot" id="sb-dot"></span><span id="sb-text">检查中…</span></span>
       <button class="act primary" id="btn-sb-start">启动沙箱</button>
@@ -206,7 +217,7 @@
     </div>
     <div class="logwrap">
       <table>
-        <thead><tr><th>时间</th><th>模式</th><th>方法</th><th>路径</th><th>状态</th><th>耗时</th></tr></thead>
+        <thead><tr><th>时间</th><th>实例 · 渠道</th><th>方法</th><th>路径</th><th>状态</th><th>耗时</th></tr></thead>
         <tbody id="logs"><tr><td colspan="6" class="sub">暂无记录</td></tr></tbody>
       </table>
     </div>
@@ -225,9 +236,13 @@ const SLOTS = [
   { key: 'fast_model',    label: '快速模型(可选)' },
   { key: 'fable_model',   label: 'Fable 模型(可选)' },
 ];
+// 请求日志里的实例名:正式实例(用户自己登录的 Science)与免登录沙箱。
+const INSTANCES = { official: '正式', sandbox: '沙箱' };
 let state = null;
 let channel = 'kimi';
 let scienceUrl = null;
+// 沙箱渠道的切换请求是否在途(带重启时要好几秒)。在途时两张沙箱渠道卡片禁用。
+let sandboxSwitching = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -254,14 +269,23 @@ async function api(path, options) {
   return data;
 }
 
-function renderModes() {
-  $('modes').innerHTML = MODES.map((mode) => `
-    <button class="mode" data-mode="${mode.id}" aria-pressed="${state.mode === mode.id}">
+// 一组模式卡片。正式实例与免登录沙箱各一组,同一套渲染,各自绑定自己的切换动作。
+function renderModeCards(container, modes, selected, onPick, disabled) {
+  container.innerHTML = modes.map((mode) => `
+    <button class="mode" data-mode="${mode.id}" aria-pressed="${selected === mode.id}"${disabled ? ' disabled' : ''}>
       <b>${mode.name}</b><span>${mode.desc}</span>
     </button>`).join('');
-  document.querySelectorAll('.mode').forEach((button) => {
-    button.onclick = () => switchMode(button.dataset.mode);
+  container.querySelectorAll('.mode').forEach((button) => {
+    button.onclick = () => onPick(button.dataset.mode);
   });
+}
+
+// 两组的选中态各取各的:正式实例看 state.mode,沙箱看 state.sandbox_mode。
+// 沙箱没有「官方 Claude」这一项(它没有真实登录),不放一张按了不起作用的卡片。
+function renderModes() {
+  renderModeCards($('modes'), MODES, state.mode, (mode) => switchMode(mode));
+  renderModeCards($('sb-modes'), MODES.filter((mode) => mode.id !== 'official'),
+    state.sandbox_mode, switchSandboxMode, sandboxSwitching);
 }
 
 function renderSlots() {
@@ -361,6 +385,46 @@ async function switchMode(mode, force) {
       return;
     }
     msg($('mode-msg'), '切换失败:' + error.message, 'err');
+  }
+}
+
+// 成功提示按响应如实写:沙箱没在运行时只是存了下来,要到下次启动才用上。
+function sandboxSwitchNote(result) {
+  if (!result.changed) return `沙箱的渠道已经是${result.mode_label},没有变化。`;
+  return result.sandbox_restarted
+    ? `沙箱已切换到${result.mode_label}并重启。`
+    : `沙箱渠道已设为${result.mode_label},下次启动沙箱时生效。`;
+}
+
+// 切换免登录沙箱的渠道。只动沙箱:正式实例的模式不变,也不会被重启。
+async function switchSandboxMode(mode) {
+  if (sandboxSwitching || mode === state.sandbox_mode) return;
+  const request = (force) => api('sandbox/switch', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(force ? { mode, force: true } : { mode }),
+  });
+  sandboxSwitching = true;
+  renderModes();
+  try {
+    let result;
+    try {
+      result = await request(false);
+    } catch (error) {
+      // 沙箱在跑时服务会要求确认,而不是默默重启它。被拒绝时服务端什么都没改,
+      // 所以取消就到此为止,界面也不用动。
+      if (!/沙箱正在运行/.test(error.message)) throw error;
+      if (!confirm(error.message + '\n\n仍要切换吗?')) return;
+      result = await request(true);
+    }
+    msg($('sb-msg'), sandboxSwitchNote(result));
+  } catch (error) {
+    msg($('sb-msg'), '切换失败:' + error.message, 'err');
+  } finally {
+    sandboxSwitching = false;
+    // 不猜结果:「重启失败」发生在存盘之后,选中态以服务端当前状态为准;
+    // 问不到就按手头的状态把卡片放开。只刷状态,不重绘渠道配置表单。
+    await poll().catch(() => renderModes());
   }
 }
 
@@ -586,8 +650,10 @@ $('btn-logs').onclick = async () => {
   $('logs').innerHTML = entries.length ? entries.map((entry) => {
     const detail = entry.detail || {};
     const time = new Date(entry.ts_ms).toLocaleTimeString();
+    // 谁发来的、走了哪个渠道:两个实例各有各的模式,只写渠道分不清是哪一边。
+    const route = detail.mode ? `${INSTANCES[detail.instance] || '—'} · ${detail.mode}` : '—';
     return `<tr>
-      <td>${time}</td><td>${detail.mode || '—'}</td><td>${detail.method || '—'}</td>
+      <td>${time}</td><td>${route}</td><td>${detail.method || '—'}</td>
       <td><code>${detail.path || '—'}</code></td>
       <td>${detail.error ? '<span style="color:var(--err)">错误</span>' : (detail.status || '—')}</td>
       <td>${detail.ms != null ? detail.ms + ' ms' : '—'}</td>

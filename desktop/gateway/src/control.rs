@@ -1,7 +1,10 @@
 //! 单进程服务:推理网关 + 本地控制 API + 内嵌 WebUI。
 //!
 //! 一个端口对外提供三类路径:
-//! - `/v1/messages`、`/v1/models` —— 推理,按激活模式路由(官方直通 / 渠道中继);
+//! - `/v1/messages`、`/v1/models` —— 正式实例的推理,按正式实例的模式路由
+//!   (官方直通 / 渠道中继);
+//!   `/sandbox/v1/messages`、`/sandbox/v1/models` —— 免登录沙箱的推理,按沙箱自己选的
+//!   渠道路由(只有渠道中继)。两个实例各有各的模式,靠这段路径前缀区分;
 //! - `/control/*` —— 本地控制面(状态、配置、切换、日志);
 //! - `/`、`/ui/*` —— 内嵌 WebUI。
 //!
@@ -16,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::profile::{Channel, Mode, Profile};
+use crate::profile::{Channel, Instance, Mode, Profile};
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const MAX_LOG_ENTRIES: usize = 300;
@@ -117,13 +120,14 @@ fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         handle_control(&mut stream, &request, rest, &state);
         return;
     }
-    if path == "/v1/messages" || path == "/v1/models" {
+    if let Some((instance, target)) = route_inference(&request.target) {
         crate::server::handle_inference(
             &mut stream,
             &request.method,
-            &request.target,
+            target,
             request.headers.clone(),
             request.body.clone(),
+            instance,
             &state,
         );
         return;
@@ -133,6 +137,25 @@ fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         404,
         json!({"type": "error", "error": {"type": "not_found_error", "message": path}}),
     );
+}
+
+/// 推理路由:请求目标 →(来自哪个实例, 交给推理层的 target)。不是推理路径时返回 `None`,
+/// 由调用方显式 404。
+///
+/// 正式实例的 base_url 是不带路径的网关地址,请求落在 `/v1/*`;免登录沙箱的 base_url 多带
+/// `sandbox::INFERENCE_PREFIX`,请求落在 `/sandbox/v1/*`。前缀只在这一处剥离(query 保留),
+/// 推理层看到的 target 与实例无关。路径必须整条相等,不做前缀匹配:`/sandbox`、
+/// `/sandbox/v1/别的`、`/sandboxx/v1/messages` 都不是推理路径。
+fn route_inference(target: &str) -> Option<(Instance, &str)> {
+    fn is_inference(target: &str) -> bool {
+        let path = target.split('?').next().unwrap_or(target);
+        path == "/v1/messages" || path == "/v1/models"
+    }
+    if is_inference(target) {
+        return Some((Instance::Official, target));
+    }
+    let rest = target.strip_prefix(crate::sandbox::INFERENCE_PREFIX)?;
+    is_inference(rest).then_some((Instance::Sandbox, rest))
 }
 
 fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state: &Arc<AppState>) {
@@ -150,6 +173,7 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
         ("POST", "science/stop") => crate::science::stop().map(|_| json!({"ok": true})),
         ("GET", "sandbox/status") => Ok(crate::sandbox::status()),
         ("POST", "sandbox/start") => start_sandbox(state),
+        ("POST", "sandbox/switch") => switch_sandbox_mode(request, state),
         ("POST", "sandbox/stop") => crate::sandbox::stop().map(|_| json!({"ok": true})),
         ("GET", "sandbox/url") => crate::sandbox::entry_url().map(|url| json!({"url": url})),
         ("POST", "quit") => {
@@ -198,12 +222,17 @@ fn status_payload(state: &Arc<AppState>) -> Value {
         // 正在运行的这个服务进程的版本。安装版的启动器拿它与自己比对:
         // 换了新版应用而后台还是旧服务时,要提示而不是让人以为已经升级。
         "version": crate::VERSION,
+        // 正式实例的模式。
         "mode": profile.mode.as_str(),
         "mode_label": profile.mode.display_name(),
         "port": state.port,
         "base_url": format!("http://127.0.0.1:{}", state.port),
         "science": science,
         "sandbox": crate::sandbox::status(),
+        // 免登录沙箱的渠道。放在顶层、且不叫 `mode`:序列化保留写入顺序,取顶层模式的
+        // 脚本用的是贪婪匹配,任何更靠后的 `"mode":"…"` 都会被它当成正式实例的模式。
+        "sandbox_mode": profile.sandbox_mode.as_str(),
+        "sandbox_mode_label": profile.sandbox_mode.display_name(),
         "request_log": profile.request_log,
         "web_search": profile.web_search,
         "channels": {
@@ -431,12 +460,17 @@ fn parse_web_search_request(payload: &Value) -> Result<(bool, bool), String> {
         Some(_) => return Err("enabled 必须是布尔值".into()),
         None => return Err("缺少 enabled".into()),
     };
-    let force = match payload.get("force") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(force)) => *force,
-        Some(_) => return Err("force 必须是布尔值".into()),
-    };
-    Ok((enabled, force))
+    Ok((enabled, parse_force(payload)?))
+}
+
+/// 请求体里可选的 `force`:「我确认打断正在进行的事」。缺省为否;出现了就必须是布尔值,
+/// 不从别的类型猜。联网搜索总开关与沙箱渠道切换共用。
+fn parse_force(payload: &Value) -> Result<bool, String> {
+    match payload.get("force") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(force)) => Ok(*force),
+        Some(_) => Err("force 必须是布尔值".into()),
+    }
 }
 
 /// 联网搜索总开关。一个值驱动两层:
@@ -494,10 +528,7 @@ fn set_web_search(request: &Request, state: &Arc<AppState>) -> Result<Value, Str
             },
         )?;
     }
-    let sandbox_running = crate::sandbox::status()
-        .get("running")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let sandbox_running = reports_running(&crate::sandbox::status());
     Ok(json!({
         "ok": true,
         "web_search": enabled,
@@ -535,25 +566,154 @@ fn stop_instances() -> (Vec<&'static str>, Vec<String>) {
 
 /// `None` 表示实例本就没在运行,无需停止。
 fn stop_if_running(status: &Value, stop: fn() -> Result<(), String>) -> Option<Result<(), String>> {
-    let running = status
-        .get("running")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    running.then(stop)
+    reports_running(status).then(stop)
 }
 
-/// 免登录沙箱的推理走网关当前模式:官方模式下沙箱没有可用上游,渠道配置不完整
-/// 也注定失败 —— 启动前先拒绝,不要等沙箱起来后才 401。
+/// 实例状态(`science::status` / `sandbox::status`)是否报告在运行。
+fn reports_running(status: &Value) -> bool {
+    status
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 沙箱为什么不能用官方 Claude。切换入口拿它拒绝请求,控制台原文展示。
+fn sandbox_official_refusal() -> String {
+    "免登录沙箱不能使用官方 Claude:沙箱用的是 CSSwitch 生成的虚拟登录,没有真实的 Claude 凭证,\
+     官方接口会拒绝它。请选择 Kimi 或 DeepSeek。"
+        .into()
+}
+
+/// 免登录沙箱能不能用这个渠道:必须是第三方渠道,且配置完整;报错点名渠道与缺项。
+/// 启动沙箱(看沙箱当前选的渠道)与切换沙箱渠道(看目标渠道)共用。
+fn sandbox_channel_ready(profile: &Profile, mode: &Mode) -> Result<(), String> {
+    let channel = profile.channel(mode).ok_or_else(sandbox_official_refusal)?;
+    channel.validate().map_err(|error| {
+        format!(
+            "免登录沙箱要用的 {} 渠道配置不完整:{error}。请先在「渠道配置」里补全。",
+            mode.display_name()
+        )
+    })
+}
+
+/// 启动沙箱的前置检查:只看沙箱自己选的渠道(`sandbox_mode`)。正式实例处于什么模式与它
+/// 无关 —— 沙箱的请求按 `sandbox_mode` 路由,正式实例是官方模式时沙箱照样能用。
+/// 启动前就拒绝,不要等沙箱起来后推理才报错。
+fn sandbox_start_precheck(profile: &Profile) -> Result<(), String> {
+    sandbox_channel_ready(profile, &profile.sandbox_mode)
+}
+
 fn start_sandbox(state: &Arc<AppState>) -> Result<Value, String> {
     let profile = state.snapshot();
-    let channel = profile
-        .channel(&profile.mode)
-        .ok_or("免登录沙箱需要第三方渠道:请先切换到 Kimi 或 DeepSeek 模式")?;
-    channel.validate()?;
+    sandbox_start_precheck(&profile)?;
     crate::sandbox::start(
         &format!("http://127.0.0.1:{}", state.port),
         profile.web_search,
     )
+}
+
+/// 切换免登录沙箱的渠道时要做什么。
+#[derive(Debug, Eq, PartialEq)]
+enum SandboxSwitch {
+    /// 目标渠道就是当前渠道:什么都不做。
+    Unchanged,
+    /// 沙箱没在运行:只存盘,下次启动沙箱时生效。
+    SaveOnly,
+    /// 沙箱在运行而调用方没有确认:拒绝,任何状态不变。
+    NeedsConfirmation,
+    /// 沙箱在运行且已确认:存盘后重启它。
+    SaveAndRestart,
+}
+
+/// 纯判定,不碰任何状态。沙箱的请求每次都按 `sandbox_mode` 路由,所以运行中的沙箱必须
+/// 跟着重启:只存不重启,它会立刻被改道到新渠道,而它手里的模型目录还是旧渠道的。
+/// 沙箱没有可靠的会话数可查(官方实例有 `active_conversations`),因此不区分有没有会话:
+/// 只要在运行就先要确认。
+fn plan_sandbox_switch(current: &Mode, target: &Mode, running: bool, force: bool) -> SandboxSwitch {
+    if current == target {
+        SandboxSwitch::Unchanged
+    } else if !running {
+        SandboxSwitch::SaveOnly
+    } else if !force {
+        SandboxSwitch::NeedsConfirmation
+    } else {
+        SandboxSwitch::SaveAndRestart
+    }
+}
+
+/// 沙箱在运行而未确认时拒绝切换渠道的文案。控制台按「沙箱正在运行」识别它并转成确认框。
+fn sandbox_running_refusal() -> String {
+    "免登录沙箱正在运行,切换渠道会重启沙箱并打断其中进行中的会话。确认后重试。".into()
+}
+
+/// 请求体 `{"mode": "kimi" | "deepseek", "force"?: bool}`。`official` 在入口就拒绝:
+/// 沙箱永不为官方。
+fn parse_sandbox_switch_request(payload: &Value) -> Result<(Mode, bool), String> {
+    let mode_name = payload
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or("缺少 mode")?;
+    let mode = Mode::parse(mode_name).ok_or("未知 mode")?;
+    if mode == Mode::Official {
+        return Err(sandbox_official_refusal());
+    }
+    Ok((mode, parse_force(payload)?))
+}
+
+/// 切换免登录沙箱的渠道。只动沙箱:不改正式实例的模式,也不重启正式实例。
+///
+/// 顺序与联网搜索总开关一致:解析、渠道校验、判定都在存盘之前,被拒绝(或用户在确认框里
+/// 取消)时任何状态都不变。存盘并更新快照之后,沙箱的请求从下一条起就按新渠道路由,
+/// 运行中的沙箱随即重启。重启失败不回滚(回滚再重启可能循环):那时的真实状态就是
+/// 「渠道已保存、沙箱没有按新渠道跑起来」,原文报给用户。
+fn switch_sandbox_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String> {
+    let payload: Value =
+        serde_json::from_slice(&request.body).map_err(|e| format!("请求体不是合法 JSON:{e}"))?;
+    let (mode, force) = parse_sandbox_switch_request(&payload)?;
+    let mut profile = state.snapshot();
+    sandbox_channel_ready(&profile, &mode)?;
+    let running = reports_running(&crate::sandbox::status());
+    let restart = match plan_sandbox_switch(&profile.sandbox_mode, &mode, running, force) {
+        SandboxSwitch::Unchanged => {
+            return Ok(json!({
+                "ok": true,
+                "mode": mode.as_str(),
+                "mode_label": mode.display_name(),
+                "changed": false,
+                "sandbox_restarted": false,
+            }))
+        }
+        SandboxSwitch::NeedsConfirmation => return Err(sandbox_running_refusal()),
+        SandboxSwitch::SaveOnly => false,
+        SandboxSwitch::SaveAndRestart => true,
+    };
+
+    profile.sandbox_mode = mode.clone();
+    let web_search = profile.web_search;
+    profile.save()?;
+    if let Ok(mut guard) = state.profile.write() {
+        *guard = profile;
+    }
+
+    if restart {
+        let saved = mode.display_name();
+        crate::sandbox::stop().map_err(|error| {
+            format!(
+                "沙箱渠道已保存为 {saved},沙箱的请求已按它路由;但停止沙箱失败,它没有重启:{error}"
+            )
+        })?;
+        std::thread::sleep(Duration::from_millis(600));
+        crate::sandbox::start(&format!("http://127.0.0.1:{}", state.port), web_search).map_err(
+            |error| format!("沙箱渠道已保存为 {saved};但沙箱已停止,按新渠道启动失败:{error}"),
+        )?;
+    }
+    Ok(json!({
+        "ok": true,
+        "mode": mode.as_str(),
+        "mode_label": mode.display_name(),
+        "changed": true,
+        "sandbox_restarted": restart,
+    }))
 }
 
 /// 向渠道拉取可用模型清单(WebUI 的"获取可用模型")。
@@ -891,6 +1051,118 @@ mod tests {
         assert!(parse_web_search_request(&json!({})).is_err());
         // force 是「我确认打断会话」,同样不能从别的类型猜。
         assert!(parse_web_search_request(&json!({"enabled": false, "force": "true"})).is_err());
+    }
+
+    #[test]
+    fn inference_routing_tells_the_two_instances_apart() {
+        // 正式实例:target 原样交给推理层。
+        assert_eq!(
+            route_inference("/v1/messages?beta=true"),
+            Some((Instance::Official, "/v1/messages?beta=true"))
+        );
+        assert_eq!(
+            route_inference("/v1/models"),
+            Some((Instance::Official, "/v1/models"))
+        );
+        // 沙箱:前缀剥掉、query 保留。前缀没剥干净,推理层只会回 404。
+        assert_eq!(
+            route_inference("/sandbox/v1/messages?beta=true"),
+            Some((Instance::Sandbox, "/v1/messages?beta=true"))
+        );
+        assert_eq!(
+            route_inference("/sandbox/v1/models"),
+            Some((Instance::Sandbox, "/v1/models"))
+        );
+        // 近似路径一律不是推理路径,留给调用方显式 404。放宽成前缀匹配的话 `/sandboxx`
+        // 会被当成沙箱;循环剥前缀的话叠两层也会被接受。
+        for target in [
+            "/sandbox",
+            "/sandbox/",
+            "/sandbox/v1/unknown",
+            "/sandboxx/v1/messages",
+            "/sandbox/sandbox/v1/messages",
+            "//sandbox/v1/messages",
+        ] {
+            assert_eq!(route_inference(target), None, "{target}");
+        }
+    }
+
+    #[test]
+    fn sandbox_switch_never_restarts_a_running_sandbox_without_consent() {
+        use SandboxSwitch::*;
+        let (kimi, deepseek) = (Mode::Kimi, Mode::Deepseek);
+        // 目标就是当前渠道:不存盘、不重启 —— 哪怕沙箱正在跑、带着 force。
+        assert_eq!(plan_sandbox_switch(&kimi, &kimi, true, true), Unchanged);
+        assert_eq!(
+            plan_sandbox_switch(&deepseek, &deepseek, false, false),
+            Unchanged
+        );
+        // 没在运行:只存盘,下次启动沙箱时生效。带着 force 也不会顺手把它启动起来。
+        assert_eq!(
+            plan_sandbox_switch(&kimi, &deepseek, false, false),
+            SaveOnly
+        );
+        assert_eq!(plan_sandbox_switch(&kimi, &deepseek, false, true), SaveOnly);
+        // 在运行且未确认:拒绝。沙箱没有会话数可查,所以只要在运行就要确认;两个方向都受保护。
+        assert_eq!(
+            plan_sandbox_switch(&kimi, &deepseek, true, false),
+            NeedsConfirmation
+        );
+        assert_eq!(
+            plan_sandbox_switch(&deepseek, &kimi, true, false),
+            NeedsConfirmation
+        );
+        // 在运行且已确认:存盘并重启。
+        assert_eq!(
+            plan_sandbox_switch(&kimi, &deepseek, true, true),
+            SaveAndRestart
+        );
+        assert!(
+            sandbox_running_refusal().contains("沙箱正在运行"),
+            "控制台靠这几个字把拒绝转成确认框"
+        );
+    }
+
+    #[test]
+    fn sandbox_switch_request_refuses_official_and_guessed_types() {
+        assert_eq!(
+            parse_sandbox_switch_request(&json!({"mode": "deepseek"})),
+            Ok((Mode::Deepseek, false))
+        );
+        assert_eq!(
+            parse_sandbox_switch_request(&json!({"mode": "kimi", "force": true})),
+            Ok((Mode::Kimi, true))
+        );
+        // 沙箱永不为官方:在入口就拒绝并说明原因,带着 force 也一样。
+        let official =
+            parse_sandbox_switch_request(&json!({"mode": "official", "force": true})).unwrap_err();
+        assert!(official.contains("虚拟登录"), "要说明原因:{official}");
+        assert!(parse_sandbox_switch_request(&json!({"mode": "claude"})).is_err());
+        assert!(parse_sandbox_switch_request(&json!({})).is_err());
+        // force 是「我确认重启沙箱」:字符串 "false" 在 JS 里是真值,不从别的类型猜。
+        assert!(parse_sandbox_switch_request(&json!({"mode": "kimi", "force": "false"})).is_err());
+    }
+
+    #[test]
+    fn sandbox_start_looks_only_at_the_sandbox_channel() {
+        // 正式实例是官方模式:以前这时沙箱直接被拒(要求先把全局模式切到第三方)。
+        let mut profile = Profile {
+            mode: Mode::Official,
+            sandbox_mode: Mode::Deepseek,
+            ..Profile::default()
+        };
+        profile.deepseek.api_key = "k".into();
+        assert_eq!(sandbox_start_precheck(&profile), Ok(()));
+
+        // 反过来:正式实例的渠道配得再完整也不顶用,看的是沙箱自己选的那个渠道。
+        profile.mode = Mode::Kimi;
+        profile.kimi.api_key = "k".into();
+        profile.deepseek.api_key.clear();
+        let error = sandbox_start_precheck(&profile).unwrap_err();
+        assert!(
+            error.contains("DeepSeek") && error.contains("API Key"),
+            "要点名渠道与缺项:{error}"
+        );
     }
 
     #[test]
