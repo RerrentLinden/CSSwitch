@@ -212,9 +212,10 @@ CSSwitch.app/Contents/
 **证据边界**:「Science 把请求发到 `base_url + path`」来自对已安装的 0.1.60 二进制的只读静态
 检查(SDK 的 `buildURL` 是直接拼接),旧版 CSSwitch 也给过 Science 带路径的 base_url。
 离线门禁证明的是网关一侧:带前缀的两条路径按 `sandbox_mode` 路由、其余显式 404。真实 Science
-带着前缀跑通一轮推理属于真机验收([test/LIVE_ACCEPTANCE.md](../test/LIVE_ACCEPTANCE.md) §G),
-截至 2026-10-10 未执行。若真机发现 Science 不按带前缀的 base_url 发请求,备选是给沙箱开第二个
-监听端口:只动沙箱环境与路由两处,用户可见行为不变。
+带着前缀跑通推理已在真机上确认(2026-10-10,安装版 0.10.0,Science 0.1.60,记录见
+[test/LIVE_ACCEPTANCE.md](../test/LIVE_ACCEPTANCE.md) §G);其它版本的 Science 没有核对过。
+若某个版本不按带前缀的 base_url 发请求,备选是给沙箱开第二个监听端口:只动沙箱环境与路由两处,
+用户可见行为不变。
 
 ## 联网搜索总开关
 

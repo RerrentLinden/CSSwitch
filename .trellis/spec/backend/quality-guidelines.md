@@ -423,8 +423,8 @@ GET  /control/status → 顶层 sandbox_mode / sandbox_mode_label
   - 网关靠沙箱 base_url 的路径前缀 `/sandbox` 认出沙箱的请求。前缀只定义一次
     （`sandbox::INFERENCE_PREFIX`，沙箱环境与路由共用），只加在 `ANTHROPIC_BASE_URL` 上，
     两个代理变量不加。正式实例的 base_url 不带路径，`science.rs` 不因此改动。依据是
-    Science 0.1.60 内置 SDK 以 `baseURL + path` 直接拼接（静态证据；真机见
-    `test/LIVE_ACCEPTANCE.md` §G）。
+    Science 0.1.60 内置 SDK 以 `baseURL + path` 直接拼接（静态检查；2026-10-10 真机实测一致，
+    记录见 `test/LIVE_ACCEPTANCE.md` §G）。
   - `sandbox_mode` 永不为官方：沙箱是虚拟登录，官方直通对它只会 401。两个入口归一——
     读配置（`Profile::parse`：键缺失或值为 `official` → 推导：`mode` 是渠道就取它，否则取
     第一个配置完整的渠道，都不完整取 Kimi；推导值不在读入时回写）与切换（拒绝并说明原因）。

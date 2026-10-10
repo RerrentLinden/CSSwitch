@@ -65,8 +65,8 @@ CSSwitch 接管的是**用户自己的官方 Science 实例**,不做数据隔离
 - Science 经 base_url 只调 `/v1/messages` 与 `/v1/models`(2026-08 实测)。
   登录、会话存储、内核、Reviewer 都走 daemon 自身。
 - 免登录沙箱调的是同样两个端点,落在 `/sandbox/v1/messages` 与 `/sandbox/v1/models`
-  (Science 0.1.60 的 SDK 是 `baseURL + path` 直接拼接,静态证据;真实 Science 带前缀跑通一轮
-  推理的真机验收见 `test/LIVE_ACCEPTANCE.md` §G)。路径整条相等才算,不做前缀匹配。
+  (Science 0.1.60 的 SDK 是 `baseURL + path` 直接拼接;2026-10-10 真机实测沙箱的请求确实落在
+  这两条路径上,记录见 `test/LIVE_ACCEPTANCE.md` §G)。路径整条相等才算,不做前缀匹配。
 - 其余路径显式 404(含 `/sandbox`、`/sandbox/v1/别的`、`/sandboxx/…`)。新版本 Science
   若调用了没见过的端点,应当立刻可见,而不是被一个假的成功响应掩盖。
   诊断用 `official-passthrough` 子命令枚举端点面。
