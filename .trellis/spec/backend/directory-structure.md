@@ -10,6 +10,7 @@ desktop/gateway/
     ├── control.rs           单进程装配:HTTP 路由、控制面 API、WebUI
     ├── profile.rs           用户配置:模式、渠道、四模型槽、静态目录生成
     ├── science.rs           Science daemon 控制器(启停/状态/登录链接)
+    ├── science_config.rs    联网搜索关闭态的镜像配置(源 config.toml 只读 + enable_web_search=false)
     ├── sandbox.rs           免登录沙箱编排(隔离 HOME/固定端口 8790·8791/钥匙串校验/兜底停止)
     ├── sandbox_forge.rs     沙箱虚拟登录铸造(v2 GCM 三件套/幂等三态/三道护栏)
     ├── config.rs            GatewayConfig:契约装配与策略解析

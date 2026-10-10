@@ -23,6 +23,16 @@ Science daemon 由服务用 CLI 拉起,注入 `ANTHROPIC_BASE_URL=http://127.0.0
 手动 `claude-science serve` 仍用 Science 自己的默认 8000,与经 CSSwitch 启动的地址不同。
 两者都绑 loopback。
 
+启动参数(方括号里的一对只在联网搜索总开关关闭时出现,见下文「联网搜索总开关」):
+
+```text
+官方:serve [--config <镜像>] --port 8686 --sandbox-port 8687 --detached --no-browser
+沙箱:serve --data-dir <沙箱> [--config <镜像>] --host 127.0.0.1 --port 8790 --sandbox-port 8791
+       --no-browser --no-auto-update --detached
+```
+
+官方实例永不带 `--data-dir` 与 `--no-auto-update`:前者会造出隔离实例,后者会关掉它自己的自动更新。
+
 退出服务(`/control/quit`,控制台按钮与 `./csswitch stop` 共用)先并行停掉正在运行的官方实例与
 免登录沙箱,再退出进程:网关一走,指向它的实例只剩断掉的推理链路。停止失败不拦截退出,
 失败原文随响应返回。终端里 Ctrl-C 只结束服务进程,不停实例。
@@ -41,6 +51,54 @@ Science daemon 由服务用 CLI 拉起,注入 `ANTHROPIC_BASE_URL=http://127.0.0
 | DeepSeek | deepseek 契约 + DeepSeek 补偿链 | 同上 |
 
 模式存在配置里,切换需重启 Science daemon(它只在启动时读 base_url)。
+
+## 联网搜索总开关
+
+`service.v1.json` 顶层的 `web_search`(默认 `true`)是唯一真相,全局生效、不分渠道。
+它对应 Science 0.1.56 起的实例级选项 `enable_web_search`:该选项写在 Science 的
+`config.toml` 根表,只在启动时读取,没有应用内设置项也没有环境变量。一个值驱动两层:
+
+```text
+service.v1.json: web_search
+        │
+        ├─ Science 一侧(启动时一次性,science_config.rs)
+        │     true  → 不带 --config,启动参数与没有这个开关时逐项相同
+        │     false → 生成镜像配置 → serve --config <镜像> …
+        │
+        └─ 网关一侧(每请求读快照,config.rs / server.rs)
+              true  → Kimi 的 typed web_search 走 query-tool bridge
+              false → relay 入口摘除 typed web_search,桥不触发
+```
+
+**镜像配置**:源文件(只读)+ 根表 `enable_web_search = false`,由 `toml_edit` 解析后写出,
+其余键、表与注释原样保留。
+
+| | 官方实例 | 免登录沙箱 |
+| --- | --- | --- |
+| 源(只读) | `~/.claude-science/config.toml` | `<沙箱 data-dir>/config.toml` |
+| 镜像(CSSwitch 写,0600) | `~/.csswitch/science-config/official.toml` | `~/.csswitch/science-config/sandbox.toml` |
+
+- CSSwitch 对真实 `~/.claude-science/` 只读这一个文件,不写、不建任何东西。
+- 镜像只会追加限制:开关开启时不带 `--config`,Science 自己配置里的任何值(包括手写的
+  `enable_web_search = false`)原样生效。
+- `--config` 只换配置文件,不换数据目录,登录与对话不受影响(2026-10-10 用 0.1.60 在隔离
+  HOME 实测)。
+- 每次启动都重新生成镜像;开启态启动时删除残留的镜像文件。源文件不存在时镜像只有这一个键;
+  源文件读不了或解析不了时报错并拒绝启动,不猜着改。
+
+**生效时机**:网关一侧存盘后下一次请求即生效,且不依赖 Science 是否已重启、是否认识这个选项。
+Science 一侧要重启:`POST /control/web-search` 在官方实例运行时会重启它,有会话正在进行且未带
+`force` 时拒绝并且不改任何状态;镜像生成不出来同样在存盘之前报错。重启失败不回滚,原文报出
+(此时开关已改、Science 未按新设置运行;拨回开启再启动就是原始启动方式)。免登录沙箱不自动重启,
+响应里用 `sandbox_restart_required` 标出。
+
+官方模式的零改写直通不变:该模式下的关闭效果完全来自 Science 一侧。DeepSeek 平时把搜索声明
+留给上游原生执行,关闭态同样在入口被摘除。
+
+**回滚注意**:旧版本把这个开关存在渠道里(`kimi.web_search`)。新版本读到「顶层没有该键且
+`kimi.web_search == false`」时迁移为总开关关闭,保存后只写顶层键。因此代码回滚到旧版本后,
+旧二进制读不到渠道级旧键,会把「关」读成「开」。`~/.csswitch/science-config/` 是派生文件,
+可直接删除。
 
 ## 端点合同的由来
 
@@ -81,7 +139,11 @@ catch-all 转发并记录脱敏端点清单,用于回归这个结论。
 
 ## 配置
 
-`~/.csswitch/service.v1.json`(0600):模式、端口、两个渠道的 base_url / key / 四槽。
+`~/.csswitch/service.v1.json`(0600):模式、端口、两个渠道的 base_url / key / 四槽、
+`request_log`(请求日志开关)、`web_search`(联网搜索总开关)。
+
+`~/.csswitch/science-config/`(0700,文件 0600):联网搜索关闭时交给 Science 的镜像配置,
+每次启动重写,见「联网搜索总开关」。
 
 文件名刻意避开 `config.json` —— 那是旧桌面端的文件名,它会把不认识的 schema
 当作自己的旧版本迁移,结果清空自身 provider 列表(实测踩过一次)。

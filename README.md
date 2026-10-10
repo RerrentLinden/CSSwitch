@@ -20,7 +20,8 @@ CSSwitch 服务  ── /v1/messages、/v1/models  按当前模式路由
 ```
 
 关键点:**不做数据隔离**。CSSwitch 启动的是你平时用的那个 Science
-(`~/.claude-science`,真实登录),只在启动时注入一个 base_url。
+(`~/.claude-science`,真实登录),只在启动时注入:一个 base_url;关掉「联网搜索」时
+再多带一份镜像配置(见下文)。CSSwitch 不往 Science 自己的目录里写任何文件。
 所以历史对话、项目、MCP、Skill 全都还在原处,换供应商不会让对话分家。
 
 ## 用法
@@ -45,6 +46,23 @@ CSSwitch 服务  ── /v1/messages、/v1/models  按当前模式路由
 每个渠道有四个槽:默认(均衡)、高质量、快速、Fable。
 默认槽必填,其余留空自动继承默认槽。每槽可分别填上游模型 ID 与显示名——
 显示名就是 Science 模型菜单里看到的名字。「获取可用模型」直接向上游要清单。
+
+## 联网搜索开关
+
+控制台「当前连接」卡片里有一个「联网搜索」开关,默认开启,对官方 / Kimi / DeepSeek
+三种模式和免登录沙箱都生效。它对应 Claude Science 0.1.56 起的官方选项
+`enable_web_search`,一个开关同时管两层:
+
+- **Science 一侧**:关闭时,CSSwitch 把「你的 `~/.claude-science/config.toml` +
+  `enable_web_search = false`」写成一份镜像(`~/.csswitch/science-config/`),启动 Science 时用
+  `--config` 带上;你原有的代理、证书、镜像源等设置原样保留,Science 自己的文件不会被改动。
+  开启时不带任何额外参数,完全沿用 Science 自己的配置。
+- **网关一侧**:关闭时,Kimi / DeepSeek 请求里的搜索声明在入口被摘除,Kimi 的 web_search
+  兼容桥不触发;保存后下一次请求即生效。
+
+Science 只在启动时读配置,所以切换开关会重启正在运行的 Science(有会话正在进行时先确认);
+免登录沙箱不会自动重启,需要手动重启后生效。这个开关只对**经 CSSwitch 启动**的 Science 生效:
+你自己直接运行 `claude-science serve` 时不受它影响。
 
 ## 供应商补偿
 

@@ -244,21 +244,27 @@ store.capture_message(&first_request(), &response, "k3", RestorePolicy::DeepSeek
 ### 2. 签名
 
 ```text
-claude-science serve --detached --no-browser      # 全部启动参数,不多不少
+science::start(base_url, web_search)
+claude-science serve [--config <镜像>] --port 8686 --sandbox-port 8687 --detached --no-browser
+                                                  # 全部启动参数,不多不少
   env: ANTHROPIC_BASE_URL=http://127.0.0.1:<port> # 唯一注入的变量
   env_remove: ANTHROPIC_MODEL / *_MODEL / *_MODEL_NAME
               ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
 claude-science stop | status | url
+science_config::launch_config(web_search, source, mirror) -> Result<Option<PathBuf>, String>
+  source(只读): ~/.claude-science/config.toml
+  mirror(0600): ~/.csswitch/science-config/official.toml
 配置: ~/.csswitch/service.v1.json (0600)
 ```
 
 ### 3. 合同
 
-| 禁止传的参数 | 后果 |
-| --- | --- |
-| `--data-dir` / `--config` | 造出隔离实例,用户对话从此分家 |
-| `--no-auto-update` | 官方实例失去自动更新（用户明确红线） |
-| `--port` | 端口随机化,控制台地址每次重启都变；用它自己的默认端口 |
+| 参数 | 规则 | 理由 |
+| --- | --- | --- |
+| `--data-dir` | 永远禁止 | 造出隔离实例,用户对话从此分家 |
+| `--no-auto-update` | 永远禁止 | 官方实例失去自动更新（用户明确红线） |
+| `--config` | 只允许出现在联网搜索关闭态,且只指向 CSSwitch 生成的镜像 | 它只换配置文件、不换数据目录（2026-10-10 用 0.1.60 隔离实测）；开启态不带它，启动参数与没有这个开关时逐项相同 |
+| `--port` / `--sandbox-port` | 固定 8686 / 8687 | 不用 `0`（控制台地址要稳定可收藏），也不沿用 Science 默认的 8000 / 8001（常被本机其它开发服务占用）；两个端口都显式给出，不依赖「port+1」的推导 |
 
 - 模型类与凭证类环境变量必须清除：残留会让 Science 绕过网关的模型目录，或带着旧凭证启动。
 - 不写、不读、不伪造任何 auth 状态。
@@ -266,6 +272,22 @@ claude-science stop | status | url
 - 切换供应商必须重启 daemon（base_url 只在启动时读取）；重启会打断进行中的会话，
   Science 侧显示 `This session was interrupted by a restart`，因此有活跃会话时
   必须先要确认（`daemon.active_conversations > 0` 且未传 `force` → 拒绝）。
+- **联网搜索总开关**（`Profile.web_search`，全局、默认开）由调用方传给 `start`，模块内部不读
+  配置文件。`--config` 是否出现由 `launch_config` 的返回值唯一决定：
+  - 开启 → `Ok(None)`：不生成、不带参数，并尽力删除残留镜像。Science 自己配置里的任何值
+    （包括手写的 `enable_web_search = false`）原样生效，CSSwitch 不替用户放宽。
+  - 关闭 → 镜像 = 源文件全部内容 + **根表** `enable_web_search = false`（原本有就覆盖，没有就
+    新增），用 `toml_edit` 读写；源不存在时镜像只有这一个键。每次启动都重新生成。
+  - 对真实 `~/.claude-science/` 只读 `config.toml` 一个文件，不写、不建任何东西。
+  - 写出走同目录临时文件 → `0600` → rename，目录 `0700`：镜像带着用户原配置的全部内容。
+- 切换总开关（`POST /control/web-search`）的顺序固定：判定（值没变 → 不动；官方实例在运行且
+  有活跃会话且未带 `force` → 拒绝）→ 关闭时先试生成镜像 → 存盘并更新运行时快照 → 官方实例
+  在运行就 stop → start。拒绝与镜像失败都在存盘**之前**，开关不会停在「已保存但没生效」；
+  重启失败**不回滚**（回滚再重启可能循环），原文报出当前真实状态。免登录沙箱不自动重启，
+  只在响应里置 `sandbox_restart_required`。
+- 旧的渠道级 `kimi.web_search` 只在解析入口迁移一次（`Profile::parse`）：顶层没有 `web_search`
+  且 `kimi.web_search == false` → 总开关为关；顶层字段一旦存在就以它为准。`POST /control/config`
+  收到 `web_search` 显式报错并指向新端点，不静默忽略。
 
 ### 4. 校验与错误矩阵
 
@@ -274,22 +296,40 @@ claude-science stop | status | url
 | 找不到 claude-science | 明确报错并列出已查找路径；`CLAUDE_SCIENCE_BIN` 无效时 fail closed，不回退其它候选 |
 | daemon 未运行时 stop | 视为成功（stderr 含 not running / no daemon） |
 | 退出服务（`/control/quit`） | 先并行停掉**正在运行的**官方实例与沙箱再退进程；未安装 / 未运行不算失败，沙箱未运行时不碰其目录；停止失败不拦截退出，原文随响应 `errors` 返回 |
-| 有活跃会话且未确认 | 拒绝切换并报告会话数，不静默打断 |
+| 有活跃会话且未确认 | 拒绝切换（模式、联网搜索总开关同一套规矩）并报告会话数，不静默打断；总开关被拒绝时配置与 Science 都不变 |
 | 渠道配置不完整 | 切换前就拒绝，不要等推理时才 400 |
+| 源 `config.toml` 读不了或解析不了（关闭态） | 报错并拒绝启动 / 拒绝关闭开关，不写镜像、不回退成空配置；报错给路径、行列与解析器原话，**不带出错行的内容**（可能是带口令的代理地址） |
+| 源 `config.toml` 不存在（关闭态） | 正常：镜像只有 `enable_web_search = false`，不替用户创建源文件 |
+| 关闭开关后 Science 起不来 | 原文报出；把开关拨回开启再启动，就是不带 `--config` 的原始启动方式 |
 
 ### 5. 正常 / 基线 / 错误案例
 
 - 正常：官方模式下 Science 设置页 About 显示自动更新可用，历史项目与会话完整。
 - 基线：切换模式后拿到新登录链接，旧会话仍在列表里。
 - 错误：为"隔离干净"传 `--data-dir`——用户打开后发现对话全没了。
+- 错误：为了关闭联网搜索去改写 `~/.claude-science/config.toml`——坏文件会留在 Science 自己的
+  目录里，不经 CSSwitch 也起不来；开启时还要删键，可能覆盖别人手写的 `false`。
 
 ### 6. 必需测试
 
 - `science::tests::model_env_clear_list_covers_auth_and_role_overrides`：断言清除列表
   覆盖模型与凭证变量，且 **`ANTHROPIC_BASE_URL` 不在其中**（它是要注入的）。
+- `science::tests::official_serve_args_pin_ports_and_never_isolate`：开启态参数向量与字面量
+  逐项相等；关闭态 `--config <镜像>` 恰好一次、去掉这一对后与开启态相同；`--data-dir`、
+  `--no-auto-update` 两种状态下都不出现。
+- `science_config::tests`：断言一律**用 TOML 解析器把镜像读回来**比较，不拿实现里的字符串当预期。
+  覆盖：开启态不写文件并清残留；无源文件；含根键 / 注释 / 表 / 行内表 / 多行字符串 / 表数组的源
+  （除新增键外逐值相等、键在根表）；源里原本是 `true`（不得出现重复键）；源无法解析（报错、
+  不写镜像、报错不含文件内容）；源读不了不等于空配置；源目录零写入；权限 `0600` / `0700`。
+- `control::tests`：切换判定纯函数的四条分支；请求体的 `enabled` / `force` 必须是布尔。
 - loopback 层断言配置文件权限为 `0600`、且未写出 `~/.csswitch/config.json`。
 - loopback 层用假 `CLAUDE_SCIENCE_BIN` 与命令行同形的假沙箱进程，断言退出服务停掉两个实例且进程退出；
   loopback 全程不得解析到本机真实 `claude-science`。
+- loopback 层的联网搜索总开关：开启态 `serve` 整行等于主线；关闭态整行带 `--config <镜像>`，
+  镜像在根表含该键并保留临时 HOME 里源配置的其它键，源目录不变；重新开启后整行回到主线；
+  活跃会话未确认、源配置无法解析两种情况下配置文件逐字节不变且没有 stop / serve。
+  假 `claude-science` 的 `status` 输出形状必须与真实一致
+  （`{"running":true,"daemon":{"active_conversations":N}}`），否则测的是假设。
 
 ### 7. Wrong vs Correct
 
@@ -304,9 +344,10 @@ claude-science stop | status | url
 #### Correct
 
 ```rust
-// 只注入路由，其余一律沿用用户手动启动时的行为
-&["serve", "--detached", "--no-browser"]
+// 只在启动时注入，其余一律沿用用户自己的实例
+&["serve", "--port", "8686", "--sandbox-port", "8687", "--detached", "--no-browser"]
 // env: ANTHROPIC_BASE_URL=<gateway>
+// 联网搜索关闭时在 serve 之后多一对:"--config", <CSSwitch 生成的镜像>
 ```
 
 ---
@@ -323,9 +364,11 @@ claude-science stop | status | url
 ### 2. 签名
 
 ```text
-sandbox::start(base_url) → forge(幂等三态) → SSH/gh 桥接 → 沙箱钥匙串 → 端口检查 → daemon → 健康 → 钥匙串校验
-claude-science serve --data-dir <沙箱> --host 127.0.0.1 --port 8790 --sandbox-port 8791
+sandbox::start(base_url, web_search) → forge(幂等三态) → SSH/gh 桥接 → 沙箱钥匙串 → 端口检查
+  → 镜像配置(仅联网搜索关闭态) → daemon → 健康 → 钥匙串校验
+claude-science serve --data-dir <沙箱> [--config <镜像>] --host 127.0.0.1 --port 8790 --sandbox-port 8791
   --no-browser --no-auto-update --detached
+  镜像: source = <沙箱 data-dir>/config.toml(只读)  mirror = ~/.csswitch/science-config/sandbox.toml
   env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>  https_proxy=<网关快速失败>
        PATH=<沙箱>/bin:<继承>  GIT_CONFIG_COUNT/KEY_n/VALUE_n(本机装了 gh 时)
 sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护栏先行
@@ -343,6 +386,11 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
   forge 修复/铸新后先清沙箱钥匙串旧条目（0.1.48 以 Keychain 为权威，不清会被
   回写吃掉修复形成死循环）；启动后正向校验密钥确在沙箱钥匙串内，不过即停 daemon。
 - 固定端口 8790/8791，占用即报错，永不自动改绑；全部监听回环。
+- 联网搜索总开关与官方实例走同一机制（`science_config::launch_config`，合同见上一场景）：
+  关闭态多带一对 `--config <镜像>`，数据目录仍由 `--data-dir` 钉死；开启态启动参数与没有这个
+  开关时逐项相同。镜像在钥匙串清理**之后**生成：forge 已重写登录而旧钥匙串条目还没清就中途
+  退出，下次启动会判成 Reused 跳过清理。沙箱已在运行时 `start` 原样返回、不重启，开关的新值
+  要等用户重启沙箱才到它那一侧（网关一侧的摘除不依赖它）。
 - 对外入口链接的主机名固定 `127.0.0.1`，`localhost` 留给真实实例：浏览器 cookie 只按
   主机名划作用域、不看端口，而 Science 的 `operon_auth` / `operon_csrf` 都是 host-only，
   两实例同主机时后登录的一方会顶掉另一方。daemon 的 Host 闸门与写操作 Origin 闸门
@@ -381,6 +429,8 @@ sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护�
 - 护栏负例断言**零写入**（真实目录逐字节不变、符号链接目标不建目录）。
 - 幂等三态：Reused 断言 `.enc` 与 `encryption.key` 逐字节不变；Repaired 断言 org 保留。
 - 兜底停止的命令行匹配：正例命中、pid 复用/真实实例/前缀相似目录/瞬时 CLI 四组负例拒绝。
+- 启动参数：开启态与字面量逐项相等；关闭态 `--config <镜像>` 恰好一次、去掉后与开启态相同，
+  且带着它的命令行仍被兜底停止的匹配认出（否则关着搜索的沙箱停不掉）。
 - 入口链接主机名改写：localhost → 127.0.0.1、带路径前缀、已是 127.0.0.1 时幂等、
   非法 URL 原样返回，四例都钉住；并断言沙箱主机名不等于 `localhost`。
 - gh 桥接：包装脚本行为级校验（假 gh 在沙箱 HOME 下被执行时看到的是真实 HOME、参数原样
@@ -546,11 +596,15 @@ RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
   （2026-08-20 review：后置谓词恒为 false，整条过滤主路径成了死代码而测试仍绿）。
 - adapter 日志行携带 `merged_shape=<块类型序列>` 与 `pair_key_prefix=<键前缀段>`
   诊断投影（只记形状与前缀，不记查询词或 id 全文），是排查 Science 落盘行为的一手数据。
-- **渠道级能力开关关闭时，声明在补偿链之前摘除**（`strip_typed_web_search_tools`，规则
+- **联网搜索总开关关闭时，声明在补偿链之前摘除**（`strip_typed_web_search_tools`，规则
   `tool.relay.web-search-disabled-by-config`），不在链尾的 server tool policy 里摘：
   §「重排 Science 尾随机器上下文」等规则以「本轮声明了 typed search」为触发条件且跑在更早，
   链尾摘除会让它们先按"会搜索"改写一个根本不会搜索的轮次。链首摘除后整条链一致地落到
   「无 typed search → bridge 不触发，原样路径」这一既有分支，既有规则一条都不用改。
+  开关是全局的（`GatewayConfig.web_search` 取 `Profile.web_search`，不分渠道）：摘除不按 flavor
+  分支，DeepSeek 平时留给上游原生执行的搜索声明同样被摘。它是独立于 Science 一侧
+  （`enable_web_search = false` 的镜像配置）的保证：Science 还没重启、沙箱还没重启、或
+  Science 版本不认识该选项时，桥仍然是断开的；Science 一侧生效后请求里没有声明，规则不再命中。
   开关默认开，serde 默认值必须显式写 `true`——`bool` 原生默认是 `false`，存量配置没有该字段，
   用原生默认等于给所有老用户静默停掉该能力。关闭态不清洗历史工具块，
   「未声明该工具却回放其历史」是否被上游接受属未验证形状，交真机判定，不预先兜底。
@@ -568,7 +622,7 @@ RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
 | evidence > 512 KiB（两条路径同判）/ usage 数值溢出 | 502，零截断、零假成功 |
 | usage 同键类型跨阶段不一致 | 取最后阶段值 + log_line 告警，不 502 |
 | shared deadline 过期 | 504，下一阶段联网前失败 |
-| 渠道开关关闭 | 链首摘声明 + 记规则，bridge 与 tail-reorder 均不触发，上游 1 call；无声明的轮次零改写 |
+| 联网搜索总开关关闭 | 链首摘声明 + 记规则，bridge 与 tail-reorder 均不触发，上游 1 call；无声明的轮次零改写；Kimi 与 DeepSeek 同判 |
 
 ### 5. 正常 / 基线 / 错误案例
 
@@ -588,10 +642,12 @@ RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
 - K3 尾随 client search 正例与位置/name/id/input/无 pair 负例。
 - 真机必须在同一最终构建上分别跑 K3、K3-256k、K2.7：搜索 → 不联网追问 → 重载；
   核对 query/card/text、`bridged`、calls、无 400/repair/upstream failure。direct/provider 与 Science 证据分栏。
-- 渠道开关：**从 `handle_messages` 打到 fake 上游**看真正发出去的报文，断言上游 tools 里既没有
+- 联网搜索总开关：**从 `handle_messages` 打到 fake 上游**看真正发出去的报文，断言上游 tools 里既没有
   typed search 也没有 bridge 的私有查询工具（它同名 `web_search`，只断言"没有 typed"会漏掉桥仍触发）。
-  只测摘除函数本身证明不了 `cfg` 里的开关被读到。另需：链首摘除后 tail-reorder 不触发、
-  无声明轮次逐字段原样、缺省字段不改动已保存值、非布尔值显式报错。
+  只测摘除函数本身证明不了 `cfg` 里的开关被读到。DeepSeek 单独一条，并先用开启态确认同一请求
+  确实会带着搜索声明出去（否则关闭态的断言不说明问题）。另需：链首摘除后 tail-reorder 不触发、
+  无声明轮次逐字段原样；loopback 层在真实进程里断言关闭态日志含规则 id、不含 adapter，
+  重新开启后同一请求不经重启即重新走桥。
 
 ### 7. Wrong vs Correct
 
