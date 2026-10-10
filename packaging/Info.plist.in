@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  应用包的 Info.plist 模板。build_app.sh 把 @VERSION@ 换成 desktop/gateway/Cargo.toml 的版本号。
+
+  LSUIElement     不进 Dock、不出现在应用切换器里:界面是浏览器里的控制台,应用本身没有窗口。
+  LSEnvironment   经 Finder / Launchpad 打开时给主进程设 CSSWITCH_APP_LAUNCH=1,
+                  二进制据此进入启动器角色(拉起后台服务、打开控制台、退出)。
+                  直接在终端里执行包内二进制不会带这个变量,仍是前台服务。
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh_CN</string>
+  <key>CFBundleDisplayName</key>
+  <string>CSSwitch</string>
+  <key>CFBundleExecutable</key>
+  <string>CSSwitch</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.rerrentlinden.csswitch</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>CSSwitch</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>CSSWITCH_APP_LAUNCH</key>
+    <string>1</string>
+  </dict>
+  <key>LSMinimumSystemVersion</key>
+  <string>@MIN_MACOS@</string>
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

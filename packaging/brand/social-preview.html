@@ -1,0 +1,50 @@
+<!doctype html>
+<!-- 宣传图源文件。渲染成 docs/assets/social-preview.png(1280×640),见同目录 build.sh。
+     文案只写产品现在真有的东西;README 是事实来源。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>CSSwitch</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    width: 1280px; height: 640px; overflow: hidden;
+    font-family: -apple-system, "SF Pro Display", "PingFang SC", sans-serif;
+    color: #f6efe4;
+    background:
+      radial-gradient(900px 520px at 22% 38%, rgba(255, 122, 69, .13), transparent 62%),
+      linear-gradient(160deg, #2e2824 0%, #1b1816 55%, #131110 100%);
+    display: grid; grid-template-columns: 500px 1fr; align-items: center;
+  }
+  .mark { display: grid; place-items: center; }
+  .mark img { width: 420px; height: 420px; display: block; }
+  .text { padding-right: 84px; }
+  .name { font-size: 30px; font-weight: 600; letter-spacing: .5px; color: #ff9d6e; margin: 0 0 14px; }
+  h1 { font-size: 62px; line-height: 1.16; font-weight: 700; letter-spacing: .5px; margin: 0 0 20px; }
+  .sub { font-size: 25px; line-height: 1.55; color: #cfc5b8; margin: 0 0 34px; }
+  .modes { display: flex; gap: 14px; margin: 0 0 30px; }
+  .mode {
+    font-size: 23px; font-weight: 600; padding: 11px 24px; border-radius: 999px;
+    border: 1.5px solid rgba(246, 239, 228, .26); color: #f6efe4;
+  }
+  .mode.on { background: linear-gradient(180deg, #ff9d6e, #dd5a2e); border-color: transparent; color: #fff; }
+  .facts { font-size: 20px; color: #9c9288; letter-spacing: .3px; }
+  .facts b { color: #cfc5b8; font-weight: 500; }
+</style>
+</head>
+<body>
+  <div class="mark"><img src="../icon/AppIcon.svg" alt=""></div>
+  <div class="text">
+    <p class="name">CSSwitch</p>
+    <h1>给 Claude Science<br>换模型供应商</h1>
+    <p class="sub">点一下切换,对话仍然留在你自己的 Science 实例里。</p>
+    <div class="modes">
+      <span class="mode on">官方 Claude</span>
+      <span class="mode">Kimi</span>
+      <span class="mode">DeepSeek</span>
+    </div>
+    <p class="facts"><b>macOS 应用</b> · 浏览器控制台 · 免登录沙箱 · 联网搜索开关</p>
+  </div>
+</body>
+</html>

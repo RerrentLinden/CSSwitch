@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 100 824 824">
+<defs>
+<linearGradient id="lg-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a332e"/><stop offset="1" stop-color="#171412"/></linearGradient>
+<linearGradient id="lg-track" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff9d6e"/><stop offset="1" stop-color="#dd5a2e"/></linearGradient>
+</defs>
+<rect x="100" y="100" width="824" height="824" rx="185" fill="url(#lg-bg)"/>
+<g fill="none" stroke="#f6efe4" stroke-linecap="round" stroke-linejoin="round">
+<path stroke-width="50" d="M362 512H402M622 512H662"/>
+<polyline stroke-width="60" points="340,188 353,206 369,224 387,242 407,260 428,278 451,296 475,314 499,332 523,350 546,368 569,386 589,404 608,422 624,440 638,458 649,476 657,494 662,512 664,530 662,548 658,566 650,584 640,602 627,620 612,638 596,656 578,674 559,692 539,710 519,728 500,746 482,764 464,782 448,800 435,818 423,836"/>
+<polyline stroke-width="60" points="601,188 589,206 576,224 560,242 542,260 524,278 505,296 485,314 465,332 446,350 428,368 412,386 397,404 384,422 374,440 366,458 362,476 360,494 362,512 367,530 375,548 386,566 400,584 416,602 435,620 455,638 478,656 501,674 525,692 549,710 573,728 596,746 617,764 637,782 655,800 671,818 684,836"/>
+</g>
+<rect x="394" y="437" width="236" height="150" rx="75" fill="url(#lg-track)"/>
+<circle cx="555" cy="512" r="61" fill="#ffffff"/>
+</svg>
