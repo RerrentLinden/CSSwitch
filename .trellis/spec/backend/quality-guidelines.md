@@ -370,6 +370,7 @@ claude-science serve --data-dir <沙箱> [--config <镜像>] --host 127.0.0.1 --
   --no-browser --no-auto-update --detached
   镜像: source = <沙箱 data-dir>/config.toml(只读)  mirror = ~/.csswitch/science-config/sandbox.toml
   env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>/sandbox  https_proxy=<网关>(快速失败,不带前缀)
+       DO_NOT_TRACK=1(关 Science 的使用统计与错误上报)
        PATH=<沙箱>/bin:<继承>  GIT_CONFIG_COUNT/KEY_n/VALUE_n(本机装了 gh 时)
 sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护栏先行
 
@@ -419,6 +420,11 @@ GET  /control/status → 顶层 sandbox_mode / sandbox_mode_label
     时不覆盖；继承的 PATH 不可用时不改 PATH（只剩包装目录会让 daemon 找不到系统命令）。
     启动日志记 `gh_bridge=on|off`。
 - token/key/钥匙串密码不进日志、不进控制面响应；`security` 命令输出全丢弃。
+- 沙箱不向 Anthropic 上报：`daemon_env` 带 `DO_NOT_TRACK=1`（Science 官方开关，关使用统计与
+  错误上报，只在 daemon 启动时读）。快速失败代理只拦 Anthropic / Claude 域名
+  （`connect::is_blocked_host`），错误上报的主机不在其中，靠代理拦不住，所以从源头关。
+  取值不能是空串、`0`、`false`：Science 0.1.60 的判定函数把这三个当作没设（静态检查）。
+  只加在沙箱一侧——真实实例的遥测设置是用户自己的，`science.rs` 的环境不得带它。
 - **沙箱的渠道与正式实例各选各的**（`Profile.sandbox_mode` 对 `Profile.mode`）：
   - 网关靠沙箱 base_url 的路径前缀 `/sandbox` 认出沙箱的请求。前缀只定义一次
     （`sandbox::INFERENCE_PREFIX`，沙箱环境与路由共用），只加在 `ANTHROPIC_BASE_URL` 上，
@@ -471,7 +477,8 @@ GET  /control/status → 顶层 sandbox_mode / sandbox_mode_label
 - 独立渠道：
   - 路由函数：四条推理路径（含 query，前缀被剥、query 保留）与近似路径
     （`/sandbox`、`/sandbox/`、`/sandbox/v1/unknown`、`/sandboxx/…`、叠两层前缀、`//sandbox/…`）。
-  - `daemon_env`：base_url 带前缀，两个代理变量不带。
+  - `daemon_env`：base_url 带前缀，两个代理变量不带；带 `DO_NOT_TRACK`，且取值不是空串 /
+    `0` / `false`（这三个 Science 当作没设）。
   - 切换判定的四条分支，拒绝文案含「沙箱正在运行」；请求解析拒绝 `official`、未知模式、
     非布尔 `force`。
   - 启动前置检查要抽成函数来测（`sandbox_start_precheck`）：正式实例为官方而沙箱渠道完整 →
