@@ -30,6 +30,7 @@ scratchpad/
 !/.trellis/spec/
 /.agents/skills/
 /.codex/
+/.kimi-code/
 
 # Agent 临时交接是本地执行残留,只跟踪其策略说明
 .agents/handoffs/*
