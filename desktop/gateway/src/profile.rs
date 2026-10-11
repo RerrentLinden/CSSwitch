@@ -143,7 +143,8 @@ impl Channel {
             api_key: String::new(),
             default_model: ModelSlot::new("k3-256k", "Kimi K3 256k"),
             quality_model: ModelSlot::new("k3", "Kimi K3"),
-            fast_model: ModelSlot::new("kimi-for-coding", "Kimi K2.7"),
+            // 这个 id 自 2026-09-11 起指向 K2.8 Preview(此前是 K2.7)。
+            fast_model: ModelSlot::new("kimi-for-coding", "Kimi K2.8"),
             fable_model: ModelSlot::default(),
         }
     }
@@ -194,6 +195,7 @@ impl Channel {
     pub fn static_catalog(&self, adapter: &str) -> Value {
         let slots = self.resolved_slots();
         // 同一模型 ID 在多个槽复用时只产出一条 route,避免菜单里出现重复项。
+        // 显示名取第一个出现的槽(默认 → 高质量 → 快速 → Fable)。
         let mut routes: Vec<Value> = Vec::new();
         let mut selector_by_model: BTreeMap<String, String> = BTreeMap::new();
         for (_role, slot) in slots.iter() {
@@ -475,6 +477,66 @@ mod tests {
         assert!(
             resolver.resolve("claude-opus-5").is_some(),
             "官方角色名可解析"
+        );
+    }
+
+    /// 0.10.0 对出厂默认配置写出的 `service.v1.json`,逐字节。
+    const CONFIG_WRITTEN_BY_0_10_0: &str = r#"{
+  "mode": "official",
+  "sandbox_mode": "kimi",
+  "port": 8788,
+  "kimi": {
+    "base_url": "https://api.kimi.com/coding",
+    "api_key": "",
+    "default_model": {
+      "model_id": "k3-256k",
+      "display_name": "Kimi K3 256k"
+    },
+    "quality_model": {
+      "model_id": "k3",
+      "display_name": "Kimi K3"
+    },
+    "fast_model": {
+      "model_id": "kimi-for-coding",
+      "display_name": "Kimi K2.7"
+    },
+    "fable_model": {
+      "model_id": "",
+      "display_name": ""
+    }
+  },
+  "deepseek": {
+    "base_url": "https://api.deepseek.com/anthropic",
+    "api_key": "",
+    "default_model": {
+      "model_id": "deepseek-v4-pro",
+      "display_name": "DeepSeek V4 Pro"
+    },
+    "quality_model": {
+      "model_id": "",
+      "display_name": ""
+    },
+    "fast_model": {
+      "model_id": "deepseek-v4-flash",
+      "display_name": "DeepSeek V4 Flash"
+    },
+    "fable_model": {
+      "model_id": "",
+      "display_name": ""
+    }
+  },
+  "request_log": true,
+  "web_search": true
+}"#;
+
+    #[test]
+    fn a_config_written_by_0_10_0_round_trips_byte_for_byte() {
+        // 存量文件读进来再存回去,不能多出键、少掉键或换了顺序 —— 否则每个老用户的配置在第一次
+        // 保存时都会被改写,回滚到旧版本后还会看到不认识的键。存盘用的就是 `to_string_pretty`。
+        let profile = Profile::parse(CONFIG_WRITTEN_BY_0_10_0).unwrap();
+        assert_eq!(
+            serde_json::to_string_pretty(&profile).unwrap(),
+            CONFIG_WRITTEN_BY_0_10_0
         );
     }
 

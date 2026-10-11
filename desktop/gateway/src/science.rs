@@ -2,15 +2,23 @@
 //!
 //! 用户自己安装的 Science、用户自己的默认 profile(`~/.claude-science`)、
 //! 用户自己的真实登录 —— CSSwitch 只在启动时注入:`ANTHROPIC_BASE_URL` 把推理指向
-//! 本机网关;联网搜索总开关关闭时再多带一份镜像配置(见下)。别的一概不碰,
+//! 本机网关;有启动覆盖项时再多带一份镜像配置(见下)。别的一概不碰,
 //! 对 `~/.claude-science/` 不写任何文件。
 //!
 //! 硬约束(经实测确认,违反会伤到用户的真实实例或改变它的行为):
 //! - 不传 `--data-dir`:那会造出隔离实例,对话从此分家;
-//! - `--config` 只允许出现在联网搜索关闭态,且只指向 CSSwitch 生成的镜像
-//!   (`science_config.rs`:用户原配置 + `enable_web_search = false`)。`--config` 只换
-//!   配置文件、不换数据目录(2026-10-10 用 0.1.60 隔离实测);开关开启时不带它,
-//!   启动参数与没有这个开关时逐项相同;
+//! - `--config` 只指向 CSSwitch 生成的镜像(`science_config.rs`:用户原配置 + 启动覆盖项),
+//!   出现与否由覆盖项唯一决定:
+//!
+//!   ```text
+//!   官方模式 · 联网搜索开   serve --port 8686 --sandbox-port 8687 --detached --no-browser
+//!   官方模式 · 联网搜索关   serve --config <镜像> …      镜像写 enable_web_search = false
+//!   第三方模式(Kimi / DeepSeek) serve --config <镜像> …  总是带:镜像写 default_model;
+//!                                                       联网搜索关闭时再加 enable_web_search
+//!   ```
+//!
+//!   第一行与 CSSwitch 没有这些覆盖项时逐项相同。`--config` 只换配置文件、不换数据目录
+//!   (2026-10-10 用 0.1.60 隔离实测);
 //! - 不传 `--no-auto-update`:官方实例必须保留自身的自动更新;
 //! - 端口固定为 [`OFFICIAL_PORT`] / [`OFFICIAL_SANDBOX_PORT`],不用 `0` 随机端口:
 //!   控制台地址必须稳定可收藏。不沿用 Science 默认的 8000/8001,那两个端口常被
@@ -22,6 +30,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
+
+use crate::science_config::LaunchOverrides;
 
 /// 启动时清空的模型类环境变量:它们会越过网关的模型目录,
 /// 让 Science 直接向上游要一个我们没路由的模型。
@@ -143,7 +153,8 @@ pub fn stop() -> Result<(), String> {
 }
 
 /// 官方实例的 `serve` 参数。永不带 --data-dir / --no-auto-update;`--config` 只在
-/// `mirror_config` 有值(联网搜索关闭态)时出现,见模块文档的硬约束。端口固定,理由同上。
+/// `mirror_config` 有值(有启动覆盖项:第三方模式,或联网搜索关闭)时出现,见模块文档的
+/// 硬约束。端口固定,理由同上。
 fn serve_args(mirror_config: Option<&Path>) -> Vec<String> {
     let mut args = vec!["serve".to_string()];
     if let Some(config) = mirror_config {
@@ -161,12 +172,13 @@ fn serve_args(mirror_config: Option<&Path>) -> Vec<String> {
     args
 }
 
-/// 以官方默认 profile 启动 daemon:注入 base_url;`web_search` 为 `false`(联网搜索总开关
-/// 关闭)时再带上镜像配置。镜像生成失败(例如用户的 `config.toml` 无法解析)直接报错,
-/// 不启动 —— 不能让开关看起来生效而 Science 实际照旧。
-pub fn start(proxy_base_url: &str, web_search: bool) -> Result<(), String> {
+/// 以官方默认 profile 启动 daemon:注入 base_url;有启动覆盖项(第三方模式要指定默认模型;
+/// 联网搜索总开关关闭)时再带上镜像配置。覆盖项由调用方给出,这里不读配置文件。
+/// 镜像生成失败(例如用户的 `config.toml` 无法解析)直接报错,不启动 —— 不能让设置看起来
+/// 生效而 Science 实际照旧。
+pub fn start(proxy_base_url: &str, overrides: &LaunchOverrides) -> Result<(), String> {
     let bin = find_binary()?;
-    let mirror_config = crate::science_config::official_launch_config(web_search)?;
+    let mirror_config = crate::science_config::official_launch_config(overrides)?;
     let args = serve_args(mirror_config.as_deref());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(
@@ -259,6 +271,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn launch_overrides_alone_decide_whether_the_config_flag_appears() {
+        // `start` 做的就是这两步:覆盖项 → 镜像(有或没有)→ serve 参数。
+        let base = std::env::temp_dir().join(format!(
+            "csswitch-science-launch-test-{}-{}",
+            std::process::id(),
+            crate::sandbox_forge::rand_hex(4).unwrap()
+        ));
+        let source = base.join("science/config.toml");
+        let mirror = base.join("csswitch/science-config/official.toml");
+        let args_for = |web_search: bool, default_model: Option<&str>| {
+            let overrides = LaunchOverrides {
+                web_search,
+                default_model: default_model.map(str::to_string),
+            };
+            let config =
+                crate::science_config::launch_config(&overrides, &source, &mirror).unwrap();
+            serve_args(config.as_deref())
+        };
+        let config_flags = |args: &[String]| args.iter().filter(|arg| *arg == "--config").count();
+
+        // 第三方模式总是带镜像 —— 联网搜索开着也一样,否则 Science 的默认模型会停在
+        // 清单里已经没有的官方 id 上。
+        for web_search in [true, false] {
+            let args = args_for(web_search, Some("claude-sonnet-19"));
+            assert_eq!(config_flags(&args), 1, "--config 恰好出现一次:{args:?}");
+            let flag = args.iter().position(|arg| arg == "--config").unwrap();
+            assert_eq!(args[flag + 1], mirror.display().to_string());
+        }
+        // 官方模式 + 联网搜索开启:回到不带任何覆盖项的原始参数(先在第三方模式下启动过也一样)。
+        assert_eq!(
+            args_for(true, None),
+            [
+                "serve",
+                "--port",
+                "8686",
+                "--sandbox-port",
+                "8687",
+                "--detached",
+                "--no-browser"
+            ]
+        );
+        assert!(!mirror.exists(), "切回官方模式后不留镜像");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

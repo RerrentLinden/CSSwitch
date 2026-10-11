@@ -119,9 +119,7 @@
 
   <section class="card">
     <h2>当前连接</h2>
-    <p class="hint" style="margin-top:0">
-      这里选的是正式实例(你自己登录的 Science)用哪个 AI。免登录沙箱在下面的卡片里单独选,两边互不影响。
-    </p>
+    <p class="hint" style="margin-top:0">你自己登录的 Science 用哪个 AI。</p>
     <div class="modes" id="modes"></div>
     <div class="row" style="margin-top:16px">
       <span class="pill"><span class="dot" id="sci-dot"></span><span id="sci-text">检查中…</span></span>
@@ -136,25 +134,13 @@
         <input type="checkbox" id="web-search">
         <span>联网搜索</span>
       </label>
-      <p class="hint" style="margin:6px 0 0">
-        关闭后,经 CSSwitch 启动的 Science 不再提供联网搜索(官方 / Kimi / DeepSeek 与免登录沙箱都适用),
-        Kimi 的 web_search 兼容桥同时断开。开启时沿用 Science 自己的配置,CSSwitch 不干预。
-        切换会重启正在运行的 Science;免登录沙箱不会自动重启,需要手动重启后生效。
-      </p>
     </div>
     <div class="msg" id="mode-msg"></div>
   </section>
 
   <section class="card">
     <h2>免登录沙箱</h2>
-    <p class="hint" style="margin-top:0">
-      无 Claude 订阅时,用下面选中的渠道驱动一个隔离的 Science 实例(127.0.0.1:8790)。
-      沙箱没有真实的 Claude 登录,所以没有「官方 Claude」这一项。
-      渠道与上面的正式实例各选各的,共用「渠道配置」里的同一份地址、API Key 与模型;
-      沙箱运行中切换会先确认,再重启沙箱。
-      沙箱的对话历史与正式实例相互独立,数据保存在 <code>~/.csswitch/science-sandbox/</code>;
-      正式实例不受任何影响。
-    </p>
+    <p class="hint" style="margin-top:0">没有 Claude 订阅时用:一个独立的 Science,对话与上面的分开。</p>
     <div class="modes two" id="sb-modes" style="margin-bottom:16px"></div>
     <div class="row">
       <span class="pill"><span class="dot" id="sb-dot"></span><span id="sb-text">检查中…</span></span>
@@ -182,16 +168,12 @@
       </div>
       <div class="row" style="margin-bottom:12px">
         <button type="button" class="act" id="btn-probe">获取可用模型</button>
-        <span class="sub" id="probe-note">从上游拉取模型清单</span>
+        <span class="sub" id="probe-note"></span>
       </div>
       <div class="slots" id="slots"></div>
-      <p class="hint" style="margin-top:14px">
-        默认模型必填;高质量、快速与 Fable 留空时自动继承默认模型。
-        模型 ID 用于上游请求,显示名用于 Science 的模型菜单。
-      </p>
-      <div class="row">
+      <div class="row" style="margin-top:14px">
         <button type="submit" class="act primary">保存配置</button>
-        <span class="sub">保存只更新配置;运行中的链路不变,下次切换或重启 Science 时生效。</span>
+        <span class="sub">重启 Science 后生效。</span>
       </div>
       <div class="msg" id="cfg-msg"></div>
     </form>
@@ -204,16 +186,11 @@
         <input type="checkbox" id="request-log">
         <span>记录请求日志</span>
       </label>
-      <p class="hint" style="margin:6px 0 0">
-        关闭后不再记录每条请求:服务日志(安装版在 <code>~/.csswitch/service.log</code>,
-        <code>./csswitch</code> 打在终端)里的请求明细行与下方列表都停止记录。
-        启动信息、警告与错误始终保留。切换立即生效,无需重启。
-      </p>
       <div class="msg" id="log-msg"></div>
     </div>
     <div class="row" style="margin-bottom:12px">
       <button class="act" id="btn-logs">刷新</button>
-      <span class="sub">仅记录方法、路径、状态与耗时,不含任何凭证或消息内容。</span>
+      <span class="sub">不记录凭证与消息内容。</span>
     </div>
     <div class="logwrap">
       <table>
@@ -326,13 +303,6 @@ function renderScience() {
   $('base-url').textContent = state.base_url;
   $('btn-open').disabled = !running;
 }
-
-const SB_ACTIONS = {
-  created: '首次铸造虚拟登录',
-  repaired: '已修复沙箱登录并沿用沙箱内原有对话',
-  reused: '沙箱登录完整,直接复用',
-  'already-running': '沙箱已在运行',
-};
 
 function renderSandbox() {
   const sandbox = state.sandbox || {};
@@ -480,7 +450,7 @@ $('btn-start').onclick = async () => {
   try {
     const result = await api('science/start', { method: 'POST' });
     scienceUrl = result.url || null;
-    msg($('mode-msg'), 'Science 已启动。' + (scienceUrl ? '' : '可用「打开 Science」获取登录链接。'));
+    msg($('mode-msg'), 'Science 已启动。');
     await refresh();
   } catch (error) {
     msg($('mode-msg'), '启动失败:' + error.message, 'err');
@@ -509,7 +479,7 @@ $('btn-open').onclick = async () => {
 $('btn-sb-start').onclick = async () => {
   try {
     const result = await api('sandbox/start', { method: 'POST' });
-    msg($('sb-msg'), '沙箱已启动:' + (SB_ACTIONS[result.action] || '完成') + '。');
+    msg($('sb-msg'), result.action === 'already-running' ? '沙箱已在运行。' : '沙箱已启动。');
     if (result.url) window.open(result.url, '_blank');
     await refresh();
   } catch (error) {
@@ -567,26 +537,16 @@ $('btn-quit').onclick = async () => {
     errors.forEach((error) => line(error, 'msg err show'));
   }
   card.insertAdjacentHTML('beforeend',
-    '<p class="sub">再次启动:重新打开 CSSwitch 应用;从源码运行的,重新运行 <code>./csswitch</code>。</p>');
+    '<p class="sub">重新打开 CSSwitch 即可再次启动。</p>');
   document.querySelector('.wrap').replaceChildren(card);
 };
 
-// 成功提示按响应逐项拼:Science、网关、沙箱三层的生效时机不同,每一句都只说已经成立的事。
+// 成功提示按响应逐项拼,每一句只说已经成立、且用户需要知道的事。
 function webSearchNote(result) {
   if (!result.changed) return '联网搜索设置没有变化。';
-  const on = result.web_search;
-  const parts = [on ? '已开启联网搜索。' : '已关闭联网搜索。'];
-  if (result.science_restarted) {
-    parts.push(on ? 'Science 已重启,沿用它自己的配置。' : 'Science 已带着关闭设置重启。');
-  } else {
-    parts.push('Science 未在运行,下次从这里启动时生效。');
-  }
-  parts.push(on
-    ? '网关一侧已生效:从下一次请求起不再摘除搜索声明,Kimi 的 web_search 兼容桥恢复。'
-    : '网关一侧已生效:Kimi / DeepSeek 的请求从下一次起不再带搜索声明,Kimi 的 web_search 兼容桥已断开。');
-  if (result.sandbox_restart_required) {
-    parts.push('免登录沙箱正在运行,需要重启沙箱后它那一侧才生效。');
-  }
+  const parts = [result.web_search ? '已开启联网搜索。' : '已关闭联网搜索。'];
+  if (result.science_restarted) parts.push('Science 已重启。');
+  if (result.sandbox_restart_required) parts.push('沙箱要重启后才生效。');
   return parts.join('');
 }
 
@@ -636,7 +596,7 @@ $('request-log').onchange = async (event) => {
       body: JSON.stringify({ request_log: enabled }),
     });
     state.request_log = result.request_log;
-    msg($('log-msg'), enabled ? '已开启请求日志。' : '已关闭请求日志;警告与错误仍会记录。');
+    msg($('log-msg'), enabled ? '已开启请求日志。' : '已关闭请求日志。');
   } catch (error) {
     // 服务端没存上,勾选状态回滚,界面不能和实际行为不一致。
     event.target.checked = !enabled;

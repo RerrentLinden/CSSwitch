@@ -24,9 +24,12 @@
 //!   清空沙箱钥匙串旧条目——0.1.48 以 Keychain 为权威,不一致时把 file 回写成旧值
 //!   (research/science-0148-login-gate.md §2.2),不清则修复被回写吃掉形成死循环;
 //! - 兜底停止只杀「pid 来自沙箱 operon.lock 且命令行含精确 `--data-dir`」的进程;
-//! - `--config` 只在联网搜索总开关关闭态出现,且只指向 CSSwitch 生成的镜像
-//!   (`science_config.rs`:沙箱原配置 + `enable_web_search = false`)。它只换配置文件,
-//!   数据目录仍由 `--data-dir` 钉死;开关开启时启动参数与没有这个开关时逐项相同;
+//! - 启动总是带 `--config`,且只指向 CSSwitch 生成的镜像(`science_config.rs`:沙箱原配置 +
+//!   启动覆盖项)。沙箱只走第三方渠道,镜像里总有 `default_model`(指到模型清单里承载默认槽
+//!   的那一条;Science 出厂的默认模型不在清单里,不指定的话新会话的默认模型不可用),联网搜索
+//!   总开关关闭时再加 `enable_web_search = false`。`--config` 只换配置文件,数据目录仍由
+//!   `--data-dir` 钉死。渠道的默认槽为空时写不出 `default_model`;那时若联网搜索也开着就没有
+//!   覆盖项,不带 `--config`(启动前的渠道完整性检查本来就会拦下这种配置);
 //! - 刻意跨出隔离边界的动作只有两个桥接,都不把真实登录钥匙串挂进沙箱搜索表(真实实例的
 //!   Science 加密密钥也在里面):
 //!   - SSH 桥接:把真实 `~/.ssh` 的 `config`/`known_hosts` 两个非秘密文件 symlink 进沙箱
@@ -42,6 +45,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::sandbox_forge::LoginAction;
+use crate::science_config::LaunchOverrides;
 
 /// 沙箱 daemon 与预览端口。
 const DAEMON_PORT: u16 = 8790;
@@ -117,8 +121,8 @@ pub fn status() -> Value {
     })
 }
 
-/// 一键启动:forge(幂等)→ SSH / gh 桥接 → 沙箱钥匙串就位 → 端口检查 → 镜像配置(仅
-/// 联网搜索关闭态)→ 拉起 daemon → 健康检查 → 钥匙串正向校验。桥接与钥匙串配置步骤失败
+/// 一键启动:forge(幂等)→ SSH / gh 桥接 → 沙箱钥匙串就位 → 端口检查 → 镜像配置(启动
+/// 覆盖项)→ 拉起 daemon → 健康检查 → 钥匙串正向校验。桥接与钥匙串配置步骤失败
 /// 仅警告(桥接缺失只影响 Compute 找主机别名、沙箱读不到本机 gh 登录),其余任一步失败都
 /// 显式报错;健康/校验不过会先停 daemon 再报错。
 ///
@@ -126,9 +130,10 @@ pub fn status() -> Value {
 /// `daemon_env` 加在 `ANTHROPIC_BASE_URL` 上。沙箱走哪个渠道不在这里决定:网关每请求按
 /// `Profile::sandbox_mode` 路由,调用方在启动前检查那个渠道配置完整。
 ///
-/// `web_search` 是联网搜索总开关的当前值,由调用方传入。沙箱已在运行时原样返回,不重启:
-/// 开关的新值要等下一次启动才到沙箱一侧(网关一侧的摘除不依赖它)。
-pub fn start(proxy_base_url: &str, web_search: bool) -> Result<Value, String> {
+/// `overrides` 是这次启动的覆盖项(默认模型、联网搜索总开关的当前值),由调用方给出。
+/// 沙箱已在运行时原样返回,不重启:新的覆盖项要等下一次启动才到沙箱一侧(网关一侧对
+/// 联网搜索的摘除不依赖它)。
+pub fn start(proxy_base_url: &str, overrides: &LaunchOverrides) -> Result<Value, String> {
     if sandbox_process_pid().is_some() {
         return Ok(json!({
             "ok": true,
@@ -159,10 +164,10 @@ pub fn start(proxy_base_url: &str, web_search: bool) -> Result<Value, String> {
     // 3. 固定端口,占用即报错,不自动改绑。
     ensure_port_free(DAEMON_PORT)?;
     ensure_port_free(PREVIEW_PORT)?;
-    // 3.5 联网搜索关闭时生成镜像配置,生成不出来就不拉起。放在钥匙串清理之后:
+    // 3.5 按覆盖项生成镜像配置,生成不出来就不拉起。放在钥匙串清理之后:
     //     forge 已重写登录而旧钥匙串条目还没清就中途退出,下次启动会判成 Reused
     //     跳过清理,修复被 Keychain 回写吃掉。
-    let mirror_config = crate::science_config::sandbox_launch_config(web_search)?;
+    let mirror_config = crate::science_config::sandbox_launch_config(overrides)?;
     // 4. 拉起隔离 daemon。沙箱与真实实例共享同一个二进制,自更新由真实实例负责,
     //    沙箱侧钉 `--no-auto-update` 避免它自己去碰更新通道。
     let mut env = daemon_env(&home, proxy_base_url);
@@ -300,7 +305,7 @@ fn pin_cookie_host(url: &str) -> String {
 }
 
 // ---------- 启动组装(纯函数,供单测钉死) ----------
-/// `mirror_config` 只在联网搜索关闭态有值,指向 `science_config.rs` 生成的镜像;
+/// `mirror_config` 指向 `science_config.rs` 按启动覆盖项生成的镜像,没有覆盖项时为 `None`;
 /// `--config` 只换配置文件,数据目录仍由 `--data-dir` 决定。
 fn serve_args(data_dir: &Path, mirror_config: Option<&Path>) -> Vec<String> {
     let mut args = vec![
@@ -763,7 +768,8 @@ mod tests {
 
     #[test]
     fn serve_args_pin_the_sandbox_layout() {
-        // 开启态:与引入联网搜索总开关之前逐项相同(字面量就是那时的参数向量)。
+        // 不带镜像配置时的参数向量(字面量就是引入启动覆盖项之前的那一份);
+        // 带镜像时只在它上面多一对 `--config <镜像>`,见下一个测试。
         let data_dir = Path::new("/tmp/sandbox/home/.claude-science");
         let enabled = serve_args(data_dir, None);
         assert_eq!(
@@ -790,30 +796,69 @@ mod tests {
     }
 
     #[test]
-    fn serve_args_add_only_the_mirror_config_when_web_search_is_off() {
+    fn serve_args_add_only_the_mirror_config() {
         let data_dir = Path::new("/tmp/sandbox/home/.claude-science");
         let mirror = Path::new("/tmp/csswitch/science-config/sandbox.toml");
-        let disabled = serve_args(data_dir, Some(mirror));
-        let flags: Vec<usize> = disabled
+        let mirrored = serve_args(data_dir, Some(mirror));
+        let flags: Vec<usize> = mirrored
             .iter()
             .enumerate()
             .filter_map(|(index, arg)| (arg == "--config").then_some(index))
             .collect();
-        assert_eq!(flags.len(), 1, "--config 恰好出现一次:{disabled:?}");
-        assert_eq!(disabled[flags[0] + 1], mirror.display().to_string());
-        let mut rest = disabled.clone();
+        assert_eq!(flags.len(), 1, "--config 恰好出现一次:{mirrored:?}");
+        assert_eq!(mirrored[flags[0] + 1], mirror.display().to_string());
+        let mut rest = mirrored.clone();
         rest.drain(flags[0]..=flags[0] + 1);
         assert_eq!(
             rest,
             serve_args(data_dir, None),
-            "去掉这一对之后与开启态逐项相同"
+            "去掉这一对之后与不带镜像时逐项相同"
         );
         // 兜底停止与运行状态都靠命令行里的 `--data-dir <沙箱目录>` 认出沙箱 daemon:
-        // 多带一个 --config 之后它必须仍然被认出来,否则关着搜索的沙箱停不掉。
+        // 多带一个 --config 之后它必须仍然被认出来 —— 沙箱现在每次启动都带它,
+        // 认不出来就等于沙箱停不掉、状态也永远显示未运行。
         assert!(command_line_contains_data_dir(
-            &format!("/usr/local/bin/claude-science {}", disabled.join(" ")),
+            &format!("/usr/local/bin/claude-science {}", mirrored.join(" ")),
             data_dir
         ));
+    }
+
+    #[test]
+    fn sandbox_launch_carries_the_mirror_config_whatever_the_web_search_switch_says() {
+        // `start` 做的就是这两步:覆盖项 → 镜像 → serve 参数。沙箱只走第三方渠道,
+        // 联网搜索开着也要带镜像:不带的话 Science 的默认模型会停在清单里没有的官方 id 上。
+        let base = std::env::temp_dir().join(format!(
+            "csswitch-sandbox-launch-test-{}-{}",
+            std::process::id(),
+            crate::sandbox_forge::rand_hex(4).unwrap()
+        ));
+        let data_dir = base.join("home/.claude-science");
+        let mirror = base.join("science-config/sandbox.toml");
+        for web_search in [true, false] {
+            let overrides = LaunchOverrides {
+                web_search,
+                default_model: Some("claude-sonnet-19".into()),
+            };
+            let config = crate::science_config::launch_config(
+                &overrides,
+                &data_dir.join("config.toml"),
+                &mirror,
+            )
+            .unwrap();
+            let args = serve_args(&data_dir, config.as_deref());
+            assert_eq!(
+                args.iter().filter(|arg| *arg == "--config").count(),
+                1,
+                "联网搜索 {web_search}:{args:?}"
+            );
+            let flag = args.iter().position(|arg| arg == "--config").unwrap();
+            assert_eq!(args[flag + 1], mirror.display().to_string());
+        }
+        assert!(
+            !data_dir.exists(),
+            "生成镜像只读沙箱的 config.toml,不在沙箱数据目录里建任何东西"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

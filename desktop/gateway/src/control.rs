@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::profile::{Channel, Instance, Mode, Profile};
+use crate::science_config::LaunchOverrides;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const MAX_LOG_ENTRIES: usize = 300;
@@ -314,8 +315,39 @@ fn save_config(request: &Request, state: &Arc<AppState>) -> Result<Value, String
     Ok(json!({
         "ok": true,
         "channel": channel_payload(&channel),
-        "note": "已保存。运行中的链路不变,下次切换或重启 Science 时生效。"
+        // 保存不重启 Science(会打断会话)。地址、模型槽与默认模型都要等它下次启动才完全生效。
+        "note": "已保存,重启 Science 后生效。",
     }))
+}
+
+/// 这个模式的模型目录。官方模式没有渠道,返回 `None`;渠道的默认槽为空(配置不完整,
+/// 目录生成不出来)时同样是 `None`。
+fn channel_resolver(
+    profile: &Profile,
+    mode: &Mode,
+) -> Option<crate::static_profile::StaticProfileResolver> {
+    let (adapter, _) = mode.contract()?;
+    let catalog = profile.channel(mode)?.static_catalog(adapter);
+    crate::static_profile::StaticProfileResolver::from_json(&catalog.to_string()).ok()
+}
+
+/// 这个实例本次启动要带的覆盖项:联网搜索总开关的当前值,以及新会话默认用哪个模型。
+///
+/// 默认模型只在这一处决定,所有启动点(切换模式、启动 Science、切换联网搜索总开关、
+/// 启动沙箱、切换沙箱渠道)都从这里取:
+/// - 正式实例 + 官方模式 → 不指定,沿用 Science 自己的默认;
+/// - 走渠道的实例 → 该渠道清单里承载默认槽的那一条(Science 出厂的 `claude-opus-5` 不在清单里,
+///   不指定的话它会显示成不可用)。这一条恒为 `claude-sonnet-19`,见
+///   `static_profile::MENU_POSITIONS`。
+///
+/// 渠道的默认槽为空时目录生成不出来,取不到 id,这里不因此拦截:启动前的渠道完整性检查
+/// 另有其处。
+fn launch_overrides(profile: &Profile, instance: Instance) -> LaunchOverrides {
+    LaunchOverrides {
+        web_search: profile.web_search,
+        default_model: channel_resolver(profile, profile.mode_for(instance))
+            .map(|resolver| resolver.default_menu_id().to_string()),
+    }
 }
 
 /// 「记录请求日志」开关。先存盘再改运行时:存盘失败时进程行为保持不变,
@@ -357,7 +389,7 @@ fn switch_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String
         channel.validate()?;
     }
     profile.mode = mode.clone();
-    let web_search = profile.web_search;
+    let overrides = launch_overrides(&profile, Instance::Official);
     profile.save()?;
     if let Ok(mut guard) = state.profile.write() {
         *guard = profile;
@@ -377,9 +409,15 @@ fn switch_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String
     let restarted = if running {
         crate::science::stop()?;
         std::thread::sleep(Duration::from_millis(600));
-        crate::science::start(&format!("http://127.0.0.1:{}", state.port), web_search)?;
+        crate::science::start(&format!("http://127.0.0.1:{}", state.port), &overrides)?;
         true
     } else {
+        // 没在运行就走不到 start。新模式不需要镜像配置(官方模式 + 联网搜索开启)时,
+        // 顺手删掉上次留下的那一份,否则它会一直留到下次启动;需要镜像时什么都不做,
+        // 下次启动会重新生成。
+        if !overrides.needs_mirror() {
+            let _ = crate::science_config::official_launch_config(&overrides);
+        }
         false
     };
     let url = crate::science::login_url().ok();
@@ -413,8 +451,8 @@ fn active_sessions_refusal(active: u64) -> String {
 }
 
 fn start_science(state: &Arc<AppState>) -> Result<Value, String> {
-    let web_search = state.snapshot().web_search;
-    crate::science::start(&format!("http://127.0.0.1:{}", state.port), web_search)?;
+    let overrides = launch_overrides(&state.snapshot(), Instance::Official);
+    crate::science::start(&format!("http://127.0.0.1:{}", state.port), &overrides)?;
     let url = crate::science::login_url().ok();
     Ok(json!({"ok": true, "url": url}))
 }
@@ -480,8 +518,8 @@ fn parse_force(payload: &Value) -> Result<bool, String> {
 ///
 /// 拒绝与镜像预检都在存盘之前:被拒绝、或镜像生成不出来(例如用户的 `config.toml`
 /// 无法解析)时,开关不会停在「已保存但没生效」的状态。重启失败不回滚:那时的真实状态
-/// 就是「开关已改、Science 没按新设置跑起来」,原文报给用户;把开关拨回去再启动,
-/// 就是不带 `--config` 的原始启动方式。
+/// 就是「开关已改、Science 没按新设置跑起来」,原文报给用户;官方模式下把开关拨回开启
+/// 再启动,就是不带 `--config` 的原始启动方式。
 fn set_web_search(request: &Request, state: &Arc<AppState>) -> Result<Value, String> {
     let payload: Value =
         serde_json::from_slice(&request.body).map_err(|e| format!("请求体不是合法 JSON:{e}"))?;
@@ -506,11 +544,13 @@ fn set_web_search(request: &Request, state: &Arc<AppState>) -> Result<Value, Str
         WebSearchSwitch::SaveOnly => false,
         WebSearchSwitch::SaveAndRestart => true,
     };
-    // 预检:关闭要靠镜像配置交给 Science,现在生成不出来就不要存;
-    // 开启则顺手删掉残留镜像 —— 官方实例没在运行时不会走到 start,残留会一直留到下次启动。
-    crate::science_config::official_launch_config(enabled)?;
-
+    // 预检:按新值算出这次启动的覆盖项。要带镜像配置(关闭联网搜索,或正式实例在第三方
+    // 模式)而现在生成不出来,就不要存;不需要镜像时顺手删掉残留的那一份 —— 官方实例没在
+    // 运行时不会走到 start,残留会一直留到下次启动。
     profile.web_search = enabled;
+    let overrides = launch_overrides(&profile, Instance::Official);
+    crate::science_config::official_launch_config(&overrides)?;
+
     profile.save()?;
     if let Ok(mut guard) = state.profile.write() {
         *guard = profile;
@@ -522,7 +562,7 @@ fn set_web_search(request: &Request, state: &Arc<AppState>) -> Result<Value, Str
             format!("联网搜索已保存为{saved},网关一侧已生效;但停止 Science 失败,它没有按新设置重启:{error}")
         })?;
         std::thread::sleep(Duration::from_millis(600));
-        crate::science::start(&format!("http://127.0.0.1:{}", state.port), enabled).map_err(
+        crate::science::start(&format!("http://127.0.0.1:{}", state.port), &overrides).map_err(
             |error| {
                 format!("联网搜索已保存为{saved},网关一侧已生效;但 Science 已停止,按新设置启动失败:{error}")
             },
@@ -608,7 +648,7 @@ fn start_sandbox(state: &Arc<AppState>) -> Result<Value, String> {
     sandbox_start_precheck(&profile)?;
     crate::sandbox::start(
         &format!("http://127.0.0.1:{}", state.port),
-        profile.web_search,
+        &launch_overrides(&profile, Instance::Sandbox),
     )
 }
 
@@ -689,7 +729,7 @@ fn switch_sandbox_mode(request: &Request, state: &Arc<AppState>) -> Result<Value
     };
 
     profile.sandbox_mode = mode.clone();
-    let web_search = profile.web_search;
+    let overrides = launch_overrides(&profile, Instance::Sandbox);
     profile.save()?;
     if let Ok(mut guard) = state.profile.write() {
         *guard = profile;
@@ -703,7 +743,7 @@ fn switch_sandbox_mode(request: &Request, state: &Arc<AppState>) -> Result<Value
             )
         })?;
         std::thread::sleep(Duration::from_millis(600));
-        crate::sandbox::start(&format!("http://127.0.0.1:{}", state.port), web_search).map_err(
+        crate::sandbox::start(&format!("http://127.0.0.1:{}", state.port), &overrides).map_err(
             |error| format!("沙箱渠道已保存为 {saved};但沙箱已停止,按新渠道启动失败:{error}"),
         )?;
     }
@@ -950,6 +990,56 @@ mod tests {
         let text = payload.to_string();
         assert!(!text.contains("sk-super-secret-value"), "key 不得回显");
         assert_eq!(payload["has_api_key"], json!(true));
+    }
+
+    /// 两个渠道都是出厂默认的配置。Kimi:默认 k3-256k / 高质量 k3 / 快速 kimi-for-coding;
+    /// DeepSeek:默认 deepseek-v4-pro / 高质量留空 / 快速 deepseek-v4-flash。
+    fn profile_with(mode: Mode, sandbox_mode: Mode) -> Profile {
+        Profile {
+            mode,
+            sandbox_mode,
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn launch_overrides_point_each_instance_at_its_own_channels_default_entry() {
+        let menu = |profile: &Profile, instance| launch_overrides(profile, instance).default_model;
+        // 正式实例是官方模式:不指定默认模型,Science 用它自己的。沙箱走它自己选的渠道。
+        // 把沙箱的写成取 `profile.mode`,这里沙箱会跟着正式实例变成 None;把正式实例的写成取
+        // `profile.sandbox_mode`,正式实例会跟着沙箱变成有值。
+        let profile = profile_with(Mode::Official, Mode::Kimi);
+        assert_eq!(menu(&profile, Instance::Official), None);
+        assert_eq!(
+            menu(&profile, Instance::Sandbox).as_deref(),
+            Some("claude-sonnet-19")
+        );
+        // 默认模型恒在 sonnet 位,与渠道里别的槽怎么填无关(出厂的 Kimi 另配了高质量槽,
+        // DeepSeek 没有)。
+        let profile = profile_with(Mode::Deepseek, Mode::Kimi);
+        for instance in [Instance::Official, Instance::Sandbox] {
+            assert_eq!(
+                menu(&profile, instance).as_deref(),
+                Some("claude-sonnet-19")
+            );
+        }
+
+        // 联网搜索总开关的值原样带上。
+        let mut profile = profile_with(Mode::Kimi, Mode::Deepseek);
+        assert!(launch_overrides(&profile, Instance::Official).web_search);
+        profile.web_search = false;
+        for instance in [Instance::Official, Instance::Sandbox] {
+            assert!(!launch_overrides(&profile, instance).web_search);
+        }
+
+        // 渠道还没填默认模型:取不到 id,但不因此出错 —— 启动前的完整性检查另有其处。
+        // 走另一个渠道的实例不受牵连。
+        profile.kimi.default_model = Default::default();
+        assert_eq!(menu(&profile, Instance::Official), None);
+        assert_eq!(
+            menu(&profile, Instance::Sandbox).as_deref(),
+            Some("claude-sonnet-19")
+        );
     }
 
     #[test]

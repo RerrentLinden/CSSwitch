@@ -47,13 +47,42 @@ fn humanize_model_id(id: &str) -> Option<String> {
     (!segments.iter().any(String::is_empty)).then(|| segments.join(" / "))
 }
 
+/// Science 把这种写法的显示名当成内部模型 id:小写字母开头、只有小写字母与数字、用连字符
+/// 分成至少两段(它的判据是 `^[a-z][a-z0-9]*(-[a-z0-9]+)+$`)。带着这种名字的条目会被它
+/// 整条从模型菜单里丢掉 —— 2026-10-10 用 0.1.60 真机确认:清单里的 `k3-256k` 不出现,
+/// 改名「Kimi K3 256k」后出现。槽的显示名留空时回落到模型 ID,正好就是这种写法。
+fn looks_like_internal_id_to_science(name: &str) -> bool {
+    let mut parts = name.split('-');
+    let well_formed = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    };
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let mut rest = parts.peekable();
+    first
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase())
+        && well_formed(first)
+        && rest.peek().is_some()
+        && rest.all(well_formed)
+}
+
+/// 把会被 Science 丢弃或误读的显示名换成它肯显示的写法(`deepseek-v4-pro` → `DeepSeek V4 Pro`)。
+/// 模型 id 不变,只换菜单里看到的名字。
 pub(crate) fn science_safe_display_name(id: &str, candidate: &str) -> String {
     let claude_like = id
         .rsplit('/')
         .next()
         .is_some_and(|segment| segment.to_ascii_lowercase().starts_with("claude-"));
-    if claude_like && candidate.eq_ignore_ascii_case(id) {
-        if let Some(generated) = humanize_model_id(id) {
+    if (claude_like && candidate.eq_ignore_ascii_case(id))
+        || looks_like_internal_id_to_science(candidate)
+    {
+        if let Some(generated) = humanize_model_id(candidate) {
             return generated;
         }
     }
@@ -256,16 +285,52 @@ mod tests {
             {"id": "vendor-model", "display_name": "Vendor Model Pro"}
         ]}));
         let data = response["data"].as_array().unwrap();
+        // 小写连字符写法的名字 Science 会当成内部 id、把整条从菜单里丢掉:换成它肯显示的写法。
         assert_eq!(data[0]["id"], "kimi-k3");
-        assert_eq!(data[0]["display_name"], "kimi-k3");
+        assert_eq!(data[0]["display_name"], "Kimi K3");
         assert_eq!(data[1]["id"], "kimi-for-coding");
-        assert_eq!(data[1]["display_name"], "kimi-for-coding");
+        assert_eq!(data[1]["display_name"], "Kimi For Coding");
         assert_eq!(data[2]["id"], "claude-sonnet-5");
         assert_eq!(data[2]["display_name"], "Claude Sonnet 5");
         assert_eq!(data[3]["id"], "vendor/model-v2");
-        assert_eq!(data[3]["display_name"], "compact-label");
+        assert_eq!(data[3]["display_name"], "Compact Label");
         assert_eq!(data[4]["id"], "vendor-model");
         assert_eq!(data[4]["display_name"], "Vendor Model Pro");
+    }
+
+    #[test]
+    fn display_names_science_would_drop_are_rewritten_and_the_rest_left_alone() {
+        use super::science_safe_display_name as shown;
+        // 槽的显示名留空时回落到模型 ID:这几种正是 Science 会丢弃的写法(真机确认过 k3-256k)。
+        assert_eq!(shown("k3-256k", "k3-256k"), "K3 256k");
+        assert_eq!(
+            shown("deepseek-v4-pro", "deepseek-v4-pro"),
+            "DeepSeek V4 Pro"
+        );
+        assert_eq!(
+            shown("kimi-for-coding", "kimi-for-coding"),
+            "Kimi For Coding"
+        );
+        // 换出来的名字自己不能还是那种写法,否则白换。
+        for name in ["k3-256k", "deepseek-v4-pro", "a-1", "x-y-z"] {
+            let rewritten = shown(name, name);
+            assert!(rewritten.contains(' '), "{name} → {rewritten}");
+        }
+        // 没有连字符、带大写、带空格或点号、非 ASCII:Science 照常显示,原样不动。
+        for name in [
+            "k3",
+            "Kimi K3",
+            "K3-256k",
+            "kimi k3",
+            "k2.8-preview",
+            "深度求索-v4",
+            "-k3",
+            "k3-",
+            "k3--256k",
+            "3k-256",
+        ] {
+            assert_eq!(shown("some-model", name), name, "{name}");
+        }
     }
 
     #[test]

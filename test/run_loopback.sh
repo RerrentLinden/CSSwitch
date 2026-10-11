@@ -162,6 +162,41 @@ route_of() {
 # 假 claude-science 收到的最后一次 serve,以及 stop / serve 的累计次数(判断有没有重启过)。
 last_serve() { grep '^serve' "$FAKE_SCI/calls.log" 2>/dev/null | tail -1; }
 restart_calls() { grep -cE '^(stop|serve)' "$FAKE_SCI/calls.log" 2>/dev/null; }
+# 模型清单里的 id,按响应里的顺序排成一行(从标准输入读清单)。前面带引号的 "id" 不会匹配到
+# first_id / last_id。
+model_ids() { grep -o '"id":"[^"]*"' | tr '\n' ' ' | sed 's/ $//'; }
+# target_of <model>:向正式入口发一条以它为 model 的推理请求,返回网关把它解析成的上游模型
+# (relay 日志行里的 target)。上游是不存在的域名,请求必然失败 —— 但这一行在联网之前就已
+# 写出;解析不了的 model 根本不会留下这一行,返回空。
+target_of() {
+  local before
+  before="$(grep -c 'POST /v1/messages relay' "$SANDBOX/out.log")"
+  body -X POST "http://127.0.0.1:$PORT/v1/messages" -H 'content-type: application/json' \
+    -d "{\"model\":\"$1\",\"max_tokens\":16,\"stream\":false,
+         \"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" >/dev/null
+  grep 'POST /v1/messages relay' "$SANDBOX/out.log" | tail -n +"$((before + 1))" | tail -1 \
+    | sed -nE 's/.* target=([^ ]+) .*/\1/p'
+}
+# mirror_root_has <名称> <整行正则>:镜像配置的根表里有这一行 —— 必须写在第一个 [table] 之前,
+# 落在表里的键 Science 读不到。
+mirror_root_has() {
+  local key_line table_line
+  key_line="$(grep -nE "$2" "$MIRROR" 2>/dev/null | head -1 | cut -d: -f1)"
+  table_line="$(grep -n '^\[' "$MIRROR" 2>/dev/null | head -1 | cut -d: -f1)"
+  if [ -n "$key_line" ] && { [ -z "$table_line" ] || [ "$key_line" -lt "$table_line" ]; }; then
+    echo "  ok   $1"
+  else
+    echo "  FAIL $1(键在第 ${key_line:-?} 行,第一个表头在第 ${table_line:-?} 行)"; fail=1
+  fi
+}
+# mirror_lacks <名称> <键名>:镜像里没有以这个键开头的行。
+mirror_lacks() {
+  if grep -qE "^$2[[:space:]]*=" "$MIRROR" 2>/dev/null; then
+    echo "  FAIL $1:镜像里不该有 $2"; fail=1
+  else
+    echo "  ok   $1"
+  fi
+}
 # 向正式入口(正式实例当前的渠道)发一条声明了 typed web_search 的推理请求,返回它留下的 relay 日志行。
 # 上游是不存在的域名,请求必然失败 —— 但规则行在联网之前就已写进 stderr。
 relay_line_for_search_request() {
@@ -256,14 +291,25 @@ else
   echo "  FAIL 沙箱渠道切换被拒后配置文件变了"; fail=1
 fi
 
-# ── 联网搜索总开关 ──────────────────────────────────────────────────────────
-# 一个全局开关驱动两层:Science 启动时带不带 `--config <镜像>`,以及网关桥不桥。
+# ── 模型清单:每个模型一条 ──────────────────────────────────────────────────
+# 清单由渠道的四槽配置在本地合成,不联网。这一节走沙箱入口:正式实例此刻是官方模式,
+# 它的入口会直通真实的 api.anthropic.com。沙箱渠道是 Kimi,只配了默认槽 m1。
+sandbox_models() { body "http://127.0.0.1:$PORT/sandbox/v1/models"; }
+models="$(sandbox_models)"
+check "只配了默认槽:清单里只有一条,在默认槽的位置" '"id":"claude-sonnet-19"' \
+  "$(printf '%s' "$models" | model_ids)"
+has "这一条显示的是默认槽的模型" '"display_name":"M1"' "$models"
+
+# ── 启动覆盖项:联网搜索总开关与默认模型 ────────────────────────────────────
+# Science 启动时带不带 `--config <镜像>` 由两件事决定:联网搜索总开关(关 → 镜像里写
+# enable_web_search = false),以及正式实例是不是第三方模式(是 → 镜像里写 default_model,
+# 指到模型清单里承载默认槽的那一条)。两者都没有时不带 --config。总开关同时决定网关桥不桥。
 # Science 自己的配置放在临时 HOME 里(服务只读它),镜像由服务写进临时 HOME 的 .csswitch。
 SCI_HOME="$SANDBOX/.claude-science"
 SCI_CONFIG="$SCI_HOME/config.toml"
 MIRROR="$SANDBOX/.csswitch/science-config/official.toml"
-SERVE_ON="serve --port 8686 --sandbox-port 8687 --detached --no-browser"
-SERVE_OFF="serve --config $MIRROR --port 8686 --sandbox-port 8687 --detached --no-browser"
+SERVE_PLAIN="serve --port 8686 --sandbox-port 8687 --detached --no-browser"
+SERVE_MIRRORED="serve --config $MIRROR --port 8686 --sandbox-port 8687 --detached --no-browser"
 mkdir -p "$SCI_HOME"
 cat >"$SANDBOX/config.good.toml" <<'EOF'
 # 管理员下发
@@ -279,9 +325,9 @@ check "联网搜索默认开启" true "$(web_search_state)"
 check "状态接口只有一个 web_search 字段" 1 \
   "$(printf '%s' "$status_after" | grep -o '"web_search"' | wc -l | tr -d ' ')"
 
-# 开启态:启动调用与引入开关之前逐项相同,只注入 base_url,不生成任何镜像。
+# 官方模式 + 联网搜索开启:启动调用与引入这些覆盖项之前逐项相同,只注入 base_url,不生成任何镜像。
 post science/start '{}' >/dev/null
-check "开启态启动参数与主线逐项相同" "$SERVE_ON" "$(last_serve)"
+check "官方模式开启态启动参数与主线逐项相同" "$SERVE_PLAIN" "$(last_serve)"
 check "启动时注入网关 base_url" "http://127.0.0.1:$PORT" "$(tail -1 "$FAKE_SCI/serve-base-url.log")"
 if [ -e "$SANDBOX/.csswitch/science-config" ]; then
   echo "  FAIL 开启态生成了镜像目录"; fail=1
@@ -334,18 +380,19 @@ turned_off="$(post web-search '{"enabled":false,"force":true}')"
 rm -f "$FAKE_SCI/active"
 has "确认后关闭成功并重启了 Science" '"science_restarted":true' "$turned_off"
 check "关闭后总开关为关" false "$(web_search_state)"
-check "关闭态启动带且只带镜像配置" "$SERVE_OFF" "$(last_serve)"
+check "关闭态启动带且只带镜像配置" "$SERVE_MIRRORED" "$(last_serve)"
 check "重启是先停后起" "stop" "$(grep -E '^(stop|serve)' "$FAKE_SCI/calls.log" | tail -2 | head -1)"
 check "关闭态启动同样注入网关 base_url" "http://127.0.0.1:$PORT" "$(tail -1 "$FAKE_SCI/serve-base-url.log")"
 
 # 镜像 = 用户原配置 + 根表的 enable_web_search = false(必须写在第一个 [table] 之前)。
-key_line="$(grep -nE '^enable_web_search[[:space:]]*=[[:space:]]*false[[:space:]]*$' "$MIRROR" 2>/dev/null | head -1 | cut -d: -f1)"
-table_line="$(grep -n '^\[network\]' "$MIRROR" 2>/dev/null | head -1 | cut -d: -f1)"
-if [ -n "$key_line" ] && [ -n "$table_line" ] && [ "$key_line" -lt "$table_line" ]; then
-  echo "  ok   镜像在根表里关闭了联网搜索"
+# 正式实例此刻是官方模式:默认模型是 Science 自己的事,镜像里不写。
+WEB_SEARCH_OFF_LINE='^enable_web_search[[:space:]]*=[[:space:]]*false[[:space:]]*$'
+if grep -q '^\[network\]' "$MIRROR" 2>/dev/null; then
+  mirror_root_has "镜像在根表里关闭了联网搜索" "$WEB_SEARCH_OFF_LINE"
 else
-  echo "  FAIL 镜像没有在根表里关闭联网搜索(键在第 ${key_line:-?} 行,[network] 在第 ${table_line:-?} 行)"; fail=1
+  echo "  FAIL 镜像里没有用户原配置的 [network] 表,根表的位置无从判断"; fail=1
 fi
+mirror_lacks "官方模式的镜像不指定默认模型" default_model
 if grep -q '^proxy = "http://proxy.corp.example:8080"$' "$MIRROR" 2>/dev/null \
   && grep -q '^update_channel = "stable"$' "$MIRROR" 2>/dev/null; then
   echo "  ok   镜像保留了用户原配置的其它键"
@@ -368,10 +415,15 @@ has "空 key 提交不清空已保存的 key" '"has_api_key":true' "$(body "http
 # 关闭态下「启动 Science」与「切换模式」都要把总开关的值带进启动参数。
 post science/stop '{}' >/dev/null
 post science/start '{}' >/dev/null
-check "关闭态点启动同样带镜像配置" "$SERVE_OFF" "$(last_serve)"
+check "关闭态点启动同样带镜像配置" "$SERVE_MIRRORED" "$(last_serve)"
 before_restarts="$(restart_calls)"
 post switch '{"mode":"kimi"}' >/dev/null
-check "关闭态切换模式的重启同样带镜像配置" "$((before_restarts + 2)):$SERVE_OFF" "$(restart_calls):$(last_serve)"
+check "关闭态切换模式的重启同样带镜像配置" "$((before_restarts + 2)):$SERVE_MIRRORED" "$(restart_calls):$(last_serve)"
+# 正式实例现在是 Kimi:镜像里多出默认模型。它恒指向默认槽的位置(sonnet 位),不带 opus ——
+# Science 对订阅档不够格的登录会把带 opus 的默认模型换成一个清单里没有的 id。
+DEFAULT_MODEL_LINE='^default_model = "claude-sonnet-19"$'
+mirror_root_has "切到第三方模式:镜像在根表里指定了默认模型" "$DEFAULT_MODEL_LINE"
+mirror_root_has "切到第三方模式:镜像仍然关着联网搜索" "$WEB_SEARCH_OFF_LINE"
 
 # 关闭态的网关一侧:typed web_search 在请求入口被摘除并留下规则 id,兼容桥不触发。
 # 没有这条,规则 id 被删掉、或开关没接到网关上,都没人会发现。
@@ -386,20 +438,71 @@ has "关闭态 DeepSeek 在日志里留下摘除规则" "tool.relay.web-search-d
   "$(relay_line_for_search_request)"
 post switch '{"mode":"kimi"}' >/dev/null
 
-# 重新开启:Science 回到不带 --config 的原始启动方式,残留镜像被清掉;
-# 网关一侧不等任何重启,同一条请求重新走桥。
+# 重新开启(正式实例是 Kimi):第三方模式总是带镜像,所以启动参数不变;变的是镜像的内容 ——
+# 不再关闭联网搜索,只剩默认模型。官方模式下「重新开启 → 回到不带 --config 的原始启动方式、
+# 残留镜像被清掉」在下面「切回官方模式」一段断言。网关一侧不等任何重启,同一条请求重新走桥。
 turned_on="$(post web-search '{"enabled":true}')"
 has "重新开启成功并重启了 Science" '"science_restarted":true' "$turned_on"
 check "重新开启后总开关为开" true "$(web_search_state)"
-check "重新开启后启动参数回到主线" "$SERVE_ON" "$(last_serve)"
-if [ -e "$MIRROR" ]; then
-  echo "  FAIL 重新开启后还留着镜像文件"; fail=1
+check "第三方模式重新开启后启动仍带镜像配置" "$SERVE_MIRRORED" "$(last_serve)"
+mirror_lacks "重新开启后镜像不再关闭联网搜索" enable_web_search
+mirror_root_has "重新开启后镜像仍指定默认模型" "$DEFAULT_MODEL_LINE"
+if grep -q '^proxy = "http://proxy.corp.example:8080"$' "$MIRROR" 2>/dev/null; then
+  echo "  ok   只带默认模型的镜像同样保留用户原配置"
 else
-  echo "  ok   重新开启后不留镜像文件"
+  echo "  FAIL 只带默认模型的镜像丢了用户原配置的键"; fail=1
 fi
 relay_line="$(relay_line_for_search_request)"
 has "重新开启后 Kimi 重新走兼容桥" "web-search.query-tool-adapter" "$relay_line"
 lacks "重新开启后不再摘除搜索声明" "tool.relay.web-search-disabled-by-config" "$relay_line"
+
+# ── 模型菜单的条目、默认模型与旧 id ─────────────────────────────────────────
+# 正式实例是 Kimi(假 Science 在运行),所以正式入口的清单在本地合成,不出网。
+official_models() { body "http://127.0.0.1:$PORT/v1/models"; }
+# 给高质量槽与快速槽各配一个模型:三个模型各占一个主菜单位置。
+# 保存不重启 Science(会打断会话),保存结果说明重启后生效。
+before_restarts="$(restart_calls)"
+moved="$(post config '{"channel":"kimi","quality_model":{"model_id":"q1","display_name":"Q1"},
+  "fast_model":{"model_id":"f1","display_name":"F1"}}')"
+has "保存结果说明重启 Science 后生效" "重启 Science 后生效" "$moved"
+check "保存槽位不重启 Science" "$before_restarts" "$(restart_calls)"
+models="$(official_models)"
+check "三个槽三个模型:每个模型一条,默认模型排最前" \
+  '"id":"claude-sonnet-19" "id":"claude-opus-19" "id":"claude-haiku-19"' \
+  "$(printf '%s' "$models" | model_ids)"
+# 清单里不再有 Science 自己会用的那几个官方 id,也不再把同一个模型用 claude-csswitch-* 再列一遍。
+for unlisted in claude-opus-5 claude-sonnet-5 claude-opus-4-8 claude-sonnet-4-6 claude-haiku-4-5-20251001 claude-csswitch-; do
+  lacks "清单里没有 $unlisted" "\"id\":\"$unlisted" "$models"
+done
+# 清单里的每个 id,请求真的解析到它显示的那个模型。
+check "claude-opus-19 解析到高质量槽的模型" q1 "$(target_of claude-opus-19)"
+check "claude-sonnet-19 解析到默认槽的模型" m2 "$(target_of claude-sonnet-19)"
+check "claude-haiku-19 解析到快速槽的模型" f1 "$(target_of claude-haiku-19)"
+# 不在清单里的官方 id(旧会话、Science 自己的辅助调用)与旧的 claude-csswitch-* selector
+# 仍按原来的规则解析。
+check "claude-opus-5 仍解析到高质量槽" q1 "$(target_of claude-opus-5)"
+check "claude-opus-4-8 仍解析到高质量槽" q1 "$(target_of claude-opus-4-8)"
+check "claude-sonnet-5 仍解析到默认槽" m2 "$(target_of claude-sonnet-5)"
+check "claude-sonnet-4-6 仍解析到默认槽" m2 "$(target_of claude-sonnet-4-6)"
+check "claude-haiku-4-5-20251001 仍解析到快速槽" f1 "$(target_of claude-haiku-4-5-20251001)"
+check "旧的 claude-csswitch-m2 仍解析到 m2" m2 "$(target_of claude-csswitch-m2)"
+check "旧的 claude-csswitch-q1 仍解析到 q1" q1 "$(target_of claude-csswitch-q1)"
+# 对照:解析不了的 id 不会留下 relay 行 —— 上面那些断言不是恒真的。
+check "不认识的 id 不被解析" "" "$(target_of claude-csswitch-gone)"
+
+# 重启后,镜像里的默认模型仍是默认槽的位置:别的槽怎么填都不会把它挤走。
+post science/stop '{}' >/dev/null
+post science/start '{}' >/dev/null
+check "第三方模式点启动同样带镜像配置" "$SERVE_MIRRORED" "$(last_serve)"
+mirror_root_has "另配了高质量槽之后,镜像里的默认模型仍指向默认槽的位置" "$DEFAULT_MODEL_LINE"
+
+# 把两个槽清空:清单回到一条,仍在默认槽的位置;重启后镜像里的默认模型不变。
+post config '{"channel":"kimi","quality_model":{"model_id":"","display_name":""},
+    "fast_model":{"model_id":"","display_name":""}}' >/dev/null
+check "槽清空后清单回到一条" '"id":"claude-sonnet-19"' "$(official_models | model_ids)"
+post science/stop '{}' >/dev/null
+post science/start '{}' >/dev/null
+mirror_root_has "槽清空并重启后,镜像里的默认模型不变" "$DEFAULT_MODEL_LINE"
 
 # ── 两个实例各用各的渠道 ────────────────────────────────────────────────────
 # 正式实例的请求落在 /v1/*,按 mode 路由;免登录沙箱的 base_url 多带 /sandbox,请求落在
@@ -421,8 +524,11 @@ check "沙箱入口的请求记为 沙箱 + DeepSeek" "sandbox deepseek" \
 # 两个入口给出的是两个渠道各自的模型,沙箱前缀也确实被剥掉了(否则这里是 404)。
 has "正式入口的模型清单来自 Kimi 的配置" '"display_name":"M2"' \
   "$(body "http://127.0.0.1:$PORT/v1/models")"
-has "沙箱入口的模型清单来自 DeepSeek 的配置" '"display_name":"DeepSeek V4 Pro"' \
-  "$(body "http://127.0.0.1:$PORT/sandbox/v1/models")"
+deepseek_models="$(sandbox_models)"
+has "沙箱入口的模型清单来自 DeepSeek 的配置" '"display_name":"DeepSeek V4 Pro"' "$deepseek_models"
+# DeepSeek 出厂只配了默认槽与快速槽:两个模型各占一个位置,默认模型同样在 sonnet 位。
+check "DeepSeek 出厂的两个模型各占一个主菜单位置" '"id":"claude-sonnet-19" "id":"claude-haiku-19"' \
+  "$(printf '%s' "$deepseek_models" | model_ids)"
 
 # 前缀本身、前缀下的未知路径、只是长得像的路径:显式 404,而且根本没有进推理层
 # (进了就会多出日志条目)。这几条趁正式实例还是第三方渠道时测:万一被错当成正式入口,
@@ -438,12 +544,40 @@ check "这些路径没有进入推理层" "$before_entries" "$(inference_log_cou
 # 这一段只打带前缀的沙箱入口 —— 官方模式下正式入口的请求会被转发到真实的 api.anthropic.com。
 post switch '{"mode":"official"}' >/dev/null
 check "正式实例切到官方,沙箱渠道不变" "official deepseek" "$(official_mode) $(sandbox_mode)"
+# 切回官方模式(联网搜索开着):重启用的是不带 --config 的原始启动方式,第三方模式留下的
+# 镜像被清掉。
+no_mirror() { # no_mirror <名称>
+  if [ -e "$MIRROR" ]; then echo "  FAIL $1"; fail=1; else echo "  ok   $1"; fi
+}
+check "切回官方模式后启动参数回到主线" "$SERVE_PLAIN" "$(last_serve)"
+no_mirror "切回官方模式后不留镜像文件"
+# 官方模式下关一次、开一次联网搜索:关 → 镜像只关搜索、不指定默认模型;
+# 开 → 回到不带 --config 的原始启动方式,镜像清掉。
+post web-search '{"enabled":false}' >/dev/null
+check "官方模式关闭联网搜索:启动带镜像配置" "$SERVE_MIRRORED" "$(last_serve)"
+mirror_root_has "官方模式关闭联网搜索:镜像在根表里关闭了它" "$WEB_SEARCH_OFF_LINE"
+mirror_lacks "官方模式关闭联网搜索:镜像不指定默认模型" default_model
+post web-search '{"enabled":true}' >/dev/null
+check "官方模式重新开启后启动参数回到主线" "$SERVE_PLAIN" "$(last_serve)"
+no_mirror "官方模式重新开启后不留镜像文件"
 check "正式实例是官方时,沙箱入口仍记为 沙箱 + DeepSeek" "sandbox deepseek" \
   "$(route_of /sandbox/v1/messages)"
 has "正式实例是官方时,沙箱入口的模型清单仍来自 DeepSeek" '"display_name":"DeepSeek V4 Pro"' \
   "$(body "http://127.0.0.1:$PORT/sandbox/v1/models")"
 post switch '{"mode":"kimi"}' >/dev/null
 check "正式实例切回 Kimi,沙箱渠道仍不变" "kimi deepseek" "$(official_mode) $(sandbox_mode)"
+check "切回 Kimi 的重启又带上镜像配置" "$SERVE_MIRRORED" "$(last_serve)"
+mirror_root_has "切回 Kimi 后镜像重新指定默认模型" "$DEFAULT_MODEL_LINE"
+# Science 没在运行时切回官方:走不到启动,残留的镜像同样要清掉;不因此把 Science 拉起来。
+post science/stop '{}' >/dev/null
+before_serves="$(grep -c '^serve' "$FAKE_SCI/calls.log")"
+post switch '{"mode":"official"}' >/dev/null
+no_mirror "Science 没在运行时切回官方,残留镜像也被清掉"
+check "Science 没在运行时切换模式不会把它拉起来" "$before_serves" "$(grep -c '^serve' "$FAKE_SCI/calls.log")"
+post switch '{"mode":"kimi"}' >/dev/null
+post science/start '{}' >/dev/null
+check "回到 Kimi 并启动:带镜像配置" "$SERVE_MIRRORED" "$(last_serve)"
+mirror_root_has "回到 Kimi 并启动:镜像指定默认模型" "$DEFAULT_MODEL_LINE"
 # 上面两次切换都重启了(假的)正式实例:它每次拿到的 base_url 都是不带路径的网关地址,
 # 沙箱前缀没有漏到它那一侧。
 check "正式实例收到的 base_url 始终不带沙箱前缀" "http://127.0.0.1:$PORT" \
