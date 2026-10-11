@@ -25,7 +25,7 @@ Kimi 走一个 provider contract（`kimi-anthropic-relay`），默认地址
 | --- | --- | --- |
 | 默认(均衡) | `k3-256k` | Kimi K3 256k |
 | 高质量 | `k3` | Kimi K3 |
-| 快速 | `kimi-for-coding` | Kimi K2.7 |
+| 快速 | `kimi-for-coding` | Kimi K2.8 |
 | Fable | 留空 | 继承默认槽 |
 
 端点当前提供:`kimi-for-coding`、`kimi-for-coding-highspeed`、`k3`、`k3-256k`。

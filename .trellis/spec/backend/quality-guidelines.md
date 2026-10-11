@@ -244,16 +244,18 @@ store.capture_message(&first_request(), &response, "k3", RestorePolicy::DeepSeek
 ### 2. 签名
 
 ```text
-science::start(base_url, web_search)
+science::start(base_url, &LaunchOverrides)
 claude-science serve [--config <镜像>] --port 8686 --sandbox-port 8687 --detached --no-browser
                                                   # 全部启动参数,不多不少
   env: ANTHROPIC_BASE_URL=http://127.0.0.1:<port> # 唯一注入的变量
   env_remove: ANTHROPIC_MODEL / *_MODEL / *_MODEL_NAME
               ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
 claude-science stop | status | url
-science_config::launch_config(web_search, source, mirror) -> Result<Option<PathBuf>, String>
+science_config::LaunchOverrides { web_search: bool, default_model: Option<String> }
+science_config::launch_config(&overrides, source, mirror) -> Result<Option<PathBuf>, String>
   source(只读): ~/.claude-science/config.toml
   mirror(0600): ~/.csswitch/science-config/official.toml
+control::launch_overrides(profile, instance) -> LaunchOverrides   # 五个启动点唯一的取值处
 配置: ~/.csswitch/service.v1.json (0600)
 ```
 
@@ -263,7 +265,7 @@ science_config::launch_config(web_search, source, mirror) -> Result<Option<PathB
 | --- | --- | --- |
 | `--data-dir` | 永远禁止 | 造出隔离实例,用户对话从此分家 |
 | `--no-auto-update` | 永远禁止 | 官方实例失去自动更新（用户明确红线） |
-| `--config` | 只允许出现在联网搜索关闭态,且只指向 CSSwitch 生成的镜像 | 它只换配置文件、不换数据目录（2026-10-10 用 0.1.60 隔离实测）；开启态不带它，启动参数与没有这个开关时逐项相同 |
+| `--config` | 只指向 CSSwitch 生成的镜像；只在「联网搜索关闭」或「这个实例处于第三方模式」时出现 | 它只换配置文件、不换数据目录（2026-10-10 用 0.1.60 隔离实测）；官方模式 + 联网搜索开启时不带它，启动参数与没有这些功能时逐项相同 |
 | `--port` / `--sandbox-port` | 固定 8686 / 8687 | 不用 `0`（控制台地址要稳定可收藏），也不沿用 Science 默认的 8000 / 8001（常被本机其它开发服务占用）；两个端口都显式给出，不依赖「port+1」的推导 |
 
 - 模型类与凭证类环境变量必须清除：残留会让 Science 绕过网关的模型目录，或带着旧凭证启动。
@@ -272,12 +274,26 @@ science_config::launch_config(web_search, source, mirror) -> Result<Option<PathB
 - 切换供应商必须重启 daemon（base_url 只在启动时读取）；重启会打断进行中的会话，
   Science 侧显示 `This session was interrupted by a restart`，因此有活跃会话时
   必须先要确认（`daemon.active_conversations > 0` 且未传 `force` → 拒绝）。
-- **联网搜索总开关**（`Profile.web_search`，全局、默认开）由调用方传给 `start`，模块内部不读
-  配置文件。`--config` 是否出现由 `launch_config` 的返回值唯一决定：
-  - 开启 → `Ok(None)`：不生成、不带参数，并尽力删除残留镜像。Science 自己配置里的任何值
-    （包括手写的 `enable_web_search = false`）原样生效，CSSwitch 不替用户放宽。
-  - 关闭 → 镜像 = 源文件全部内容 + **根表** `enable_web_search = false`（原本有就覆盖，没有就
-    新增），用 `toml_edit` 读写；源不存在时镜像只有这一个键。每次启动都重新生成。
+- **启动覆盖项**（`LaunchOverrides`）由调用方传给 `start`，模块内部不读配置文件。镜像里至多写两个
+  **根表**键，别的一概不写；`--config` 是否出现由 `launch_config` 的返回值唯一决定：
+
+  | `web_search` | `default_model` | 结果 |
+  | --- | --- | --- |
+  | true | None | `Ok(None)`：不生成、不带参数，并尽力删除残留镜像 |
+  | false | None | 镜像 = 源 + `enable_web_search = false` |
+  | true | Some(id) | 镜像 = 源 + `default_model = "<id>"` |
+  | false | Some(id) | 镜像 = 源 + 两个键 |
+
+  - `web_search` 是联网搜索总开关（`Profile.web_search`，全局、默认开）。开启时不写这个键：
+    Science 自己配置里的任何值（包括手写的 `enable_web_search = false`）原样生效，CSSwitch 不替用户放宽。
+  - `default_model` 只在实例处于第三方模式时有值：该渠道清单里承载默认槽的那一条的 id
+    （`StaticProfileResolver::default_menu_id`，见「生成模型清单」场景）。官方模式下必须是
+    `None` —— 那是用户自己的设置；沙箱总是第三方模式。渠道默认槽为空取不到 id 时也是 `None`，不因此拦截启动。
+  - 取值只有 `control::launch_overrides(profile, instance)` 一处，`switch_mode`、`start_science`、
+    `set_web_search`（含存盘前的镜像预生成）、`start_sandbox`、`switch_sandbox_mode` 都用它。
+    在某个启动点另写一份判断，两个实例就会拿到不一致的默认模型。
+  - 镜像 = 源文件全部内容 + 覆盖的键（原本有就覆盖，没有就新增），用 `toml_edit` 读写；
+    源不存在时镜像只有覆盖的键。每次启动都重新生成。
   - 对真实 `~/.claude-science/` 只读 `config.toml` 一个文件，不写、不建任何东西。
   - 写出走同目录临时文件 → `0600` → rename，目录 `0700`：镜像带着用户原配置的全部内容。
 - 切换总开关（`POST /control/web-search`）的顺序固定：判定（值没变 → 不动；官方实例在运行且
@@ -298,9 +314,10 @@ science_config::launch_config(web_search, source, mirror) -> Result<Option<PathB
 | 退出服务（`/control/quit`） | 先并行停掉**正在运行的**官方实例与沙箱再退进程；未安装 / 未运行不算失败，沙箱未运行时不碰其目录；停止失败不拦截退出，原文随响应 `errors` 返回 |
 | 有活跃会话且未确认 | 拒绝切换（模式、联网搜索总开关同一套规矩）并报告会话数，不静默打断；总开关被拒绝时配置与 Science 都不变 |
 | 渠道配置不完整 | 切换前就拒绝，不要等推理时才 400 |
-| 源 `config.toml` 读不了或解析不了（关闭态） | 报错并拒绝启动 / 拒绝关闭开关，不写镜像、不回退成空配置；报错给路径、行列与解析器原话，**不带出错行的内容**（可能是带口令的代理地址） |
-| 源 `config.toml` 不存在（关闭态） | 正常：镜像只有 `enable_web_search = false`，不替用户创建源文件 |
-| 关闭开关后 Science 起不来 | 原文报出；把开关拨回开启再启动，就是不带 `--config` 的原始启动方式 |
+| 源 `config.toml` 读不了或解析不了（需要镜像时：联网搜索关闭，或第三方模式） | 报错并拒绝启动 / 拒绝切换开关，不写镜像、不回退成空配置；报错给路径、行列与解析器原话，**不带出错行的内容**（可能是带口令的代理地址）。报错里按实际的覆盖项说明为什么需要这个文件，不笼统地只提联网搜索。第三方模式下**开启**联网搜索同样要预生成镜像，所以同样会被拒 |
+| 源 `config.toml` 不存在（需要镜像时） | 正常：镜像只有覆盖的键，不替用户创建源文件 |
+| 关闭开关后 Science 起不来 | 原文报出；官方模式下把开关拨回开启再启动，就是不带 `--config` 的原始启动方式 |
+| 切回「官方模式 + 联网搜索开启」而 Science 没在运行 | `switch_mode` 顺手删掉残留镜像（否则它会留到下次启动，看起来像仍在生效） |
 
 ### 5. 正常 / 基线 / 错误案例
 
@@ -314,19 +331,24 @@ science_config::launch_config(web_search, source, mirror) -> Result<Option<PathB
 
 - `science::tests::model_env_clear_list_covers_auth_and_role_overrides`：断言清除列表
   覆盖模型与凭证变量，且 **`ANTHROPIC_BASE_URL` 不在其中**（它是要注入的）。
-- `science::tests::official_serve_args_pin_ports_and_never_isolate`：开启态参数向量与字面量
-  逐项相等；关闭态 `--config <镜像>` 恰好一次、去掉这一对后与开启态相同；`--data-dir`、
-  `--no-auto-update` 两种状态下都不出现。
+- `science::tests::official_serve_args_pin_ports_and_never_isolate`：无镜像时参数向量与字面量
+  逐项相等；有镜像时 `--config <镜像>` 恰好一次、去掉这一对后与无镜像时相同；`--data-dir`、
+  `--no-auto-update` 两种状态下都不出现。这条测试是官方模式的冻结线，改启动方式时不改它。
 - `science_config::tests`：断言一律**用 TOML 解析器把镜像读回来**比较，不拿实现里的字符串当预期。
-  覆盖：开启态不写文件并清残留；无源文件；含根键 / 注释 / 表 / 行内表 / 多行字符串 / 表数组的源
-  （除新增键外逐值相等、键在根表）；源里原本是 `true`（不得出现重复键）；源无法解析（报错、
-  不写镜像、报错不含文件内容）；源读不了不等于空配置；源目录零写入；权限 `0600` / `0700`。
-- `control::tests`：切换判定纯函数的四条分支；请求体的 `enabled` / `force` 必须是布尔。
+  覆盖：上表四格（无覆盖时不写文件并清残留）；无源文件；含根键 / 注释 / 表 / 行内表 / 多行字符串 /
+  表数组的源（除覆盖的键外逐值相等、键在根表）；源里原本就有 `enable_web_search = true` 或自己的
+  `default_model`（被覆盖，不得出现重复键）；源无法解析（报错、不写镜像、报错不含文件内容）；
+  源读不了不等于空配置；源目录零写入；权限 `0600` / `0700`。
+- `control::tests`：切换判定纯函数的四条分支；请求体的 `enabled` / `force` 必须是布尔；
+  `launch_overrides` 对两个实例各取各的模式（正式实例官方、沙箱走渠道 → 正式实例 `None`、沙箱
+  `claude-sonnet-19`；把沙箱写成取 `profile.mode`，或把正式实例写成取 `sandbox_mode`，这条会红）。
 - loopback 层断言配置文件权限为 `0600`、且未写出 `~/.csswitch/config.json`。
 - loopback 层用假 `CLAUDE_SCIENCE_BIN` 与命令行同形的假沙箱进程，断言退出服务停掉两个实例且进程退出；
   loopback 全程不得解析到本机真实 `claude-science`。
-- loopback 层的联网搜索总开关：开启态 `serve` 整行等于主线；关闭态整行带 `--config <镜像>`，
-  镜像在根表含该键并保留临时 HOME 里源配置的其它键，源目录不变；重新开启后整行回到主线；
+- loopback 层的启动覆盖项：官方模式 + 开启态 `serve` 整行等于主线；官方模式 + 关闭态整行带
+  `--config <镜像>`，镜像在根表含 `enable_web_search` 并保留临时 HOME 里源配置的其它键，源目录不变；
+  官方模式下重新开启后整行回到主线、镜像被删。第三方模式下整行总是带 `--config`，镜像含
+  `default_model`，开关联网搜索只增减 `enable_web_search`；切回官方模式后镜像被删。
   活跃会话未确认、源配置无法解析两种情况下配置文件逐字节不变且没有 stop / serve。
   假 `claude-science` 的 `status` 输出形状必须与真实一致
   （`{"running":true,"daemon":{"active_conversations":N}}`），否则测的是假设。
@@ -347,7 +369,7 @@ science_config::launch_config(web_search, source, mirror) -> Result<Option<PathB
 // 只在启动时注入，其余一律沿用用户自己的实例
 &["serve", "--port", "8686", "--sandbox-port", "8687", "--detached", "--no-browser"]
 // env: ANTHROPIC_BASE_URL=<gateway>
-// 联网搜索关闭时在 serve 之后多一对:"--config", <CSSwitch 生成的镜像>
+// 联网搜索关闭、或实例处于第三方模式时,在 serve 之后多一对:"--config", <CSSwitch 生成的镜像>
 ```
 
 ---
@@ -364,9 +386,9 @@ science_config::launch_config(web_search, source, mirror) -> Result<Option<PathB
 ### 2. 签名
 
 ```text
-sandbox::start(base_url, web_search) → forge(幂等三态) → SSH/gh 桥接 → 沙箱钥匙串 → 端口检查
-  → 镜像配置(仅联网搜索关闭态) → daemon → 健康 → 钥匙串校验
-claude-science serve --data-dir <沙箱> [--config <镜像>] --host 127.0.0.1 --port 8790 --sandbox-port 8791
+sandbox::start(base_url, &LaunchOverrides) → forge(幂等三态) → SSH/gh 桥接 → 沙箱钥匙串 → 端口检查
+  → 镜像配置 → daemon → 健康 → 钥匙串校验
+claude-science serve --data-dir <沙箱> --config <镜像> --host 127.0.0.1 --port 8790 --sandbox-port 8791
   --no-browser --no-auto-update --detached
   镜像: source = <沙箱 data-dir>/config.toml(只读)  mirror = ~/.csswitch/science-config/sandbox.toml
   env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>/sandbox  https_proxy=<网关>(快速失败,不带前缀)
@@ -393,9 +415,9 @@ GET  /control/status → 顶层 sandbox_mode / sandbox_mode_label
   forge 修复/铸新后先清沙箱钥匙串旧条目（0.1.48 以 Keychain 为权威，不清会被
   回写吃掉修复形成死循环）；启动后正向校验密钥确在沙箱钥匙串内，不过即停 daemon。
 - 固定端口 8790/8791，占用即报错，永不自动改绑；全部监听回环。
-- 联网搜索总开关与官方实例走同一机制（`science_config::launch_config`，合同见上一场景）：
-  关闭态多带一对 `--config <镜像>`，数据目录仍由 `--data-dir` 钉死；开启态启动参数与没有这个
-  开关时逐项相同。镜像在钥匙串清理**之后**生成：forge 已重写登录而旧钥匙串条目还没清就中途
+- 启动覆盖项与官方实例走同一机制（`science_config::launch_config`，合同见上一场景）。沙箱总是
+  第三方模式，`default_model` 总有值，所以实际启动时**总是**带一对 `--config <镜像>`（渠道默认槽为空的
+  配置进不了启动流程）；数据目录仍由 `--data-dir` 钉死。镜像在钥匙串清理**之后**生成：forge 已重写登录而旧钥匙串条目还没清就中途
   退出，下次启动会判成 Reused 跳过清理。沙箱已在运行时 `start` 原样返回、不重启，开关的新值
   要等用户重启沙箱才到它那一侧（网关一侧的摘除不依赖它）。
 - 对外入口链接的主机名固定 `127.0.0.1`，`localhost` 留给真实实例：浏览器 cookie 只按
@@ -467,8 +489,8 @@ GET  /control/status → 顶层 sandbox_mode / sandbox_mode_label
 - 护栏负例断言**零写入**（真实目录逐字节不变、符号链接目标不建目录）。
 - 幂等三态：Reused 断言 `.enc` 与 `encryption.key` 逐字节不变；Repaired 断言 org 保留。
 - 兜底停止的命令行匹配：正例命中、pid 复用/真实实例/前缀相似目录/瞬时 CLI 四组负例拒绝。
-- 启动参数：开启态与字面量逐项相等；关闭态 `--config <镜像>` 恰好一次、去掉后与开启态相同，
-  且带着它的命令行仍被兜底停止的匹配认出（否则关着搜索的沙箱停不掉）。
+- 启动参数：不带镜像时与字面量逐项相等；带镜像时 `--config <镜像>` 恰好一次、去掉后与不带时相同，
+  且带着它的命令行仍被兜底停止的匹配认出（沙箱实际启动时总是带着它，认不出就停不掉）。
 - 入口链接主机名改写：localhost → 127.0.0.1、带路径前缀、已是 127.0.0.1 时幂等、
   非法 URL 原样返回，四例都钉住；并断言沙箱主机名不等于 `localhost`。
 - gh 桥接：包装脚本行为级校验（假 gh 在沙箱 HOME 下被执行时看到的是真实 HOME、参数原样
@@ -522,6 +544,131 @@ match plan_sandbox_switch(&profile.sandbox_mode, &mode, running, force) {
 }
 profile.sandbox_mode = mode;
 profile.save()?;
+```
+
+---
+
+## 场景：生成模型清单
+
+### 1. 范围 / 触发条件
+
+改动 `static_profile.rs` 的 `models_response` / `MENU_POSITIONS`，或 `/v1/models`（含 `/sandbox/v1/models`）
+返回的任何字段时适用。第三方模式下 Science 的模型菜单与默认模型全部由这份清单决定；
+清单与请求解析各说各话时，用户选的模型与实际到达的模型就不是同一个。
+
+Science 一侧的依据（0.1.60，只读静态检查，出处见 `docs/ARCHITECTURE.md`「模型解析」）：
+
+- 主菜单三个位置按 id 的写法分配：`claude-opus*` / `claude-sonnet*` / `claude-haiku*` 各取能被
+  `^claude-(opus|sonnet|haiku)-N(-M)?(-YYYYMMDD)?$` 解析的最新一条；其余进 More models。
+- 新会话的默认模型只取配置里的 `default_model`，不看它在不在清单里。
+- 显示名是小写连字符写法（判据 `^[a-z][a-z0-9]*(-[a-z0-9]+)+$`）或以 emoji 开头的条目，被它整条从菜单里
+  丢掉（2026-10-10 真机确认 `k3-256k`）。
+
+### 2. 签名
+
+```text
+static_profile::MENU_POSITIONS = [                        # (家族名 = 角色, id)；顺序 = 去重的先后，默认槽在前
+    ("sonnet", "claude-sonnet-19"),
+    ("opus",   "claude-opus-19"),
+    ("haiku",  "claude-haiku-19") ]
+StaticProfileResolver::models_response() -> Value
+StaticProfileResolver::default_menu_id() -> &str          # 用户配置生成的目录下恒为 claude-sonnet-19
+models::science_safe_display_name(id, candidate) -> String
+StaticProfileResolver::resolve(requested)                 # 不因本场景而改
+```
+
+### 3. 合同
+
+- **清单的组成**：按 `MENU_POSITIONS` 的顺序（sonnet → opus → haiku，即默认槽 → 高质量槽 → 快速槽），
+  每个位置取它**解析到**的 route，已经列过的 route 不再列；其余没列过的 route（只可能来自 Fable 槽）
+  以自己的 `claude-csswitch-*` selector 列出。官方 id（`claude-opus-5` 等）**不得**列出：列回去，
+  菜单里同一个模型又是好几条。
+- **默认条目恒在 sonnet 位**（`claude-sonnet-19`）：去重从默认槽开始，默认模型不会被别的槽挤到别的位置上。
+  `default_menu_id` **不得**是名字里带 `opus` 的 id —— Science 0.1.60 对订阅档不够格的登录
+  （免费档、部分 team / enterprise 席位）会把这样的默认模型换成 `claude-sonnet-4-6`，那个 id 不在清单里
+  （静态检查所得；免登录沙箱是虚拟的 max 档，不受影响，所以这条只在正式实例的真实登录上才暴露）。
+  Science 显示菜单时自己按家族排序，清单里的先后不决定显示顺序。
+- **清单语义 = 解析语义**：位置 id 不另建别名表，经 `official_role_alias` 按家族名落到角色绑定；
+  `models_response` 也经同一条解析路径取 route。清单里显示的模型名，必须属于 `resolve(id)` 返回的
+  那个上游模型。
+- **仍可解析的旧 id**：官方 id 与旧的 `claude-csswitch-<slug>` 不在清单里，但 `resolve` 的结果不变
+  （旧会话，以及 Science 固定用官方 id 发起的辅助调用）。
+- **位置 id 的版本号**（`19`，三个位置用同一个）必须满足三条，换之前逐条确认：`official_role_alias`
+  返回对应角色；能被 Science 的主菜单正则解析（1–2 位数字）；不是任何真实模型的名字。
+- **同一个模型出现在多个显式槽里**时只有一条 route，显示名取 `默认 → 高质量 → 快速 → Fable` 顺序里
+  第一个槽的。
+- **显示名**：清单里的名字一律过 `models::science_safe_display_name`。槽的显示名留空时回落到模型 ID，
+  而 `deepseek-v4-pro` 这种写法会让 Science 丢掉整条 —— 默认模型若被丢掉，新会话就没有默认模型。
+- **保存不重启**：`save_config` 不重启 Science（会打断会话）。保存结果的 `note` 固定是一句
+  「已保存,重启 Science 后生效。」，不按改了什么另拼说明（界面文案从简，见前端规范）。
+- **不新增配置键**：`ModelSlot` 只有 `model_id` 与 `display_name`，0.10.0 写出的 `service.v1.json`
+  读写一轮后逐字节不变。
+
+### 4. 校验与错误矩阵
+
+| 条件 | 要求行为 |
+| --- | --- |
+| 高质量 / 快速槽留空，或与前面的槽是同一个模型 | 那个位置不列；带着那个位置的 id 来的请求仍按角色绑定解析 |
+| Fable 槽的模型与前三个都不同 | 以 `claude-csswitch-<slug>` 列出（进 More models）；与其中一个相同则不列 |
+| 请求带官方 id 或旧的 `claude-csswitch-<slug>` | 照常解析到对应槽位 |
+| 外部生成的目录里默认 route 不绑定任何主菜单角色 | 它以自己的 selector 列出并排最前，`default_menu_id` 就是这个 selector，不悄悄换成第一个主菜单位置 |
+| 槽的显示名留空，或是小写连字符写法 | 清单里换成 Science 肯显示的写法；模型 id 不变 |
+| 显示名是占位词 `default` | 换成上游模型名，再过一遍显示名改写 |
+
+### 5. 正常 / 基线 / 错误案例
+
+| 默认 / 高质量 / 快速 / Fable | 清单 | `default_menu_id` |
+| --- | --- | --- |
+| K3 / 空 / K2.8 / 空 | sonnet-19=K3，haiku-19=K2.8 | `claude-sonnet-19` |
+| k3-256k / k3 / kimi-for-coding / 空（出厂的 Kimi） | sonnet-19=k3-256k，opus-19=k3，haiku-19=kimi-for-coding | `claude-sonnet-19` |
+| A / B / C / D | sonnet-19=A，opus-19=B，haiku-19=C，`claude-csswitch-D`=D | `claude-sonnet-19` |
+| A / A / A / 空 | sonnet-19=A | `claude-sonnet-19` |
+| A / B / B / 空 | sonnet-19=A，opus-19=B | `claude-sonnet-19` |
+| A / 空 / C / C | sonnet-19=A，haiku-19=C | `claude-sonnet-19` |
+| A / 空 / 空 / D | sonnet-19=A，`claude-csswitch-D`=D | `claude-sonnet-19` |
+
+- 错误：为了让 Science 的默认模型「找得到」，把官方 id 列回清单 —— 两个真实模型在菜单里出现七条。
+- 错误：去重从高质量槽开始（opus → sonnet → haiku），想让主力模型显示在第一位 —— 高质量槽留空时
+  默认条目变成 `claude-opus-19`，在免登录沙箱里一切正常，换成订阅档不够格的真实登录，Science 就把
+  默认模型换成清单里没有的 id。
+
+### 6. 必需测试
+
+- `static_profile`：上表各种配置的清单与 `default_menu_id`（恒为 `claude-sonnet-19`）；
+  清单里没有 Science 自己会用的那几个官方 id；
+  **清单里每个 id 经 `resolve` 得到的上游模型等于该条目显示的模型**；两个显式槽共用一个模型而显示名不同时
+  只列一次、用第一个槽的名字；官方 id 与旧 selector 仍可解析；外部目录的默认 route 不在主菜单位置时
+  以自己的 selector 作默认条目；三个位置 id 是「家族名 + 同一个 1–2 位数字版本号」并按家族名解析到
+  对应角色；显示名留空的槽仍出现在清单里。
+- `profile`：0.10.0 写出的 `service.v1.json` 读写一轮逐字节不变。
+- `control`：`launch_overrides` 的默认条目对两个实例各取各的渠道。
+- `models`：小写连字符写法的名字被换成带空格的写法且换出来的不再是那种写法；没有连字符、带大写、
+  带空格或点号、非 ASCII 的名字原样不动。
+- loopback：第三方模式的清单含位置 id，不含 Science 自己会用的官方 id，也不把同一个模型用
+  `claude-csswitch-*` 再列一遍；以清单里每个 id 为 model 的请求到达它显示的模型；以官方 id 或旧 selector
+  为 model 的请求仍到达对应槽位，不认识的 id 不被解析；保存槽位不重启 Science、保存结果说明重启后生效；
+  另配或清空高质量槽 / 快速槽并重启，镜像里的 `default_model` 都是 `claude-sonnet-19`。
+- 这些测试只证明网关一侧。Science 的菜单规则变了，它们不会自己变红：Science 升级后要在真机上
+  重跑 `test/LIVE_ACCEPTANCE.md` §H。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```rust
+// 清单与解析各走各的:清单读角色绑定,另给位置 id 建一张别名表去解析
+data.push(json!({"id": "claude-opus-19", "display_name": quality_slot.label(), ..}));
+aliases.insert("claude-opus-19", default_selector.clone()); // 两处一旦不同步,菜单显示 A、请求到 B
+```
+
+#### Correct
+
+```rust
+// 清单里的每一条,都是「这个 id 实际会解析到的那条 route」
+for (_role, id) in MENU_POSITIONS {
+    let Some(index) = self.resolved_index(id) else { continue };
+    // 已列过的 route 跳过;显示名取自这条 route
+}
 ```
 
 ---

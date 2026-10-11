@@ -9,11 +9,14 @@ CSSwitch 接管的是**用户自己的官方 Science 实例**,不做数据隔离
   `CLAUDE_SCIENCE_BIN` 是显式开发 override,无效时 fail closed,不隐式回退别的候选。
 - 启动参数固定为 `serve [--config <镜像>] --port 8686 --sandbox-port 8687 --detached --no-browser`,
   端口不用 `0`(控制台地址要稳定可收藏),也不沿用 Science 默认的 8000/8001。
-  - `--config` 只允许出现在联网搜索关闭态,且只指向 CSSwitch 生成的镜像
-    (`~/.csswitch/science-config/official.toml` = 用户原配置 + 根表 `enable_web_search = false`)。
-    联网搜索开启时不得出现,启动参数与没有这个开关时逐项相同。它只换配置文件、不换数据目录
-    (2026-10-10 用 0.1.60 隔离实测;此前把它与 `--data-dir` 并列为「会造出隔离实例」的说法
-    对 `--config` 单独不成立)。
+  - `--config` 只指向 CSSwitch 生成的镜像(`~/.csswitch/science-config/official.toml`),镜像 =
+    用户原配置 + 至多两个根表键,别的一概不写:
+    - `enable_web_search = false`:只在联网搜索总开关关闭时;
+    - `default_model = "<菜单条目 id>"`:只在这个实例处于第三方模式(Kimi / DeepSeek)时。
+    两个键都不需要写时(官方模式 + 联网搜索开启)`--config` **不得出现**,启动参数与没有这些功能时
+    逐项相同,并删掉残留的镜像。官方模式下不得写 `default_model`:那是用户自己的设置。
+    它只换配置文件、不换数据目录(2026-10-10 用 0.1.60 隔离实测;此前把它与 `--data-dir` 并列为
+    「会造出隔离实例」的说法对 `--config` 单独不成立)。
   - `--data-dir`、`--no-auto-update` 对官方实例仍然**禁止**:前者会造出隔离实例,用户的对话
     从此分家;后者会关掉官方实例自己的自动更新。
 - 环境变量只注入 `ANTHROPIC_BASE_URL`,值是**不带路径**的网关地址(`http://127.0.0.1:<port>`);
@@ -34,6 +37,7 @@ CSSwitch 接管的是**用户自己的官方 Science 实例**,不做数据隔离
   切换前先校验渠道配置完整,别等到推理时才炸。
 - Science 的 `config.toml` 同样只在启动时读,所以切换联网搜索总开关也要重启官方实例;
   有会话正在进行且未确认时拒绝,并且不改任何状态。免登录沙箱不自动重启,只提示需要重启。
+  保存渠道配置(地址、模型槽)不重启 Science —— 那会打断会话;保存结果只说「重启 Science 后生效」。
 - 镜像配置写 `~/.csswitch/science-config/`(目录 0700、文件 0600,每次启动重写)。
   它带着用户原配置的全部内容,解析报错只给路径、行列与解析器原话,不带出错行的内容。
 
@@ -62,6 +66,24 @@ CSSwitch 接管的是**用户自己的官方 Science 实例**,不做数据隔离
   模式、不重启正式实例。
 - 状态接口用顶层键 `sandbox_mode` / `sandbox_mode_label` 报告沙箱渠道。状态里不得再出现第二个
   名为 `mode` 的键(序列化保留顺序,取顶层模式的脚本是贪婪匹配)。
+
+## 模型清单与菜单条目
+
+- 第三方模式下 Science 的模型菜单完全来自网关返回的清单。清单里每个不同的模型只列一次:
+  主菜单的三个位置 `claude-sonnet-19` / `claude-opus-19` / `claude-haiku-19` 依次是默认槽、高质量槽、
+  快速槽的模型(与前面同模型的不列),Fable 槽的模型与前三个都不同时以 `claude-csswitch-*` 列出。
+- 去重必须从默认槽开始:默认模型因此恒在 sonnet 位(`claude-sonnet-19`)。
+  `default_model` **不得**指向名字里带 `opus` 的 id —— Science 0.1.60 对订阅档不够格的登录会把这样的
+  默认模型换成 `claude-sonnet-4-6`(不在清单里),正式实例的真实登录会碰到。
+- **不得**把官方 id(`claude-opus-5` 等)列进清单:菜单里同一个模型会重新出现好几条。
+- 清单显示的模型与请求解析到的模型必须出自同一份角色绑定:不为菜单条目另建一套别名表,位置 id
+  按家族名解析到对应的槽。官方 id 与旧 selector 不在清单里,但必须仍然可以解析(旧会话、Science 的
+  辅助调用)。
+- 三个位置 id 只在 `static_profile::MENU_POSITIONS` 定义一次。换版本号之前先确认:Science 仍把它当作
+  主菜单位置(家族名后面跟 1–2 位数字的版本号)、网关仍按家族名解析它、它不是任何真实模型的名字;
+  并在真机上看一眼菜单。Science 升级后同样要复查。
+- 显示名不得是小写连字符写法(`k3-256k`):Science 会把整条从菜单里丢掉。清单里出现的名字一律过
+  `models::science_safe_display_name`。
 
 ## 端点面
 

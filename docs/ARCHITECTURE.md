@@ -48,7 +48,7 @@ Science daemon 由服务用 CLI 拉起,两个实例拿到的 base_url 不同,网
 手动 `claude-science serve` 仍用 Science 自己的默认 8000,与经 CSSwitch 启动的地址不同。
 两者都绑 loopback。
 
-启动参数(方括号里的一对只在联网搜索总开关关闭时出现,见下文「联网搜索总开关」):
+启动参数(方括号里的一对是否出现,见下文「启动覆盖项」:实例处于第三方模式,或联网搜索总开关关闭时才带):
 
 ```text
 官方:serve [--config <镜像>] --port 8686 --sandbox-port 8687 --detached --no-browser
@@ -151,7 +151,7 @@ CSSwitch.app/Contents/
 | 模式 | `/v1/messages` | `/v1/models` |
 | --- | --- | --- |
 | 官方 | 零改写转发 `api.anthropic.com`,鉴权头原样透传 | 转发 |
-| Kimi | relay 契约 + Kimi 补偿链 | 由用户四槽配置本地合成 |
+| Kimi | relay 契约 + Kimi 补偿链 | 由用户四槽配置本地合成(见「模型解析」) |
 | DeepSeek | deepseek 契约 + DeepSeek 补偿链 | 同上 |
 
 模式是**每个实例各一个**,都存在配置里:正式实例是 `mode`(三种都可选),免登录沙箱是
@@ -232,30 +232,14 @@ CSSwitch.app/Contents/
 ```text
 service.v1.json: web_search
         │
-        ├─ Science 一侧(启动时一次性,science_config.rs)
-        │     true  → 不带 --config,启动参数与没有这个开关时逐项相同
-        │     false → 生成镜像配置 → serve --config <镜像> …
+        ├─ Science 一侧(启动时一次性,见「启动覆盖项」)
+        │     true  → 不覆盖这个键
+        │     false → 镜像配置里写 enable_web_search = false
         │
         └─ 网关一侧(每请求读快照,config.rs / server.rs)
               true  → Kimi 的 typed web_search 走 query-tool bridge
               false → relay 入口摘除 typed web_search,桥不触发
 ```
-
-**镜像配置**:源文件(只读)+ 根表 `enable_web_search = false`,由 `toml_edit` 解析后写出,
-其余键、表与注释原样保留。
-
-| | 官方实例 | 免登录沙箱 |
-| --- | --- | --- |
-| 源(只读) | `~/.claude-science/config.toml` | `<沙箱 data-dir>/config.toml` |
-| 镜像(CSSwitch 写,0600) | `~/.csswitch/science-config/official.toml` | `~/.csswitch/science-config/sandbox.toml` |
-
-- CSSwitch 对真实 `~/.claude-science/` 只读这一个文件,不写、不建任何东西。
-- 镜像只会追加限制:开关开启时不带 `--config`,Science 自己配置里的任何值(包括手写的
-  `enable_web_search = false`)原样生效。
-- `--config` 只换配置文件,不换数据目录,登录与对话不受影响(2026-10-10 用 0.1.60 在隔离
-  HOME 实测)。
-- 每次启动都重新生成镜像;开启态启动时删除残留的镜像文件。源文件不存在时镜像只有这一个键;
-  源文件读不了或解析不了时报错并拒绝启动,不猜着改。
 
 **生效时机**:网关一侧存盘后下一次请求即生效,且不依赖 Science 是否已重启、是否认识这个选项。
 Science 一侧要重启:`POST /control/web-search` 在官方实例运行时会重启它,有会话正在进行且未带
@@ -268,8 +252,43 @@ Science 一侧要重启:`POST /control/web-search` 在官方实例运行时会�
 
 **回滚注意**:旧版本把这个开关存在渠道里(`kimi.web_search`)。新版本读到「顶层没有该键且
 `kimi.web_search == false`」时迁移为总开关关闭,保存后只写顶层键。因此代码回滚到旧版本后,
-旧二进制读不到渠道级旧键,会把「关」读成「开」。`~/.csswitch/science-config/` 是派生文件,
-可直接删除。
+旧二进制读不到渠道级旧键,会把「关」读成「开」。
+
+## 启动覆盖项(镜像配置)
+
+Science 只在启动时读 `config.toml`,而且有两件事只能靠它告诉 Science:关掉联网搜索、新会话默认用
+哪个模型。CSSwitch 不改 Science 自己的文件:需要覆盖时,把「源配置 + 覆盖的键」写成一份镜像,
+启动时用 `--config <镜像>` 交给 Science(`science_config.rs`)。
+
+| 覆盖的键(都在根表) | 什么时候写 | 值 |
+| --- | --- | --- |
+| `enable_web_search` | 联网搜索总开关关闭 | `false` |
+| `default_model` | 这个实例处于第三方模式(Kimi / DeepSeek) | 默认槽所在的菜单条目 id,见「模型解析」 |
+
+两个键都不需要写时,不生成镜像、不带 `--config`,并删掉上次留下的镜像:
+
+```text
+正式实例 · 官方模式 · 联网搜索开   serve --port 8686 --sandbox-port 8687 --detached --no-browser
+正式实例 · 官方模式 · 联网搜索关   serve --config <镜像> …      镜像 = 源 + enable_web_search
+正式实例 · 第三方模式              serve --config <镜像> …      镜像 = 源 + default_model [+ enable_web_search]
+免登录沙箱(总是第三方模式)        serve --data-dir <沙箱> --config <镜像> …
+```
+
+| | 官方实例 | 免登录沙箱 |
+| --- | --- | --- |
+| 源(只读) | `~/.claude-science/config.toml` | `<沙箱 data-dir>/config.toml` |
+| 镜像(CSSwitch 写,0600) | `~/.csswitch/science-config/official.toml` | `~/.csswitch/science-config/sandbox.toml` |
+
+- 镜像由 `toml_edit` 解析源文件后写出:只动上表两个根键(源里已有同名键就覆盖),其余键、表与注释
+  原样保留。
+- CSSwitch 对真实 `~/.claude-science/` 只读这一个文件,不写、不建任何东西。
+- `--config` 只换配置文件,不换数据目录,登录与对话不受影响(2026-10-10 用 0.1.60 在隔离 HOME 实测)。
+- 每次启动都重新生成镜像。源文件不存在时镜像只有覆盖的键;源文件读不了或解析不了时报错并拒绝启动,
+  不猜着改 —— 这样的文件 Science 自己也起不来。
+- 为什么 `default_model` 只能走这里:第三方模式下 Science 的默认模型只取配置里的这个键(默认
+  `claude-opus-5`),界面里的「设置默认模型」依赖 claude.ai 的模型选择器,不可用。菜单里不列
+  `claude-opus-5`,不指定它,新会话的默认模型就不在菜单里。
+- `~/.csswitch/science-config/` 是派生文件,可直接删除。
 
 ## 端点合同的由来
 
@@ -286,10 +305,67 @@ catch-all 转发并记录脱敏端点清单,用于回归这个结论。
 每槽是「上游模型 ID + 显示名」,空槽继承默认槽。服务据此生成一份静态模型目录:
 
 - 每个不同的模型 ID 产出一条 route,selector 形如 `claude-csswitch-<model-id>`;
-- 四个角色(sonnet / opus / haiku / fable)绑到对应 selector;
-- Science 发来的官方模型名(如 `claude-opus-5`)按角色映射到上游模型。
+- 四个角色(sonnet / opus / haiku / fable)绑到对应 selector:默认槽 = sonnet,高质量 = opus,
+  快速 = haiku,Fable = fable。
 
 目录带指纹校验,生成与解析共用同一套算法。
+
+**请求里的模型名怎么解析**(`StaticProfileResolver::resolve`):精确 selector → 历史别名 →
+`claude-<opus|sonnet|haiku|fable>-<版本>` 这种写法按家族名落到角色绑定。Science 自己的辅助调用
+固定用官方名字(如 `claude-haiku-4-5-20251001`),走的就是最后一条。
+
+**模型清单列什么**(`/v1/models`、`/sandbox/v1/models`):每个不同的模型只列一次。
+
+```text
+claude-sonnet-19     默认槽的模型
+claude-opus-19       高质量槽的模型    留空(继承默认槽)或与默认槽同模型时不列
+claude-haiku-19      快速槽的模型      留空或与前面是同一个模型时不列
+claude-csswitch-…    Fable 槽的模型    与前面都不同时才列
+```
+
+- 前三行是主菜单的三个位置。这三个 id 不是哪个真实型号,按上一段的规则由家族名解析到对应槽位,
+  所以清单里显示的模型与请求实际到达的模型由同一份角色绑定得出。
+- Science 自己会用的官方 id(新会话出厂默认的 `claude-opus-5`、辅助调用写死的那几个)不出现在
+  清单里 —— 列出来,菜单里同一个模型就又有好几条。它们仍然可以解析:旧会话与辅助调用照常路由。
+- 去重的先后是默认槽 → 高质量槽 → 快速槽(`static_profile::MENU_POSITIONS`),所以默认槽的模型总在
+  sonnet 位,交给 Science 的 `default_model`(见「启动覆盖项」)恒为 `claude-sonnet-19`。
+  不让默认模型落在 opus 位是有意的:Science 0.1.60 对订阅档不够格的登录(免费档、部分 team /
+  enterprise 席位)会把名字里带 `opus` 的默认模型换成 `claude-sonnet-4-6`,那个 id 不在清单里
+  (静态检查所得;免登录沙箱是虚拟的 max 档,不受影响)。Science 显示菜单时自己按家族排
+  (opus、sonnet、haiku),与这里的先后无关。
+
+为什么是这种写法:Science 0.1.60 在第三方模式下只用这份清单生成菜单,主菜单的三个位置按 id 的写法分配
+(`claude-opus-*` / `claude-sonnet-*` / `claude-haiku-*` 各取版本号最新的一条,要求写成 `claude-<家族>-<数字>[-<数字>]`),
+其余条目进 More models;位置下方的英文说明也按家族写死。版本号取 `19`:它能被这样解析,网关按家族名认得出,
+又不是任何真实模型的名字。
+
+**显示名**:Science 把小写连字符写法的显示名(`k3-256k`、`deepseek-v4-pro`)当成内部模型 id,带着这种
+名字的条目会被它整条从菜单里丢掉(2026-10-10 用 0.1.60 真机确认)。槽的显示名留空时回落到模型 ID,
+正好是这种写法,所以清单里一律换成它肯显示的写法(`K3 256k`、`DeepSeek V4 Pro`);模型 id 不变。
+
+**会话与模型 id**:会话会记住它用的 id。
+
+- 升级前建立的会话记的是旧 id(官方 id 如 `claude-opus-5`,或旧的 `claude-csswitch-*` selector)。
+  它们不在清单里,请求仍按上面的规则解析到对应槽位。以 `claude-opus-5` 建立的会话在真机上看过
+  (2026-10-10):模型按钮显示的是这个 id 本身而不是模型名,追问正常回复。
+- 不支持同一个会话跨供应商继续:切换供应商之后请新开会话。
+- Science 还会在浏览器里记住用户最后一次手动选的模型,之后的新会话默认用它,优先于 `default_model`;
+  记住的 id 不在清单里时它会自己清掉。所以「新会话默认是默认槽的模型」只对没手动选过模型的浏览器成立。
+- 保存槽位会改变各个 id 背后的模型。网关的清单与路由立刻按新配置走;运行中的 Science 手里的菜单
+  不保证跟着刷新。保存不重启 Science(会打断会话),保存结果统一提示「重启 Science 后生效」。
+
+**升级与回滚**:
+
+- 升级后,菜单立刻变成不重复的形态。Science 要重启一次才拿到 `default_model`。正常的升级路径
+  (控制台「退出服务」)本来就会先停掉两个实例;若升级时 Science 仍在运行,它的默认模型还是
+  `claude-opus-5`,不在新清单里,重启后恢复。
+- 回滚到旧版本:配置文件不用动(这一版没有新增配置键)。新版本建立的会话(`claude-sonnet-19` 等)
+  在旧网关下仍按家族名解析到同一个槽位,只是不在旧清单里。
+
+**证据边界**:上面关于 Science 的说法来自对已安装的 0.1.60 二进制的只读静态检查,其中菜单位置、
+默认模型、显示名被丢弃这几条在 2026-10-10 的真机上确认过。真机验收的步骤见
+[test/LIVE_ACCEPTANCE.md](../test/LIVE_ACCEPTANCE.md) §H,结论也记在那一节。其它版本的 Science 没有核对过:
+它的菜单规则变了,这里的做法就要跟着复查。
 
 ## 补偿链
 
@@ -315,8 +391,8 @@ catch-all 转发并记录脱敏端点清单,用于回归这个结论。
 渠道,`kimi` | `deepseek`)、端口、两个渠道的 base_url / key / 四槽(两个实例共用)、
 `request_log`(请求日志开关)、`web_search`(联网搜索总开关)。
 
-`~/.csswitch/science-config/`(0700,文件 0600):联网搜索关闭时交给 Science 的镜像配置,
-每次启动重写,见「联网搜索总开关」。
+`~/.csswitch/science-config/`(0700,文件 0600):交给 Science 的镜像配置,每次启动重写,
+见「启动覆盖项」。
 
 `~/.csswitch/service.log`、`service.log.1`(0600):安装版的服务日志,见「安装版与启动器」。
 从源码运行时不产生。
