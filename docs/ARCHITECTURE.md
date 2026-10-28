@@ -56,6 +56,9 @@ Science daemon 由服务用 CLI 拉起,两个实例拿到的 base_url 不同,网
        --no-browser --no-auto-update --detached
 ```
 
+「跳过审批」总开关(`skip_approvals`,默认关)开着时,两行末尾都再追加 `--dangerously-skip-approvals`
+(Science 官方开关,权限卡一律自动批准);关着时参数与上面逐项相同。切换规矩与联网搜索总开关相同。
+
 官方实例永不带 `--data-dir` 与 `--no-auto-update`:前者会造出隔离实例,后者会关掉它自己的自动更新。
 
 退出服务(`/control/quit`,控制台按钮与 `./csswitch stop` 共用)先并行停掉正在运行的官方实例与
@@ -389,7 +392,8 @@ claude-csswitch-…    Fable 槽的模型    与前面都不同时才列
 
 `~/.csswitch/service.v1.json`(0600):`mode`(正式实例的模式)、`sandbox_mode`(免登录沙箱的
 渠道,`kimi` | `deepseek`)、端口、两个渠道的 base_url / key / 四槽(两个实例共用)、
-`request_log`(请求日志开关)、`web_search`(联网搜索总开关)。
+`request_log`(请求日志开关)、`web_search`(联网搜索总开关)、`skip_approvals`(跳过审批总开关,
+关着时不写进文件)。
 
 `~/.csswitch/science-config/`(0700,文件 0600):交给 Science 的镜像配置,每次启动重写,
 见「启动覆盖项」。

@@ -58,6 +58,10 @@ pub const OFFICIAL_PORT: u16 = 8686;
 /// 这样两个端口都能在代码里一眼看到,推导规则变了也不会悄悄漂移。
 pub const OFFICIAL_SANDBOX_PORT: u16 = 8687;
 
+/// 跳过审批总开关开着时追加到 `serve` 末尾的参数(Science 官方开关:权限卡一律自动批准,
+/// 直到不带它重启)。正式实例与免登录沙箱共用这一处定义。
+pub(crate) const SKIP_APPROVALS_FLAG: &str = "--dangerously-skip-approvals";
+
 const BIN_ENV: &str = "CLAUDE_SCIENCE_BIN";
 const BINARY_NAME: &str = "claude-science";
 
@@ -154,8 +158,9 @@ pub fn stop() -> Result<(), String> {
 
 /// 官方实例的 `serve` 参数。永不带 --data-dir / --no-auto-update;`--config` 只在
 /// `mirror_config` 有值(有启动覆盖项:第三方模式,或联网搜索关闭)时出现,见模块文档的
-/// 硬约束。端口固定,理由同上。
-fn serve_args(mirror_config: Option<&Path>) -> Vec<String> {
+/// 硬约束。端口固定,理由同上。跳过审批开着时末尾追加 [`SKIP_APPROVALS_FLAG`],
+/// 关着时参数与没有这个开关时逐项相同。
+fn serve_args(mirror_config: Option<&Path>, skip_approvals: bool) -> Vec<String> {
     let mut args = vec!["serve".to_string()];
     if let Some(config) = mirror_config {
         args.push("--config".into());
@@ -169,6 +174,9 @@ fn serve_args(mirror_config: Option<&Path>) -> Vec<String> {
         "--detached".to_string(),
         "--no-browser".to_string(),
     ]);
+    if skip_approvals {
+        args.push(SKIP_APPROVALS_FLAG.to_string());
+    }
     args
 }
 
@@ -179,7 +187,7 @@ fn serve_args(mirror_config: Option<&Path>) -> Vec<String> {
 pub fn start(proxy_base_url: &str, overrides: &LaunchOverrides) -> Result<(), String> {
     let bin = find_binary()?;
     let mirror_config = crate::science_config::official_launch_config(overrides)?;
-    let args = serve_args(mirror_config.as_deref());
+    let args = serve_args(mirror_config.as_deref(), overrides.skip_approvals);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(
         &bin,
@@ -229,7 +237,7 @@ mod tests {
     fn official_serve_args_pin_ports_and_never_isolate() {
         // 开启态:与引入联网搜索总开关之前逐项相同。这份字面量就是那时的参数向量,
         // 多一项少一项都意味着用户的官方实例被换了一种方式启动。
-        let enabled = serve_args(None);
+        let enabled = serve_args(None, false);
         assert_eq!(
             enabled,
             [
@@ -245,7 +253,7 @@ mod tests {
 
         // 关闭态:只多出一对 `--config <镜像>`,其余原样。
         let mirror = Path::new("/home/u/.csswitch/science-config/official.toml");
-        let disabled = serve_args(Some(mirror));
+        let disabled = serve_args(Some(mirror), false);
         assert_eq!(disabled[0], "serve", "子命令必须在最前");
         let flags: Vec<usize> = disabled
             .iter()
@@ -287,10 +295,11 @@ mod tests {
             let overrides = LaunchOverrides {
                 web_search,
                 default_model: default_model.map(str::to_string),
+                skip_approvals: false,
             };
             let config =
                 crate::science_config::launch_config(&overrides, &source, &mirror).unwrap();
-            serve_args(config.as_deref())
+            serve_args(config.as_deref(), false)
         };
         let config_flags = |args: &[String]| args.iter().filter(|arg| *arg == "--config").count();
 

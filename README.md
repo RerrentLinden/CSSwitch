@@ -126,6 +126,15 @@ Science 只在启动时读配置,所以切换开关会重启正在运行的 Scie
 免登录沙箱不会自动重启,需要手动重启后生效。这个开关只对**经 CSSwitch 启动**的 Science 生效:
 你自己直接运行 `claude-science serve` 时不受它影响。
 
+## 跳过审批开关
+
+「联网搜索」下面的「跳过审批」开关默认关闭。打开后,经 CSSwitch 启动的 Science(正式实例与
+免登录沙箱)都带 Science 官方的 `--dangerously-skip-approvals` 参数:运行代码、联网、打开文件夹、
+使用连接器的权限卡一律自动批准,相当于 Claude Code 的 bypass permissions。设为 Ask each time 的
+连接器、SSH 密码、永久删除、花用量额度仍会询问。Science 官方的提醒:它只适合本就隔离的环境,
+别人给的数据或提示词里可能藏着指令。生效时机与「联网搜索」相同:正在运行的 Science 会重启,
+沙箱要手动重启。
+
 ## 供应商补偿
 
 第三方端点与官方 Anthropic API 有真实差异,直接转发会 400。补偿都是窄规则,

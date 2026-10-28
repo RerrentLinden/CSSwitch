@@ -134,6 +134,10 @@
         <input type="checkbox" id="web-search">
         <span>联网搜索</span>
       </label>
+      <label class="check" style="margin-top:8px">
+        <input type="checkbox" id="skip-approvals">
+        <span>跳过审批</span>
+      </label>
     </div>
     <div class="msg" id="mode-msg"></div>
   </section>
@@ -322,7 +326,7 @@ async function refresh() {
   renderScience();
   renderSandbox();
   $('request-log').checked = state.request_log !== false;
-  $('web-search').checked = state.web_search !== false;
+  for (const id in launchSwitches) $(id).checked = launchSwitches[id].saved(state);
 }
 
 // 周期轮询只刷状态,不重绘配置表单,也不给两个开关赋值:否则用户填到一半的地址、
@@ -541,10 +545,16 @@ $('btn-quit').onclick = async () => {
   document.querySelector('.wrap').replaceChildren(card);
 };
 
+// 两个启动开关:Science 只在启动时读它们,切换规矩相同。键是复选框 id,也是接口路径。
+const launchSwitches = {
+  'web-search': { key: 'web_search', label: '联网搜索', saved: (s) => s.web_search !== false },
+  'skip-approvals': { key: 'skip_approvals', label: '跳过审批', saved: (s) => s.skip_approvals === true },
+};
+
 // 成功提示按响应逐项拼,每一句只说已经成立、且用户需要知道的事。
-function webSearchNote(result) {
-  if (!result.changed) return '联网搜索设置没有变化。';
-  const parts = [result.web_search ? '已开启联网搜索。' : '已关闭联网搜索。'];
+function launchSwitchNote(sw, result) {
+  if (!result.changed) return sw.label + '设置没有变化。';
+  const parts = [(result[sw.key] ? '已开启' : '已关闭') + sw.label + '。'];
   if (result.science_restarted) parts.push('Science 已重启。');
   if (result.sandbox_restart_required) parts.push('沙箱要重启后才生效。');
   return parts.join('');
@@ -552,30 +562,31 @@ function webSearchNote(result) {
 
 // 改动即提交。失败时不猜结果:重启失败那一类错误发生在存盘之后,
 // 所以以服务端当前状态为准重新赋值,问不到才退回操作前的勾选。
-async function setWebSearch(enabled, force) {
-  const box = $('web-search');
+async function setLaunchSwitch(id, enabled, force) {
+  const sw = launchSwitches[id];
+  const box = $(id);
   box.disabled = true;
   try {
-    const result = await api('web-search', {
+    const result = await api(id, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(force ? { enabled, force: true } : { enabled }),
     });
-    box.checked = result.web_search;
+    box.checked = result[sw.key];
     if (result.science_restarted) scienceUrl = result.url || null;
-    msg($('mode-msg'), webSearchNote(result));
+    msg($('mode-msg'), launchSwitchNote(sw, result));
     await poll().catch(() => {});
   } catch (error) {
     // 有会话在跑时服务会要求确认,而不是默默打断它们;此时服务端什么都没改。
     if (!force && /会话正在进行/.test(error.message)) {
       // await 是必需的:否则 finally 会在重试还没回来时就把复选框放开。
-      if (confirm(error.message + '\n\n仍要切换吗?')) return await setWebSearch(enabled, true);
+      if (confirm(error.message + '\n\n仍要切换吗?')) return await setLaunchSwitch(id, enabled, true);
       box.checked = !enabled;
       return;
     }
     try {
       await poll();
-      box.checked = state.web_search !== false;
+      box.checked = sw.saved(state);
     } catch (unreachable) {
       box.checked = !enabled;
     }
@@ -585,7 +596,17 @@ async function setWebSearch(enabled, force) {
   }
 }
 
-$('web-search').onchange = (event) => setWebSearch(event.target.checked);
+$('web-search').onchange = (event) => setLaunchSwitch('web-search', event.target.checked);
+
+// 打开前先说后果;关掉只会更安全,不再确认。
+$('skip-approvals').onchange = (event) => {
+  const box = event.target;
+  if (box.checked && !confirm('开启后,Science 运行代码、联网、读写文件夹都不再询问你。只在你信任对话里的数据和提示词时使用。')) {
+    box.checked = false;
+    return;
+  }
+  setLaunchSwitch('skip-approvals', box.checked);
+};
 
 $('request-log').onchange = async (event) => {
   const enabled = event.target.checked;

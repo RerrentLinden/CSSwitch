@@ -251,7 +251,7 @@ claude-science serve [--config <镜像>] --port 8686 --sandbox-port 8687 --detac
   env_remove: ANTHROPIC_MODEL / *_MODEL / *_MODEL_NAME
               ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
 claude-science stop | status | url
-science_config::LaunchOverrides { web_search: bool, default_model: Option<String> }
+science_config::LaunchOverrides { web_search: bool, default_model: Option<String>, skip_approvals: bool }
 science_config::launch_config(&overrides, source, mirror) -> Result<Option<PathBuf>, String>
   source(只读): ~/.claude-science/config.toml
   mirror(0600): ~/.csswitch/science-config/official.toml
@@ -266,6 +266,7 @@ control::launch_overrides(profile, instance) -> LaunchOverrides   # 五个启动
 | `--data-dir` | 永远禁止 | 造出隔离实例,用户对话从此分家 |
 | `--no-auto-update` | 永远禁止 | 官方实例失去自动更新（用户明确红线） |
 | `--config` | 只指向 CSSwitch 生成的镜像；只在「联网搜索关闭」或「这个实例处于第三方模式」时出现 | 它只换配置文件、不换数据目录（2026-10-10 用 0.1.60 隔离实测）；官方模式 + 联网搜索开启时不带它，启动参数与没有这些功能时逐项相同 |
+| `--dangerously-skip-approvals` | 只在「跳过审批」总开关开着时追加在末尾(两个实例同一个值,`science::SKIP_APPROVALS_FLAG` 只定义一次) | 用户明确要的 bypass 模式;关着时参数逐项不变。不进镜像、不影响 `needs_mirror()` |
 | `--port` / `--sandbox-port` | 固定 8686 / 8687 | 不用 `0`（控制台地址要稳定可收藏），也不沿用 Science 默认的 8000 / 8001（常被本机其它开发服务占用）；两个端口都显式给出，不依赖「port+1」的推导 |
 
 - 模型类与凭证类环境变量必须清除：残留会让 Science 绕过网关的模型目录，或带着旧凭证启动。
@@ -370,6 +371,7 @@ control::launch_overrides(profile, instance) -> LaunchOverrides   # 五个启动
 &["serve", "--port", "8686", "--sandbox-port", "8687", "--detached", "--no-browser"]
 // env: ANTHROPIC_BASE_URL=<gateway>
 // 联网搜索关闭、或实例处于第三方模式时,在 serve 之后多一对:"--config", <CSSwitch 生成的镜像>
+// 跳过审批总开关开着时,末尾多一个:"--dangerously-skip-approvals"
 ```
 
 ---

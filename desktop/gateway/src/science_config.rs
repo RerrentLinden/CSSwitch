@@ -45,6 +45,9 @@ pub struct LaunchOverrides {
     pub web_search: bool,
     /// 新会话的默认模型:模型清单里承载默认槽的那一条的 id。官方模式下是 `None`。
     pub default_model: Option<String>,
+    /// 跳过审批总开关。它是 `serve` 的命令行参数,不是配置键:不进镜像,也不影响
+    /// [`needs_mirror`](Self::needs_mirror)。
+    pub skip_approvals: bool,
 }
 
 impl LaunchOverrides {
@@ -238,6 +241,7 @@ mod tests {
         LaunchOverrides {
             web_search,
             default_model: None,
+            skip_approvals: false,
         }
     }
 
@@ -246,6 +250,7 @@ mod tests {
         LaunchOverrides {
             web_search,
             default_model: Some(MENU_ID.into()),
+            skip_approvals: false,
         }
     }
 

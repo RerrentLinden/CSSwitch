@@ -178,7 +178,15 @@ pub fn start(proxy_base_url: &str, overrides: &LaunchOverrides) -> Result<Value,
             std::env::var_os("GIT_CONFIG_COUNT").is_some(),
         ));
     }
-    let output = run_cli(&bin, &serve_args(&data_dir, mirror_config.as_deref()), &env)?;
+    let output = run_cli(
+        &bin,
+        &serve_args(
+            &data_dir,
+            mirror_config.as_deref(),
+            overrides.skip_approvals,
+        ),
+        &env,
+    )?;
     if !output.status.success() {
         return Err(format!(
             "启动沙箱 daemon 失败:{}",
@@ -307,7 +315,8 @@ fn pin_cookie_host(url: &str) -> String {
 // ---------- 启动组装(纯函数,供单测钉死) ----------
 /// `mirror_config` 指向 `science_config.rs` 按启动覆盖项生成的镜像,没有覆盖项时为 `None`;
 /// `--config` 只换配置文件,数据目录仍由 `--data-dir` 决定。
-fn serve_args(data_dir: &Path, mirror_config: Option<&Path>) -> Vec<String> {
+/// 跳过审批开着时末尾追加 `science::SKIP_APPROVALS_FLAG`。
+fn serve_args(data_dir: &Path, mirror_config: Option<&Path>, skip_approvals: bool) -> Vec<String> {
     let mut args = vec![
         "serve".to_string(),
         "--data-dir".to_string(),
@@ -328,6 +337,9 @@ fn serve_args(data_dir: &Path, mirror_config: Option<&Path>) -> Vec<String> {
         "--no-auto-update".to_string(),
         "--detached".to_string(),
     ]);
+    if skip_approvals {
+        args.push(crate::science::SKIP_APPROVALS_FLAG.to_string());
+    }
     args
 }
 
@@ -771,7 +783,7 @@ mod tests {
         // 不带镜像配置时的参数向量(字面量就是引入启动覆盖项之前的那一份);
         // 带镜像时只在它上面多一对 `--config <镜像>`,见下一个测试。
         let data_dir = Path::new("/tmp/sandbox/home/.claude-science");
-        let enabled = serve_args(data_dir, None);
+        let enabled = serve_args(data_dir, None, false);
         assert_eq!(
             enabled,
             [
@@ -799,7 +811,7 @@ mod tests {
     fn serve_args_add_only_the_mirror_config() {
         let data_dir = Path::new("/tmp/sandbox/home/.claude-science");
         let mirror = Path::new("/tmp/csswitch/science-config/sandbox.toml");
-        let mirrored = serve_args(data_dir, Some(mirror));
+        let mirrored = serve_args(data_dir, Some(mirror), false);
         let flags: Vec<usize> = mirrored
             .iter()
             .enumerate()
@@ -811,7 +823,7 @@ mod tests {
         rest.drain(flags[0]..=flags[0] + 1);
         assert_eq!(
             rest,
-            serve_args(data_dir, None),
+            serve_args(data_dir, None, false),
             "去掉这一对之后与不带镜像时逐项相同"
         );
         // 兜底停止与运行状态都靠命令行里的 `--data-dir <沙箱目录>` 认出沙箱 daemon:
@@ -838,6 +850,7 @@ mod tests {
             let overrides = LaunchOverrides {
                 web_search,
                 default_model: Some("claude-sonnet-19".into()),
+                skip_approvals: false,
             };
             let config = crate::science_config::launch_config(
                 &overrides,
@@ -845,7 +858,7 @@ mod tests {
                 &mirror,
             )
             .unwrap();
-            let args = serve_args(&data_dir, config.as_deref());
+            let args = serve_args(&data_dir, config.as_deref(), false);
             assert_eq!(
                 args.iter().filter(|arg| *arg == "--config").count(),
                 1,

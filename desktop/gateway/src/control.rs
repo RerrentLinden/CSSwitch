@@ -167,7 +167,10 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
         })),
         ("POST", "config") => save_config(request, state),
         ("POST", "logging") => save_logging(request, state),
-        ("POST", "web-search") => set_web_search(request, state),
+        ("POST", "web-search") => set_launch_switch(request, state, LaunchSwitch::WebSearch),
+        ("POST", "skip-approvals") => {
+            set_launch_switch(request, state, LaunchSwitch::SkipApprovals)
+        }
         ("POST", "switch") => switch_mode(request, state),
         ("POST", "probe-models") => probe_models(request),
         ("POST", "science/start") => start_science(state),
@@ -236,6 +239,7 @@ fn status_payload(state: &Arc<AppState>) -> Value {
         "sandbox_mode_label": profile.sandbox_mode.display_name(),
         "request_log": profile.request_log,
         "web_search": profile.web_search,
+        "skip_approvals": profile.skip_approvals,
         "channels": {
             "kimi": channel_payload(&profile.kimi),
             "deepseek": channel_payload(&profile.deepseek),
@@ -345,6 +349,7 @@ fn channel_resolver(
 fn launch_overrides(profile: &Profile, instance: Instance) -> LaunchOverrides {
     LaunchOverrides {
         web_search: profile.web_search,
+        skip_approvals: profile.skip_approvals,
         default_model: channel_resolver(profile, profile.mode_for(instance))
             .map(|resolver| resolver.default_menu_id().to_string()),
     }
@@ -457,9 +462,9 @@ fn start_science(state: &Arc<AppState>) -> Result<Value, String> {
     Ok(json!({"ok": true, "url": url}))
 }
 
-/// 切换联网搜索总开关时要做什么。
+/// 切换启动开关(联网搜索、跳过审批)时要做什么。
 #[derive(Debug, Eq, PartialEq)]
-enum WebSearchSwitch {
+enum LaunchSwitchPlan {
     /// 目标值与当前值相同:什么都不做。
     Unchanged,
     /// 官方实例里有会话正在进行而调用方没有确认:拒绝,任何状态不变。
@@ -472,27 +477,27 @@ enum WebSearchSwitch {
 
 /// 纯判定,不碰任何状态。Science 只在启动时读配置,所以运行中的官方实例必须重启;
 /// 重启会打断进行中的会话,与切换模式同一套规矩:有会话且未确认就拒绝。
-fn plan_web_search_switch(
+fn plan_launch_switch(
     current: bool,
     target: bool,
     running: bool,
     active: u64,
     force: bool,
-) -> WebSearchSwitch {
+) -> LaunchSwitchPlan {
     if current == target {
-        WebSearchSwitch::Unchanged
+        LaunchSwitchPlan::Unchanged
     } else if !running {
-        WebSearchSwitch::SaveOnly
+        LaunchSwitchPlan::SaveOnly
     } else if active > 0 && !force {
-        WebSearchSwitch::NeedsConfirmation { active }
+        LaunchSwitchPlan::NeedsConfirmation { active }
     } else {
-        WebSearchSwitch::SaveAndRestart
+        LaunchSwitchPlan::SaveAndRestart
     }
 }
 
 /// 请求体 `{"enabled": bool, "force"?: bool}`。两个字段都不做类型降级:
 /// 字符串 "false" 在 JS 里是真值,静默接受会把意图反过来。
-fn parse_web_search_request(payload: &Value) -> Result<(bool, bool), String> {
+fn parse_enabled_request(payload: &Value) -> Result<(bool, bool), String> {
     let enabled = match payload.get("enabled") {
         Some(Value::Bool(enabled)) => *enabled,
         Some(_) => return Err("enabled 必须是布尔值".into()),
@@ -502,7 +507,7 @@ fn parse_web_search_request(payload: &Value) -> Result<(bool, bool), String> {
 }
 
 /// 请求体里可选的 `force`:「我确认打断正在进行的事」。缺省为否;出现了就必须是布尔值,
-/// 不从别的类型猜。联网搜索总开关与沙箱渠道切换共用。
+/// 不从别的类型猜。启动开关与沙箱渠道切换共用。
 fn parse_force(payload: &Value) -> Result<bool, String> {
     match payload.get("force") {
         None | Some(Value::Null) => Ok(false),
@@ -511,43 +516,92 @@ fn parse_force(payload: &Value) -> Result<bool, String> {
     }
 }
 
-/// 联网搜索总开关。一个值驱动两层:
-/// - 网关一侧每请求读快照,存盘并更新快照后下一次请求即生效;
-/// - Science 一侧只在启动时读配置,官方实例在运行就重启它。免登录沙箱不自动重启
-///   (它没有可供确认的会话数),只在响应里标出需要重启。
+/// 存在 `Profile` 里、只在 Science 启动时生效的开关。两个开关切换时走同一套规矩
+/// (见 [`set_launch_switch`]),只是字段与说法不同。
+#[derive(Clone, Copy)]
+enum LaunchSwitch {
+    /// 联网搜索总开关:Science 一侧写进镜像配置,网关一侧每请求读快照摘除搜索声明。
+    WebSearch,
+    /// 跳过审批总开关:只在 Science 一侧,启动时追加 `--dangerously-skip-approvals`。
+    SkipApprovals,
+}
+
+impl LaunchSwitch {
+    /// 请求、响应与状态接口里的字段名。
+    fn key(self) -> &'static str {
+        match self {
+            Self::WebSearch => "web_search",
+            Self::SkipApprovals => "skip_approvals",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::WebSearch => "联网搜索",
+            Self::SkipApprovals => "跳过审批",
+        }
+    }
+
+    fn get(self, profile: &Profile) -> bool {
+        match self {
+            Self::WebSearch => profile.web_search,
+            Self::SkipApprovals => profile.skip_approvals,
+        }
+    }
+
+    fn set(self, profile: &mut Profile, enabled: bool) {
+        match self {
+            Self::WebSearch => profile.web_search = enabled,
+            Self::SkipApprovals => profile.skip_approvals = enabled,
+        }
+    }
+
+    /// 存盘之后、Science 重启之前就已经生效的部分,写进重启失败的报错里。
+    fn saved_effect(self) -> &'static str {
+        match self {
+            Self::WebSearch => ",网关一侧已生效",
+            Self::SkipApprovals => "",
+        }
+    }
+}
+
+/// 启动开关的切换。Science 只在启动时读这些设置,所以官方实例在运行就重启它;
+/// 免登录沙箱不自动重启(它没有可供确认的会话数),只在响应里标出需要重启。
 ///
 /// 拒绝与镜像预检都在存盘之前:被拒绝、或镜像生成不出来(例如用户的 `config.toml`
 /// 无法解析)时,开关不会停在「已保存但没生效」的状态。重启失败不回滚:那时的真实状态
-/// 就是「开关已改、Science 没按新设置跑起来」,原文报给用户;官方模式下把开关拨回开启
-/// 再启动,就是不带 `--config` 的原始启动方式。
-fn set_web_search(request: &Request, state: &Arc<AppState>) -> Result<Value, String> {
+/// 就是「开关已改、Science 没按新设置跑起来」,原文报给用户。
+fn set_launch_switch(
+    request: &Request,
+    state: &Arc<AppState>,
+    switch: LaunchSwitch,
+) -> Result<Value, String> {
     let payload: Value =
         serde_json::from_slice(&request.body).map_err(|e| format!("请求体不是合法 JSON:{e}"))?;
-    let (enabled, force) = parse_web_search_request(&payload)?;
+    let (enabled, force) = parse_enabled_request(&payload)?;
     let mut profile = state.snapshot();
     let (running, active) = science_activity(&crate::science::status());
-    let restart = match plan_web_search_switch(profile.web_search, enabled, running, active, force)
-    {
-        WebSearchSwitch::Unchanged => {
+    let restart = match plan_launch_switch(switch.get(&profile), enabled, running, active, force) {
+        LaunchSwitchPlan::Unchanged => {
             return Ok(json!({
                 "ok": true,
-                "web_search": enabled,
+                switch.key(): enabled,
                 "changed": false,
                 "science_restarted": false,
                 "url": Value::Null,
                 "sandbox_restart_required": false,
             }))
         }
-        WebSearchSwitch::NeedsConfirmation { active } => {
+        LaunchSwitchPlan::NeedsConfirmation { active } => {
             return Err(active_sessions_refusal(active))
         }
-        WebSearchSwitch::SaveOnly => false,
-        WebSearchSwitch::SaveAndRestart => true,
+        LaunchSwitchPlan::SaveOnly => false,
+        LaunchSwitchPlan::SaveAndRestart => true,
     };
     // 预检:按新值算出这次启动的覆盖项。要带镜像配置(关闭联网搜索,或正式实例在第三方
     // 模式)而现在生成不出来,就不要存;不需要镜像时顺手删掉残留的那一份 —— 官方实例没在
     // 运行时不会走到 start,残留会一直留到下次启动。
-    profile.web_search = enabled;
+    switch.set(&mut profile, enabled);
     let overrides = launch_overrides(&profile, Instance::Official);
     crate::science_config::official_launch_config(&overrides)?;
 
@@ -557,21 +611,23 @@ fn set_web_search(request: &Request, state: &Arc<AppState>) -> Result<Value, Str
     }
 
     if restart {
+        let label = switch.label();
         let saved = if enabled { "开启" } else { "关闭" };
+        let effect = switch.saved_effect();
         crate::science::stop().map_err(|error| {
-            format!("联网搜索已保存为{saved},网关一侧已生效;但停止 Science 失败,它没有按新设置重启:{error}")
+            format!("{label}已保存为{saved}{effect};但停止 Science 失败,它没有按新设置重启:{error}")
         })?;
         std::thread::sleep(Duration::from_millis(600));
         crate::science::start(&format!("http://127.0.0.1:{}", state.port), &overrides).map_err(
             |error| {
-                format!("联网搜索已保存为{saved},网关一侧已生效;但 Science 已停止,按新设置启动失败:{error}")
+                format!("{label}已保存为{saved}{effect};但 Science 已停止,按新设置启动失败:{error}")
             },
         )?;
     }
     let sandbox_running = reports_running(&crate::sandbox::status());
     Ok(json!({
         "ok": true,
-        "web_search": enabled,
+        switch.key(): enabled,
         "changed": true,
         "science_restarted": restart,
         "url": if restart { crate::science::login_url().ok() } else { None },
@@ -1068,39 +1124,30 @@ mod tests {
     }
 
     #[test]
-    fn web_search_switch_never_interrupts_sessions_without_consent() {
-        use WebSearchSwitch::*;
+    fn launch_switch_never_interrupts_sessions_without_consent() {
+        use LaunchSwitchPlan::*;
         // 值没变:不存盘、不重启 —— 哪怕 Science 正在跑、带着 force。
-        assert_eq!(plan_web_search_switch(true, true, true, 3, true), Unchanged);
-        assert_eq!(
-            plan_web_search_switch(false, false, true, 0, false),
-            Unchanged
-        );
+        assert_eq!(plan_launch_switch(true, true, true, 3, true), Unchanged);
+        assert_eq!(plan_launch_switch(false, false, true, 0, false), Unchanged);
         // 有会话正在进行且未确认:拒绝。开→关、关→开都要重启,两个方向都受保护。
         assert_eq!(
-            plan_web_search_switch(true, false, true, 2, false),
+            plan_launch_switch(true, false, true, 2, false),
             NeedsConfirmation { active: 2 }
         );
         assert_eq!(
-            plan_web_search_switch(false, true, true, 1, false),
+            plan_launch_switch(false, true, true, 1, false),
             NeedsConfirmation { active: 1 }
         );
         // 没在运行:没有会话可打断,只存盘。状态里残留的会话数不构成拒绝理由。
-        assert_eq!(
-            plan_web_search_switch(true, false, false, 0, false),
-            SaveOnly
-        );
-        assert_eq!(
-            plan_web_search_switch(true, false, false, 5, false),
-            SaveOnly
-        );
+        assert_eq!(plan_launch_switch(true, false, false, 0, false), SaveOnly);
+        assert_eq!(plan_launch_switch(true, false, false, 5, false), SaveOnly);
         // 在运行:没有会话,或用户已确认 → 存盘并重启。
         assert_eq!(
-            plan_web_search_switch(true, false, true, 0, false),
+            plan_launch_switch(true, false, true, 0, false),
             SaveAndRestart
         );
         assert_eq!(
-            plan_web_search_switch(true, false, true, 2, true),
+            plan_launch_switch(true, false, true, 2, true),
             SaveAndRestart
         );
     }
@@ -1126,21 +1173,21 @@ mod tests {
     }
 
     #[test]
-    fn web_search_request_must_carry_explicit_bools() {
+    fn launch_switch_request_must_carry_explicit_bools() {
         assert_eq!(
-            parse_web_search_request(&json!({"enabled": false})),
+            parse_enabled_request(&json!({"enabled": false})),
             Ok((false, false))
         );
         assert_eq!(
-            parse_web_search_request(&json!({"enabled": true, "force": true})),
+            parse_enabled_request(&json!({"enabled": true, "force": true})),
             Ok((true, true))
         );
         // 不做类型降级:字符串 "false" 在 JS 里是真值。
-        assert!(parse_web_search_request(&json!({"enabled": "false"})).is_err());
-        assert!(parse_web_search_request(&json!({"enabled": 0})).is_err());
-        assert!(parse_web_search_request(&json!({})).is_err());
+        assert!(parse_enabled_request(&json!({"enabled": "false"})).is_err());
+        assert!(parse_enabled_request(&json!({"enabled": 0})).is_err());
+        assert!(parse_enabled_request(&json!({})).is_err());
         // force 是「我确认打断会话」,同样不能从别的类型猜。
-        assert!(parse_web_search_request(&json!({"enabled": false, "force": "true"})).is_err());
+        assert!(parse_enabled_request(&json!({"enabled": false, "force": "true"})).is_err());
     }
 
     #[test]

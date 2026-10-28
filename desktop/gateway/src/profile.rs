@@ -295,6 +295,16 @@ pub struct Profile {
     /// 存量文件里渠道级旧键的迁移见 [`Profile::parse`]。
     #[serde(default = "default_web_search")]
     pub web_search: bool,
+    /// 跳过审批总开关(全局,两个实例共用)。开着时经 CSSwitch 启动的 Science 都带
+    /// `--dangerously-skip-approvals`:权限卡一律自动批准,直到不带它重启。
+    ///
+    /// 默认关;关着时不写进文件,存量 `service.v1.json` 读进来再存回去逐字不变。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_approvals: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_sandbox_mode() -> Mode {
@@ -323,6 +333,7 @@ impl Default for Profile {
             deepseek: Channel::deepseek_default(),
             request_log: default_request_log(),
             web_search: default_web_search(),
+            skip_approvals: false,
         }
     }
 }
