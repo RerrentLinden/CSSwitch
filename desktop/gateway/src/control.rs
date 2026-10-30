@@ -112,6 +112,12 @@ fn handle(mut stream: TcpStream, state: Arc<AppState>) {
             return;
         }
     };
+    // 免登录沙箱把 https_proxy 指向这里。第三方主机(GitHub、CRAN、数据 API 等)直连打隧道;
+    // Anthropic / Claude 主机与不合法的目标落到下面的显式 404。
+    if request.method == "CONNECT" && crate::connect::should_tunnel(&request.target) {
+        crate::connect::handle_connect(&request.target, stream);
+        return;
+    }
     let path = request.path().to_string();
     if path == "/" || path == "/ui" || path == "/ui/" {
         respond_text(&mut stream, 200, "text/html; charset=utf-8", INDEX_HTML);

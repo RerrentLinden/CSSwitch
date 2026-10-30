@@ -220,6 +220,18 @@ check "控制面状态可达"     200 "$(code "http://127.0.0.1:$PORT/control/st
 check "未知路径显式 404"   404 "$(code "http://127.0.0.1:$PORT/v1/unknown")"
 check "未知控制操作报错"   400 "$(code -X POST "http://127.0.0.1:$PORT/control/nope")"
 
+# 免登录沙箱把 https_proxy 指向控制台。第三方主机要真的打通隧道(曾经一律 404,
+# 沙箱里导入 GitHub 仓库直接失败);Anthropic / Claude 主机仍是 404 快速失败。
+# 隧道目标就是控制台自己:不依赖外网,又能证明字节双向走通。--noproxy '' 防止
+# 环境里的 NO_PROXY 让 curl 绕过 -x 直连,把失败的隧道误判为通过。
+tunnel() { curl -s -o /dev/null --noproxy '' --max-time 5 -x "http://127.0.0.1:$PORT" "$@"; }
+check "CONNECT 第三方主机打通隧道并完成请求" "200 200" \
+  "$(tunnel -p -w '%{http_connect} %{http_code}' "http://127.0.0.1:$PORT/control/status")"
+check "CONNECT Anthropic 主机仍显式 404" 404 \
+  "$(tunnel -w '%{http_connect}' "https://api.anthropic.com/v1/models")"
+check "CONNECT Claude 主机仍显式 404" 404 \
+  "$(tunnel -w '%{http_connect}' "https://claude.ai/")"
+
 # 版本号只有一个来源:状态接口报告的,就是这个二进制 --version 打印的。
 # 顶层 version 是状态对象的第一个键(沙箱状态里另有一个嵌套的 version,那是 Science 的)。
 bin_version="$("$BIN" --version)"

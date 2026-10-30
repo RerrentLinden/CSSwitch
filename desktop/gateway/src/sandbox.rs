@@ -344,8 +344,8 @@ fn serve_args(data_dir: &Path, mirror_config: Option<&Path>, skip_approvals: boo
 }
 
 fn daemon_env(sandbox_home: &Path, proxy_base_url: &str) -> Vec<(String, String)> {
-    // Anthropic HTTPS 全部指向网关快速失败(网关对非推理路径显式 404),而不是挂住。
-    // 代理地址不带沙箱前缀:代理只认主机与端口。
+    // HTTPS 外联全部经网关:Anthropic / Claude 主机显式 404 快速失败(而不是挂住),
+    // 其余主机直连打隧道(GitHub、CRAN、数据 API 等)。代理地址不带沙箱前缀:代理只认主机与端口。
     let fastfail = proxy_base_url.to_string();
     vec![
         ("HOME".to_string(), sandbox_home.display().to_string()),

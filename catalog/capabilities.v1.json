@@ -324,16 +324,16 @@
       },
       "status": "supported",
       "action": "diagnose",
-      "reason": "Anthropic/Claude hosts are fast-failed with 401 so Science treats virtual login as logged out instead of retrying organization switching.",
+      "reason": "Anthropic/Claude hosts are fast-failed instead of tunnelled. The console (control.rs), which the virtual sandbox uses as https_proxy, answers 404 like any other non-inference request; the legacy server.rs path answers 401. Consequence in the sandbox: the claude.ai skill registry is unreachable, so Science refuses custom skill writes (import, upload, new draft).",
       "evidence": [
+        "desktop/gateway/src/control.rs",
         "desktop/gateway/src/server.rs",
         "desktop/gateway/src/connect.rs"
       ],
       "tests": [
-        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel",
+        "test/run_loopback.sh (CONNECT Anthropic / Claude 主机仍显式 404)",
         "desktop/gateway/src/connect.rs::tests::blocks_anthropic_claude_hosts_only",
-        "desktop/gateway/src/connect.rs::tests::blocked_and_bad_targets_never_reach_the_dialer",
-        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel"
+        "desktop/gateway/src/connect.rs::tests::blocked_and_bad_targets_never_reach_the_dialer"
       ]
     },
     {
@@ -347,15 +347,15 @@
       "action": "document",
       "reason": "Non-Anthropic CONNECT opens a direct TCP tunnel. One 10-second dial budget starts before synchronous DNS and is shared across resolved addresses; std DNS itself cannot be interrupted by that budget. External MCP access can still fail where direct egress is blocked.",
       "evidence": [
+        "desktop/gateway/src/control.rs",
         "desktop/gateway/src/server.rs",
         "desktop/gateway/src/connect.rs",
         "https://github.com/SuperJJ007/CSSwitch/issues/11"
       ],
       "tests": [
-        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel",
+        "test/run_loopback.sh (CONNECT 第三方主机打通隧道并完成请求)",
         "desktop/gateway/src/connect.rs::tests::all_addresses_share_one_connect_budget",
-        "desktop/gateway/src/connect.rs::tests::elapsed_deadline_never_attempts_a_dial",
-        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel"
+        "desktop/gateway/src/connect.rs::tests::elapsed_deadline_never_attempts_a_dial"
       ]
     },
     {

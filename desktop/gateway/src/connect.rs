@@ -23,6 +23,12 @@ pub fn is_blocked_host(host: &str) -> bool {
         || host.ends_with(".claude.com")
 }
 
+/// 控制台用:目标合法且不是 Anthropic / Claude 主机时才打隧道。其余目标由调用方沿用
+/// 显式 404,免登录沙箱靠这个让 Anthropic 请求快速失败。
+pub fn should_tunnel(target: &str) -> bool {
+    matches!(parse_target(target), Ok((host, _)) if !is_blocked_host(&host))
+}
+
 fn parse_target(target: &str) -> Result<(String, u16), ()> {
     if let Some(rest) = target.strip_prefix('[') {
         let (host, suffix) = rest.split_once(']').ok_or(())?;
