@@ -53,6 +53,9 @@ CSSwitch 接管的是**用户自己的官方 Science 实例**,不做数据隔离
 - 沙箱的 `ANTHROPIC_BASE_URL` 是「网关地址 + `/sandbox`」,网关靠这段路径前缀认出请求来自沙箱,
   按 `sandbox_mode` 路由。前缀常量只定义一次(`sandbox::INFERENCE_PREFIX`),沙箱环境与路由共用;
   只加在 base_url 上,沙箱的 `https_proxy` / `HTTPS_PROXY` 仍是不带路径的网关地址。
+- 控制台对 `CONNECT`:Anthropic / Claude 主机与不合法目标显式 404,其余直连打隧道。**不得**为
+  Anthropic / Claude 主机打隧道:铸造的登录会被带到真实服务上。代价是沙箱写不了自定义技能
+  (导入 / 上传 / 新建都要先查 claude.ai 技能注册表),这是已知限制。
 - **沙箱永不为官方**:它的登录是 CSSwitch 铸造的虚拟登录,没有真实 Claude 凭证,官方接口必然
   拒绝。读配置时归一(键缺失或被手改成 `official` → 推导成渠道),切换时拒绝并说明原因;
   推理层的官方直通只对正式实例开放。不得为了让沙箱走官方而读取或借用真实登录。

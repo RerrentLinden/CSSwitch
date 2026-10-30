@@ -273,3 +273,31 @@ Science 一侧的条目与默认模型读自它自己的 `/api/models` 与 `/api
    判据:`ps` 里**不带** `--config`;`~/.csswitch/science-config/official.toml` 不存在。
 7. 整轮结束后看「请求日志」与服务日志。
    判据:没有 error 行;沙箱的请求记为 `沙箱 · kimi`。
+
+## I. 沙箱外联(GitHub 导入)
+
+离线门禁证明的是控制台一侧:第三方主机的 `CONNECT` 真的打通隧道,Anthropic / Claude 主机仍是 404。
+Science 拿到隧道之后能做成什么,只有真机能回答。
+
+**已有的真机记录(2026-10-30,Science 0.1.71,免登录沙箱 · Kimi;安装版换成本次构建,只重启了控制台,
+两个 Science 实例没有重启;操作在 Claude 桌面端的内置浏览器里完成):**
+
+| 步 | 结果 | 看到的 |
+| --- | --- | --- |
+| 1 | 通过 | 修复前,Settings > Skills > Import from GitHub 预览私有仓库报 `Proxy refused to open a tunnel: 404 Not Found`;同一时刻对控制台发 `CONNECT api.github.com:443` 得到 404 |
+| 2 | 通过 | 修复后,经控制台 `CONNECT api.github.com:443` 得到 200,`CONNECT api.anthropic.com:443` 仍是 404 |
+| 3 | 通过 | 同一私有仓库预览成功:读出 marketplace 清单与 4 个技能(Credentials 里的 GitHub token 生效) |
+| 4 | 未通过(已知限制) | 预览下方提示 `skill catalog unreachable`,导入按钮不可用。原因是导入前要查 claude.ai 技能注册表,沙箱到不了 claude.ai |
+
+这一轮的边界:
+
+- 没有在沙箱里实际装 CRAN / npm 包或调数据 API;它们走的是同一条隧道,但没有逐个验证。
+- 隧道直连目标主机,不经用户自己的上游代理(本机 Surge 6152);直连 GitHub 不通的网络里仍会失败。
+- 控制台重启时官方实例正在跑任务。重启选在两次模型请求之间的空档,停顿约 2.5 秒,之后它的下一条请求正常走到新控制台。
+
+前提:Credentials 里已填 GitHub token;仓库地址用 `owner/repo` 或 github.com URL。
+
+1. 免登录沙箱里打开 Settings > Skills > Add skill > Import from GitHub,填仓库,点 Preview。
+   判据:列出仓库里的技能;没有 `Proxy refused to open a tunnel`。
+2. 对控制台分别 `CONNECT` 一个第三方主机与 `api.anthropic.com`(`curl --noproxy '' -x http://127.0.0.1:8788 -w '%{http_connect}'`)。
+   判据:前者 200,后者 404。

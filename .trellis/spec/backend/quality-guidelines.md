@@ -393,7 +393,7 @@ sandbox::start(base_url, &LaunchOverrides) → forge(幂等三态) → SSH/gh �
 claude-science serve --data-dir <沙箱> --config <镜像> --host 127.0.0.1 --port 8790 --sandbox-port 8791
   --no-browser --no-auto-update --detached
   镜像: source = <沙箱 data-dir>/config.toml(只读)  mirror = ~/.csswitch/science-config/sandbox.toml
-  env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>/sandbox  https_proxy=<网关>(快速失败,不带前缀)
+  env: HOME=<沙箱 home>  ANTHROPIC_BASE_URL=<网关>/sandbox  https_proxy=<网关>(不带前缀;CONNECT 到 Anthropic / Claude 主机 404,其余直连隧道)
        DO_NOT_TRACK=1(关 Science 的使用统计与错误上报)
        PATH=<沙箱>/bin:<继承>  GIT_CONFIG_COUNT/KEY_n/VALUE_n(本机装了 gh 时)
 sandbox_forge::ensure_virtual_login(auth_dir, email, sandbox_root)  # 三道护栏先行

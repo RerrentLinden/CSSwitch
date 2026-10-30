@@ -36,7 +36,13 @@ Science daemon 由服务用 CLI 拉起,两个实例拿到的 base_url 不同,网
 
 前缀只在服务层路由这一处剥离(query 保留),推理层看到的路径与实例无关;常量只定义一次
 (`sandbox::INFERENCE_PREFIX`),沙箱环境与路由共用。沙箱的 `https_proxy` / `HTTPS_PROXY`
-(外联快速失败)仍是不带路径的网关地址。详见下文「两个实例各选各的」。
+仍是不带路径的网关地址。控制台收到 `CONNECT` 时,Anthropic / Claude 主机与不合法的目标显式 404
+(快速失败),其余主机直连打隧道(`connect::should_tunnel`),不经用户自己的上游代理。
+详见下文「两个实例各选各的」。
+
+沙箱因此到不了 claude.ai 的技能注册表。Science 在写自定义技能(从 GitHub 导入、上传、新建草稿)
+之前要用它核对重名,拿不到就拒绝,界面上是 `skill catalog unreachable`;GitHub 预览本身能用。
+claude.ai 的地址写死在 Science 里(0.1.71 静态检查),没有可改的配置。
 
 沙箱的环境里还带着 `DO_NOT_TRACK=1`。这是 Science 官方的遥测开关,关掉使用统计与错误上报,
 只在 daemon 启动时读。沙箱的登录是铸造的,不以这个身份向 Anthropic 上报;错误上报的主机不在
