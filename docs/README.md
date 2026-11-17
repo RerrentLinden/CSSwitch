@@ -7,5 +7,7 @@
 - [Kimi 渠道](features/kimi-channels.md) —— Kimi 的四条补偿与各自的实测证据。
 - [DeepSeek 渠道](features/deepseek-channel.md) —— DeepSeek 的六条补偿与来源。
 - [真机验收清单](../test/LIVE_ACCEPTANCE.md) —— 离线门禁覆盖不到的部分。
+- [行为规格](../openspec/specs/) —— 每个能力一个目录:`spec.md` 是需求与场景,`design.md` 是签名、必需测试与反例。
+- [编码规范](../openspec/conventions/README.md) —— 目录结构、上游能力判定、补偿退役、三层门禁、控制台验收。
 
 Agent 规则在 [AGENTS.md](../AGENTS.md) 与 [.agents/rules/](../.agents/rules/)。

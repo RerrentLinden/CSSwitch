@@ -23,15 +23,14 @@ scratchpad/
 .claude/
 .superpowers/
 
-# Trellis:只入库项目规范(.trellis/spec/)。
-# 其余都是本机执行痕迹或 trellis 工具维护的内容:任务与逐日 journal、工作流定义、
-# 配置、版本号与模板哈希、agents/scripts;.agents/skills 同属工具生成物。
-/.trellis/*
-!/.trellis/spec/
-/.agents/skills/
+# 本机 agent 工具目录,整个不入库。
+# .agents/ 里已入库的 rules、context 与 handoffs/README.md 继续跟踪;新增文件要 `git add -f`。
+/.agents/
 /.codex/
 /.kimi-code/
 
-# Agent 临时交接是本地执行残留,只跟踪其策略说明
-.agents/handoffs/*
-!.agents/handoffs/README.md
+# OpenSpec:跟踪配置、规格与编码规范;进行中的变更留在本机
+/openspec/*
+!/openspec/config.yaml
+!/openspec/specs/
+!/openspec/conventions/
