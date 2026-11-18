@@ -1211,11 +1211,14 @@ fn relay_thinking_type(request: &Value) -> &'static str {
     }
 }
 
+/// relay 明细行。字段名与先后是稳定的(有脚本按它解析):新增项插在 `rules=` 之前,
+/// `rules=` 恒为最后一项。`lane=` 是调用类型(见 [`crate::call_kind`]),认不出时为 `-`。
 fn log_relay_metadata(
     metadata: &AnthropicMetadata,
     request: &Value,
     is_stream: bool,
     message_count: usize,
+    call_kind: &crate::call_kind::CallKind,
 ) {
     let rules = if metadata.rule_ids.is_empty() {
         "-".to_string()
@@ -1223,7 +1226,7 @@ fn log_relay_metadata(
         metadata.rule_ids.join(",")
     };
     crate::request_log_line!(
-        "POST /v1/messages relay target={} stream={} msgs={} thinking_type={} budget_tokens={:?} max_tokens={:?} server_tool_types={} dropped_server_tools={} rules={}",
+        "POST /v1/messages relay target={} stream={} msgs={} thinking_type={} budget_tokens={:?} max_tokens={:?} server_tool_types={} dropped_server_tools={} lane={} rules={}",
         metadata.target_model,
         is_stream,
         message_count,
@@ -1234,6 +1237,7 @@ fn log_relay_metadata(
         request.get("max_tokens").and_then(Value::as_u64),
         relay_server_tool_types(request),
         metadata.dropped_server_tools,
+        call_kind.as_str(),
         rules
     );
 }
@@ -1285,6 +1289,8 @@ fn handle_messages(
     if cfg.provider == "relay" || cfg.provider == "deepseek" {
         crate::debug_capture::begin(&target_model);
         crate::debug_capture::json("1-science-request.json", &raw);
+        // 调用类型取自 Science 发来的原样请求:补偿链会改写 tool_choice。
+        let call_kind = crate::call_kind::of_request(&raw);
         let provider_contract_id = cfg
             .provider_contract
             .as_ref()
@@ -1334,7 +1340,13 @@ fn handle_messages(
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or(0);
-        log_relay_metadata(&metadata, &transformed, is_stream, message_count);
+        log_relay_metadata(
+            &metadata,
+            &transformed,
+            is_stream,
+            message_count,
+            &call_kind,
+        );
         crate::debug_capture::json("2-upstream-request.json", &transformed);
         if let Some(prepared) = adapter {
             handle_kimi_web_search_adapter(
@@ -1528,16 +1540,16 @@ pub fn handle_inference(
         .unwrap_or_default();
     let mode = profile.mode_for(instance);
     let path = dequery(target);
+    // 调用类型只读请求体、不改它:官方直通转发的仍是原样的字节。日志开关关着时不读。
+    let call_kind = if method == "POST" && path == "/v1/messages" && crate::request_log_enabled() {
+        crate::call_kind::of_body(&body)
+    } else {
+        crate::call_kind::CallKind::Unknown
+    };
 
     if instance == crate::profile::Instance::Official && *mode == crate::profile::Mode::Official {
-        let outcome = crate::official_passthrough::forward(
-            stream,
-            method,
-            target,
-            &headers,
-            body,
-            crate::official_passthrough::DEFAULT_UPSTREAM,
-        );
+        let outcome =
+            crate::official_passthrough::forward_official(stream, method, target, &headers, body);
         state.record_request(crate::control::log_entry(
             "inference",
             json!({
@@ -1545,6 +1557,7 @@ pub fn handle_inference(
                 "mode": "official",
                 "method": method,
                 "path": path,
+                "lane": call_kind.known(),
                 "status": outcome.status,
                 "sse": outcome.sse,
                 "ms": timer.elapsed_ms(),
@@ -1562,6 +1575,7 @@ pub fn handle_inference(
                     "instance": instance.as_str(),
                     "mode": mode.as_str(),
                     "path": path,
+                    "lane": call_kind.known(),
                     "error": error.clone(),
                 }),
             ));
@@ -1602,6 +1616,7 @@ pub fn handle_inference(
             "mode": mode.as_str(),
             "method": method,
             "path": path,
+            "lane": call_kind.known(),
             "ms": timer.elapsed_ms(),
         }),
     ));

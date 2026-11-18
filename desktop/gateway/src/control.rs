@@ -79,6 +79,7 @@ pub fn serve(port_override: Option<u16>) -> Result<(), String> {
         .map_err(|e| format!("无法监听 127.0.0.1:{port}:{e}"))?;
     // 启动横幅同样落进 service.log,与其余日志行统一走带时间戳的格式。
     crate::log_line!("CSSwitch 控制台: http://127.0.0.1:{port}/");
+    crate::official_passthrough::log_upstream_override();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
