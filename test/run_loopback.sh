@@ -44,6 +44,7 @@ cleanup() {
   [ -n "${L_BUSY_JOB:-}" ] && wait "$L_BUSY_JOB" 2>/dev/null
   [ -n "${L_BUSY_NC:-}" ] && kill "$L_BUSY_NC" 2>/dev/null
   [ -n "${L_OLD_NC:-}" ] && kill "$L_OLD_NC" 2>/dev/null
+  [ -n "${UP_NC:-}" ] && kill "$UP_NC" 2>/dev/null
   if [ -n "${L_PORT:-}" ]; then
     stop_launched "$L_PORT" "$L_LOG"
     # 另外几个场景本不该留下服务;万一留下了(被测逻辑出错),同样不能漏。
@@ -106,6 +107,12 @@ check() {
   fi
 }
 
+wait_for_listener() {
+  for _ in $(seq 1 25); do
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    sleep 0.2
+  done
+}
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@"; }
 body() { curl -s --max-time 5 "$@"; }
 # post <控制面动作> <JSON 请求体>
@@ -662,6 +669,95 @@ kill "$LEGACY_PID" 2>/dev/null
 wait "$LEGACY_PID" 2>/dev/null
 LEGACY_PID=
 
+# ── 上游错误回给 Science 的样子 ─────────────────────────────────────────────
+# 渠道 Key 被上游拒绝(401):Science 会把推理接口的 401 当成自己的登录失效,所以 relay 路径
+# 改报 403 + 点名渠道的正文。上游的 retry-after 照转,别的上游响应头(会被 Science 当成
+# Claude 订阅的用量暂停 / 额度不足)一个不转。两个渠道都指向本地假上游:每次请求前用 nc
+# 起一个只回一条固定响应的监听。此刻正式实例是 Kimi,沙箱是 DeepSeek。
+UP_PORT=$(( PORT + 5 ))
+post config "{\"channel\":\"kimi\",\"base_url\":\"http://127.0.0.1:$UP_PORT\"}" >/dev/null
+post config "{\"channel\":\"deepseek\",\"base_url\":\"http://127.0.0.1:$UP_PORT\"}" >/dev/null
+# upstream_once <状态行> <额外响应头(每行以 \r\n 结尾)> <正文>
+upstream_once() {
+  printf 'HTTP/1.1 %s\r\ncontent-type: application/json\r\n%bcontent-length: %s\r\nconnection: close\r\n\r\n%s' \
+    "$1" "$2" "${#3}" "$3" | nc -l 127.0.0.1 "$UP_PORT" >/dev/null 2>&1 &
+  UP_NC=$!
+  wait_for_listener "$UP_PORT"
+}
+# relay_call <入口路径> <stream> [tools 的 JSON]:响应头写进 relay.head(去掉 CR),正文写进 relay.body。
+relay_call() {
+  local tools=""
+  [ -n "${3:-}" ] && tools=",\"tools\":$3"
+  curl -s --max-time 10 -D "$SANDBOX/relay.head" -o "$SANDBOX/relay.body" \
+    -X POST "http://127.0.0.1:$PORT$1" -H 'content-type: application/json' \
+    -d "{\"model\":\"claude-sonnet-19\",\"max_tokens\":16,\"stream\":$2,
+         \"messages\":[{\"role\":\"user\",\"content\":\"loopback-request-marker\"}]$tools}"
+  tr -d '\r' <"$SANDBOX/relay.head" >"$SANDBOX/relay.head.lf"
+  mv "$SANDBOX/relay.head.lf" "$SANDBOX/relay.head"
+  # nc 在网关断开后自行退出;没等到就收掉,不留给下一条请求。
+  for _ in $(seq 1 25); do kill -0 "$UP_NC" 2>/dev/null || break; sleep 0.2; done
+  kill "$UP_NC" 2>/dev/null; wait "$UP_NC" 2>/dev/null; UP_NC=
+}
+relay_status() { head -1 "$SANDBOX/relay.head" | cut -d' ' -f2; }
+key_rejected_body() { # key_rejected_body <渠道名>
+  local m="$1 渠道拒绝了 API Key(上游返回 401)。请在 CSSwitch 控制台的「渠道配置」里检查这个渠道的 Key。"
+  printf '{"type":"error","error":{"type":"permission_error","message":"%s"},"message":"%s"}' "$m" "$m"
+}
+REJECT_BODY='{"error":{"message":"invalid api key sk-loopback-secret sk-loopback-ds","echo":"loopback-request-marker"}}'
+
+upstream_once "401 Unauthorized" "" "$REJECT_BODY"
+relay_call /v1/messages false
+check "Kimi 非流式:上游 401 改报 403" 403 "$(relay_status)"
+check "Kimi 非流式:正文点名 Kimi,顶层带 message" "$(key_rejected_body Kimi)" "$(cat "$SANDBOX/relay.body")"
+
+upstream_once "401 Unauthorized" "" "$REJECT_BODY"
+relay_call /v1/messages true
+check "Kimi 流式(开流前被拒):同样是 403" 403 "$(relay_status)"
+has "Kimi 流式:以 JSON 返回,不包成 SSE" "content-type: application/json" "$(cat "$SANDBOX/relay.head")"
+check "Kimi 流式:正文与非流式相同" "$(key_rejected_body Kimi)" "$(cat "$SANDBOX/relay.body")"
+
+# 沙箱入口此刻是 DeepSeek:这一条同时覆盖沙箱入口与 DeepSeek 非流式。
+upstream_once "401 Unauthorized" "" "$REJECT_BODY"
+relay_call /sandbox/v1/messages false
+check "沙箱入口(DeepSeek 非流式):上游 401 改报 403" 403 "$(relay_status)"
+check "沙箱入口:正文点名 DeepSeek" "$(key_rejected_body DeepSeek)" "$(cat "$SANDBOX/relay.body")"
+
+# Science 的主对话是流式且声明了 typed web_search,走 Kimi 搜索桥:流在第一次上游调用前就已
+# 打开(先发保活注释帧),这时只能在 SSE 里以同一份正文报错。api_error 会被 Science 当成
+# 服务端错误反复重试。
+upstream_once "401 Unauthorized" "" "$REJECT_BODY"
+relay_call /v1/messages true '[{"type":"web_search_20250305","name":"web_search"}]'
+check "搜索桥流式:流已打开,状态仍是 200" 200 "$(relay_status)"
+has "搜索桥流式:先发了保活注释帧" ": bridge processing" "$(cat "$SANDBOX/relay.body")"
+has "搜索桥流式:SSE 错误事件用同一份正文" \
+  "event: error
+data: $(key_rejected_body Kimi)" "$(cat "$SANDBOX/relay.body")"
+lacks "搜索桥流式:不出现可重试的 api_error" "api_error" "$(cat "$SANDBOX/relay.body")"
+
+# 日志沿用原格式,状态是改报后的;日志与正文里都没有 Key,也没有请求或上游正文的内容。
+has "日志:非流式记为 status=403 upstream_status=Some(401)" \
+  "upstream_failure operation=post_nonstream status=403 upstream_status=Some(401)" "$(cat "$SANDBOX/out.log")"
+has "日志:开流前失败同样记为 403" \
+  "upstream_failure operation=open_stream status=403 upstream_status=Some(401)" "$(cat "$SANDBOX/out.log")"
+has "日志:搜索桥主阶段同样记为 403" \
+  "upstream_failure operation=kimi_web_search_adapter_main status=403 upstream_status=Some(401)" \
+  "$(cat "$SANDBOX/out.log")"
+for leaked in sk-loopback-secret sk-loopback-ds loopback-request-marker; do
+  lacks "日志里没有 $leaked" "$leaked" "$(cat "$SANDBOX/out.log")"
+done
+
+# 429:状态与正文照旧,retry-after 照转;用量暂停 / 额度不足的那两个头不转。
+upstream_once "429 Too Many Requests" \
+  'retry-after: 17\r\nanthropic-ratelimit-unified-status: rejected\r\nx-should-retry: false\r\nretry-after-ms: 17000\r\nrequest-id: req_loopback\r\n' \
+  '{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+relay_call /v1/messages false
+check "429 仍是 429" 429 "$(relay_status)"
+has "429 带上游的 retry-after" "retry-after: 17" "$(cat "$SANDBOX/relay.head")"
+for header in anthropic-ratelimit x-should-retry retry-after-ms request-id; do
+  lacks "429 不转上游的 $header" "$header" "$(cat "$SANDBOX/relay.head")"
+done
+has "429 的正文照旧带着上游原文" "upstream 429:" "$(cat "$SANDBOX/relay.body")"
+
 # 退出服务必须先停掉两个实例,再退出进程(放在最后:之后服务就不在了)。
 # 官方实例:假脚本报告在跑。沙箱:上面「两个实例各用各的渠道」一节起的那个假进程。
 touch "$FAKE_SCI/running"
@@ -759,12 +855,6 @@ launch() {
     CSSWITCH_APP_HELPER_DIR="$L_HELPERS" CSSWITCH_APP_LAUNCH=1 "$BIN" 2>/dev/null
 }
 launched_pids() { pgrep -f -- "--log-file $1" | tr '\n' ' ' | sed 's/ $//'; }
-wait_for_listener() {
-  for _ in $(seq 1 25); do
-    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 && return 0
-    sleep 0.2
-  done
-}
 
 L_HOME="$SANDBOX/launcher-home"
 L_PORT=$(( PORT + 2 ))
