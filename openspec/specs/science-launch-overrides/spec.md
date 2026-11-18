@@ -4,7 +4,7 @@
 
 CSSwitch 需要在不改写用户 Science 配置的前提下，给 Science 加上少量启动时的设置：联网搜索总开关与第三方模式的默认模型。
 做法是生成一份镜像配置并用 `--config` 传给 daemon。本规格约束镜像的生成、覆盖项的取值、联网搜索总开关的切换顺序与旧配置迁移。
-官方实例与免登录沙箱共用这套机制；改动 `science_config.rs`、`control::launch_overrides` 或 `POST /control/web-search` 时适用。
+官方实例与免登录沙箱共用这套机制；改动 `science_config.rs`、`control::launch_overrides`、`POST /control/web-search` 或 `POST /control/skip-approvals` 时适用。
 
 ## Requirements
 
@@ -164,7 +164,7 @@ MUST NOT 写镜像，MUST NOT 回退成空配置。报错给路径、行列与�
 
 切换总开关（`POST /control/web-search`）的顺序 MUST 固定：
 
-1. 判定：值没变 → 不动；官方实例在运行且有活跃会话且未带 `force` → 拒绝。
+1. 判定：值没变 → 不动；官方实例在运行且有会话正在进行（定义见下一条）且未带 `force` → 拒绝。
 2. 关闭时先试生成镜像。
 3. 存盘并更新运行时快照。
 4. 官方实例在运行就 stop → start。
@@ -177,9 +177,9 @@ MUST NOT 写镜像，MUST NOT 回退成空配置。报错给路径、行列与�
 - **WHEN** 请求的值与当前值相同
 - **THEN** 配置与 Science 都不动
 
-#### Scenario: 有活跃会话且未确认
+#### Scenario: 有会话正在进行且未确认
 
-- **WHEN** 官方实例在运行、有活跃会话且请求未带 `force`
+- **WHEN** 官方实例在运行、有会话正在进行且请求未带 `force`
 - **THEN** 请求被拒绝并报告会话数，配置文件逐字节不变，没有 stop / serve
 
 #### Scenario: 镜像生成失败
@@ -206,6 +206,19 @@ MUST NOT 写镜像，MUST NOT 回退成空配置。报错给路径、行列与�
 
 - **WHEN** 关闭开关后 Science 启动失败
 - **THEN** 原文报出；官方模式下把开关拨回开启再启动，就是不带 `--config` 的原始启动方式
+
+### Requirement: 两个启动开关与切换模式共用一个忙闲定义
+
+联网搜索总开关与跳过审批总开关（`POST /control/web-search`、`POST /control/skip-approvals`，同一套切换流程）判断
+「有会话正在进行」MUST 与切换模式用同一个定义（`control::science_activity`，见
+[official-science-instance](../official-science-instance/spec.md)「切换供应商要重启且先确认」）：官方实例 `status` 输出里
+`daemon.active_conversations` 与 `daemon.active_frames` 任一大于 0。拒绝文案也是同一句，数字取对话数，为 0 时取 frame 数。
+MUST NOT 在某个开关里另写一份只看对话数的判断。
+
+#### Scenario: 只有 frame 在跑时切换开关
+
+- **WHEN** 官方实例在运行，`active_frames > 0` 而 `active_conversations == 0`，切换联网搜索或跳过审批的请求未带 `force`
+- **THEN** 请求被拒绝，文案里的数字是 frame 数，配置文件逐字节不变，没有 stop / serve
 
 ### Requirement: 回到无覆盖状态时清理残留镜像
 

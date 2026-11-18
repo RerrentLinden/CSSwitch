@@ -4,7 +4,7 @@
 
 CSSwitch 是一个本地 Rust 服务进程，把用户自己的 Claude Science 实例的推理流量转到官方 Anthropic、Kimi 或 DeepSeek，并在必要处做窄补偿。
 本规格约束这个进程对外的路由表、三种模式各自怎么转发、两个实例怎么各走各的、CONNECT 隧道，以及上游失败与凭证的处理。
-改动 `control.rs` 的路由、`server.rs` 的模式分支、`connect.rs` 或 `messages.rs` 的错误处理时适用。
+改动 `control.rs` 的路由、`server.rs` 的模式分支与上游失败的回复、`connect.rs` 或 `messages.rs` 的错误处理时适用。
 总览见 [docs/ARCHITECTURE.md](../../../docs/ARCHITECTURE.md)。
 
 ## Requirements
@@ -115,11 +115,66 @@ Science 经 base_url 只调 `/v1/messages` 与 `/v1/models` 两个端点（2026-
 ### Requirement: 上游错误如实返回
 
 上游错误 MUST 保留 status，向客户端返回可诊断的错误体；MUST NOT 伪造成功。补偿补不了时 MUST 把上游错误原样交回。
+唯一的例外是第三方渠道上游回的 401，见下一条「relay 把上游 401 改报 403」。
 
 #### Scenario: 上游返回 4xx 或 5xx
 
-- **WHEN** 上游返回错误状态
-- **THEN** 客户端收到同样的 status 与可诊断的错误体
+- **WHEN** 上游返回 401 以外的错误状态
+- **THEN** 客户端收到同样的 status 与可诊断的错误体（第三方渠道上是 `api_error` 加上游原文）
+
+### Requirement: relay 把上游 401 改报 403
+
+第三方渠道（Kimi / DeepSeek，relay 路径）的上游回 401，说明的是渠道 Key 被拒，与 Claude 登录无关；
+而 Science 把推理接口的 401 一律当成自己的登录失效。网关 MUST 改报 403，正文 MUST 是下面的形状：
+
+```json
+{"type":"error","error":{"type":"permission_error","message":"<说明>"},"message":"<说明>"}
+```
+
+`<说明>` 是「`<渠道>` 渠道拒绝了 API Key(上游返回 401)。请在 CSSwitch 控制台的「渠道配置」里检查这个渠道的 Key。」，
+`<渠道>` 与控制台的模式名一致（`Kimi` / `DeepSeek`）。顶层的 `message` 是同一句的副本，供 Science 直接显示。
+正文 MUST NOT 带 `error.details`，MUST NOT 带出上游正文或 Key。
+
+#### Scenario: Kimi 或 DeepSeek 的上游拒绝 Key
+
+- **WHEN** 第三方渠道的上游对非流式推理请求回 401
+- **THEN** Science 收到 403，`error.type` 是 `permission_error`，说明里点名该渠道，顶层带同一句 `message`
+- **AND** 正文里没有 `error.details`、上游正文与 Key
+
+### Requirement: 401 改报只在 relay 路径、开流前以 HTTP 返回
+
+非流式请求，以及流式请求在开流之前就失败时，改报 MUST 以 HTTP 403 + `application/json` 正文返回，流式也不包成 SSE。
+Kimi 搜索桥在流已打开之后的失败见 [kimi-web-search-bridge](../kimi-web-search-bridge/spec.md)「流已打开后的上游失败以 SSE 收尾」。
+官方直通 MUST NOT 做这项改报：那条路上的 401 确实是 Claude 登录问题。
+
+#### Scenario: 流式请求在开流前被拒
+
+- **WHEN** 第三方渠道的流式请求在上游开流之前收到 401
+- **THEN** Science 收到 HTTP 403 与 `application/json` 正文，正文与非流式相同
+
+#### Scenario: 官方模式下上游回 401
+
+- **WHEN** 正式实例处于官方模式，上游回 401
+- **THEN** 状态与正文逐字节原样到达 Science
+
+### Requirement: relay 错误响应只转发 retry-after
+
+relay 路径上，上游错误响应带 `retry-after` 且取值合规时，网关 MUST 把它原样带给 Science（401 改报成 403 时同样带）。
+合规指：1–5 位十进制数字（秒，含 `0`），或 IMF-fixdate 写法的 HTTP 日期（如 `Wed, 21 Oct 2026 07:28:00 GMT`）。
+取值不合规时——包括 HTTP 日期的两种旧写法、超过 5 位的数字、小数、带 CR / LF 的值——MUST NOT 带，状态与正文不变。
+
+其它上游响应头 MUST NOT 转发，尤其是 `anthropic-ratelimit-*` 与 `x-should-retry`：Science 会把它们当成 Claude 订阅的用量暂停或额度不足。
+
+#### Scenario: 429 同时带着会被误读的响应头
+
+- **WHEN** 上游回 429，带 `retry-after: 17`、`anthropic-ratelimit-unified-status`、`x-should-retry`、`retry-after-ms` 与 `request-id`
+- **THEN** Science 收到 429，响应头里只多了 `retry-after: 17`，其余几个一个不带
+- **AND** 正文照旧是 `api_error` 加上游原文
+
+#### Scenario: retry-after 取值不合规
+
+- **WHEN** 上游的 `retry-after` 既不是 1–5 位数字也不是 IMF-fixdate（例如 `1.5`、`123456`、带换行的值）
+- **THEN** 回给 Science 的响应没有 `retry-after`，状态与正文与不带这个头时相同
 
 ### Requirement: 上游错误正文的调试输出
 

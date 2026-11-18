@@ -142,6 +142,30 @@ API Key 输入框可以填，但服务端返回的状态里只有 `has_api_key: 
 - **WHEN** 查看「免登录沙箱」卡片
 - **THEN** 只有 Kimi 与 DeepSeek 两张渠道卡片，没有置灰的官方卡片
 
+### Requirement: 提示 Science 不是经 CSSwitch 启动的
+
+状态里有 `science.unmanaged` 且 Science 在运行时，「当前连接」卡片 MUST 在按钮行下面显示这一行（原文）：
+
+> Science 不是经 CSSwitch 启动的,当前选择没有生效。先「停止」再「启动 Science」。
+
+是不是经 CSSwitch 启动的由服务端判定（[official-science-instance](../official-science-instance/spec.md)「识别不是经 CSSwitch 启动的 daemon」），
+页面 MUST NOT 自己推导，只负责显示。它随周期轮询更新，不显示原因代码。
+
+#### Scenario: 状态里带 unmanaged
+
+- **WHEN** 轮询读到 Science 在运行且带 `science.unmanaged`
+- **THEN** 「当前连接」卡片出现上面那一行
+
+#### Scenario: 恢复成经 CSSwitch 启动
+
+- **WHEN** 用户先「停止」再「启动 Science」，下一次轮询不再带 `science.unmanaged`
+- **THEN** 那一行随之隐藏
+
+#### Scenario: Science 未运行
+
+- **WHEN** Science 未运行
+- **THEN** 不显示那一行
+
 ### Requirement: 带重启的请求在途时禁用控件
 
 带重启的请求在途时，MUST 禁用触发它的控件。切换运行中沙箱的渠道要停、起一次沙箱，好几秒：在途时两张沙箱渠道卡片禁用，
@@ -243,6 +267,28 @@ API Key 输入框可以填，但服务端返回的状态里只有 `has_api_key: 
 - **WHEN** 正式入口与沙箱入口各发过请求
 - **THEN** 日志表格分别显示「正式 · <渠道>」与「沙箱 · <渠道>」
 
+### Requirement: 请求日志标出调用类型
+
+请求日志的「实例 · 渠道」后面 MUST 用一个小标签显示条目的 `detail.lane`（取值见 [request-log](../request-log/spec.md)「明细标出调用类型」）：
+`main` →「主对话」，`sub` →「子任务」，`keepalive` →「后台·保活」，`fork` →「后台·分支」；已收录的代号显示中文名
+（如 `ttl` →「后台·标题」、`sniff` →「后台·结束判断」）；没收录、但符合代号写法（至多 6 位小写字母数字）的显示「后台·<代号>」。
+`lane` 为 `null`、不是字符串或不合代号写法时 MUST NOT 显示标签——标签直接拼进表格的 HTML，不合写法的值一律不渲染。
+
+#### Scenario: 一条消息带出的几次请求
+
+- **WHEN** 日志里有标题调用、主对话与结束判断三类条目
+- **THEN** 它们分别带「后台·标题」「主对话」「后台·结束判断」标签
+
+#### Scenario: 没收录的代号
+
+- **WHEN** 条目的 `lane` 是一个没收录、但符合写法的代号 `xyz`
+- **THEN** 标签是「后台·xyz」
+
+#### Scenario: 认不出的请求
+
+- **WHEN** 条目的 `lane` 是 `null`
+- **THEN** 「实例 · 渠道」后面没有标签
+
 ### Requirement: 渠道配置表单的槽位
 
 渠道配置 MUST 渲染 base_url、API Key 与四个模型槽，每槽只有模型 ID 与显示名称两个输入框；默认槽必填，其余留空继承默认。
@@ -257,3 +303,19 @@ API Key 输入框可以填，但服务端返回的状态里只有 `has_api_key: 
 
 - **WHEN** 用户点「获取可用模型」
 - **THEN** 清单直接从上游拉取并展示
+
+### Requirement: 窄窗口按组换行
+
+「当前连接」卡片的状态行 MUST 分组：两个状态标签一组，「启动 Science」「停止」「打开 Science」一组；放不下时整组换行，
+组内再放不下才各自换行。「退出服务」不在组内，单独靠右。「免登录沙箱」卡片的三个按钮同样成一组。
+窗口窄于 600 px 时，两组模式卡片 MUST 改为单列。360 px 起页面 MUST NOT 出现横向滚动，元素 MUST NOT 越出卡片。
+
+#### Scenario: 约 600 px 宽的窗口
+
+- **WHEN** 窗口约 600 px 宽
+- **THEN** 三个操作按钮在同一行，「退出服务」靠右
+
+#### Scenario: 窄于 600 px
+
+- **WHEN** 窗口窄于 600 px（例如 480 或 360 px）
+- **THEN** 模式卡片单列排列，页面没有横向滚动

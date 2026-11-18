@@ -8,6 +8,9 @@ kimi_web_search_adapter::resolve_with(main, prepared, first, upstream_call)
 kimi_web_search_adapter::render_stream(&Value) -> Result<Vec<u8>, String>
 messages::inference_deadline(&GatewayConfig) -> Instant
 messages::post_nonstream_before(..., deadline)
+server::adapter_upstream_failure(stream, cfg, head_written, operation, &UpstreamError)
+  # 各阶段的上游失败:回复取自 relay_failure_reply(见 gateway-routing);
+  # head_written → sse_error_event(&reply.body) 收尾,否则以 HTTP 状态 + retry-after 返回
 RULE_PROVIDER_KIMI_WEB_SEARCH_QUERY_TOOL_ADAPTER =
   "provider.kimi.web-search.query-tool-adapter"
 ```
@@ -48,6 +51,11 @@ Science 持久层的选收依据未知。诊断靠 adapter 日志的 `merged_sha
   确实会带着搜索声明出去（否则关闭态的断言不说明问题）。另需：链首摘除后 tail-reorder 不触发、
   无声明轮次逐字段原样；loopback 层在真实进程里断言关闭态日志含规则 id、不含 adapter，
   重新开启后同一请求不经重启即重新走桥。
+- 阶段失败的回复：`server::tests::bridge_stage_401_is_reported_like_any_other_relay_401`——非流式下主调用成功、
+  nested 回 401 → 403 + 点名 Kimi 的正文，响应头只带 `retry-after: 30`；流式下以同一份正文的 `event: error` 收尾，
+  流里没有 `api_error` 与 Key。loopback「上游错误回给 Science 的样子」在真实进程里断言搜索桥流式：状态 200、
+  先有 `: bridge processing`、SSE 错误事件用同一份正文、没有 `api_error`，日志记
+  `upstream_failure operation=kimi_web_search_adapter_main status=403 upstream_status=Some(401)`。
 
 ## Wrong vs Correct
 
@@ -63,6 +71,19 @@ Science 每轮声明 web_search → 每轮直接强制搜索 → 非搜索轮多
 主模型通过私有 query tool 决定是否搜索 → nested 只执行真实 server search
 → 有正文直接返回；无正文才用 exact tool_result synthesis → Science 单一生命周期
 ```
+
+## 流已打开后的上游失败（2026-11-18）
+
+Science 的主对话是流式的，开着联网搜索时每一轮都声明 typed search，于是 Kimi 渠道上的主对话走的就是这座桥；
+而桥的流式路径为了保活，在第一次上游调用之前就写出了 200 头和注释帧。此前桥里各阶段的失败一律以
+`api_error` 的 SSE 错误事件收尾，渠道 Key 被拒时 Science 把它当成可重试的服务端错误：
+真机上显示 `Claude is temporarily unavailable — retrying in Ns`，3 分钟内重试 9 次仍在继续。
+现在各阶段的失败与非桥路径共用 `relay_failure_reply`，401 以同一份 `permission_error` 正文收尾，
+同一场景下只失败一次并显示点名 Kimi 的说明（2026-11-18 真机，真实 Science 0.1.72 + 假上游，
+隔离免登录沙箱；记录在 [test/LIVE_ACCEPTANCE.md](../../../test/LIVE_ACCEPTANCE.md) §J）。
+Science 对 SSE `api_error` 与 403 的处理来自对 0.1.72 的静态分析，见 [gateway-routing](../gateway-routing/design.md)。
+
+流式下改不了响应头，所以这条路径上的 429 带不了 `retry-after`，Science 仍按自己的节奏重试；这一点没有在真机上单独看过。
 
 ## 历史：从 429 到统一 bridge
 

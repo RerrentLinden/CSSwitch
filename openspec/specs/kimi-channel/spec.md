@@ -7,6 +7,9 @@ Kimi 渠道把 Claude Science 的推理流量转到 Kimi 的 Anthropic 兼容端
 联网搜索相关的三块另有规格：[kimi-web-search-bridge](../kimi-web-search-bridge/spec.md)、
 [kimi-search-pair-adoption](../kimi-search-pair-adoption/spec.md)、[kimi-context-tail-reorder](../kimi-context-tail-reorder/spec.md)。
 补偿的通用规则见 [provider-compensation](../provider-compensation/spec.md)。
+Key 被上游拒绝（401）与上游限流时回给 Science 的样子，见 [gateway-routing](../gateway-routing/spec.md)
+「relay 把上游 401 改报 403」「relay 错误响应只转发 retry-after」；搜索桥的流已打开时见
+[kimi-web-search-bridge](../kimi-web-search-bridge/spec.md)「流已打开后的上游失败以 SSE 收尾」。
 
 ## Requirements
 
