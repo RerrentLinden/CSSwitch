@@ -227,7 +227,12 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
 
 fn status_payload(state: &Arc<AppState>) -> Value {
     let profile = state.snapshot();
-    let science = crate::science::status();
+    let mut science = crate::science::status();
+    // 正在跑的 Science 不是经 CSSwitch 启动的:它的流量不经过网关,控制台据此提示先停再启动。
+    // 没命中时不出现。键名不叫 `mode`,理由见下面的 `sandbox_mode`。
+    if let Some(reason) = crate::science::unmanaged_reason(&science) {
+        science["unmanaged"] = json!({"reason": reason});
+    }
     json!({
         // 正在运行的这个服务进程的版本。安装版的启动器拿它与自己比对:
         // 换了新版应用而后台还是旧服务时,要提示而不是让人以为已经升级。

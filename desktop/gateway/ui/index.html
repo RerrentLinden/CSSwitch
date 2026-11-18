@@ -129,6 +129,7 @@
       <button class="act" id="btn-open">打开 Science</button>
       <button class="act" id="btn-quit" style="margin-left:auto">退出服务</button>
     </div>
+    <div class="msg err" id="sci-unmanaged">Science 不是经 CSSwitch 启动的,当前选择没有生效。先「停止」再「启动 Science」。</div>
     <div class="field" style="margin:16px 0 0">
       <label class="check">
         <input type="checkbox" id="web-search">
@@ -306,6 +307,8 @@ function renderScience() {
     : (running ? 'Science 运行中' : 'Science 未运行');
   $('base-url').textContent = state.base_url;
   $('btn-open').disabled = !running;
+  // 是不是经 CSSwitch 启动的由服务端从 status 推导(science.unmanaged),这里只负责显示。
+  $('sci-unmanaged').classList.toggle('show', running && !!science.unmanaged);
 }
 
 function renderSandbox() {

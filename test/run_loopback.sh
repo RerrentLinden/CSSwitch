@@ -354,6 +354,24 @@ else
   echo "  ok   开启态不生成镜像"
 fi
 
+# ── 正在跑的 Science 是不是经 CSSwitch 启动的 ───────────────────────────────
+# 只从 status 的输出推导:端口不是 8686(手动 serve 落在 Science 默认的 8000),或
+# launch_context 是 app-child(桌面 App 拉起的,两者都成立取 app)。这样的 daemon 流量不经过网关。
+control_status() { body "http://127.0.0.1:$PORT/control/status"; }
+lacks "经 CSSwitch 启动的 Science 不带归属结果" '"unmanaged"' "$(control_status)"
+echo 8000 >"$FAKE_SCI/port"
+foreign="$(control_status)"
+has "端口不是 8686:标为不是经 CSSwitch 启动(port)" '"unmanaged":{"reason":"port"}' "$foreign"
+# 新键不得叫 mode:取顶层模式的脚本是贪婪匹配。
+check "带归属结果时状态里仍只有一个 mode 键" 1 \
+  "$(printf '%s' "$foreign" | grep -o '"mode":' | wc -l | tr -d ' ')"
+echo app-child >"$FAKE_SCI/launch-context"
+has "端口不符且是桌面 App 拉起的:取 app" '"unmanaged":{"reason":"app"}' "$(control_status)"
+rm -f "$FAKE_SCI/port"
+has "桌面 App 拉起的(端口对得上):标为 app" '"unmanaged":{"reason":"app"}' "$(control_status)"
+rm -f "$FAKE_SCI/launch-context"
+lacks "恢复成经 CSSwitch 启动的样子后不再带归属结果" '"unmanaged"' "$(control_status)"
+
 # ── 只有 frame 在跑也算有会话正在进行 ───────────────────────────────────────
 # active_frames > 0 而 active_conversations == 0:切换模式被拒(数字取 frame 数),任何状态不变;
 # 带确认后放行。之后切回官方模式,下面各节仍从「官方模式、Science 在跑、没有镜像」出发。

@@ -137,6 +137,35 @@ pub fn status() -> Value {
     })
 }
 
+/// 正在运行的官方 daemon 不是经 CSSwitch 启动时,给出原因;是、或判断不了时为 `None`。
+/// 输入是 [`status`] 的结果,只从它已有的输出推导:不另读文件、不另起进程。
+///
+/// - `"app"`:桌面 App 拉起的(`daemon.launch_context == "app-child"`);
+/// - `"port"`:不在 [`OFFICIAL_PORT`] 上(多半是手动 `claude-science serve`,落在 8000)。
+///
+/// 两者都成立取 `"app"`。这样的 daemon 环境里没有网关地址,流量不经过 CSSwitch;它自己重启
+/// (看门狗、自动更新)也沿用原来的环境与参数,只能先停掉再经 CSSwitch 启动。
+/// 字段缺失时不判:宁可漏报,也不把经 CSSwitch 启动的误报成别人的。
+pub fn unmanaged_reason(status: &Value) -> Option<&'static str> {
+    if !status
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let detail = status.get("detail")?;
+    if detail
+        .pointer("/daemon/launch_context")
+        .and_then(Value::as_str)
+        == Some("app-child")
+    {
+        return Some("app");
+    }
+    let port = detail.get("port").and_then(Value::as_u64)?;
+    (port != u64::from(OFFICIAL_PORT)).then_some("port")
+}
+
 pub fn stop() -> Result<(), String> {
     let bin = find_binary()?;
     let output = run(&bin, &["stop"], &[])?;
@@ -326,6 +355,65 @@ mod tests {
         );
         assert!(!mirror.exists(), "切回官方模式后不留镜像");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_daemon_not_launched_by_csswitch_is_told_apart_from_status_alone() {
+        let status = |running: bool, detail: Value| json!({"installed": true, "running": running, "detail": detail});
+        let reason = |detail: Value| unmanaged_reason(&status(true, detail));
+
+        // 经 CSSwitch 启动:安装版实测是 launchd,从终端跑 ./csswitch 是 terminal。不得误报。
+        for context in ["launchd", "terminal", "unknown"] {
+            assert_eq!(
+                reason(json!({"port": OFFICIAL_PORT, "daemon": {"launch_context": context}})),
+                None,
+                "{context}"
+            );
+        }
+        // 手动 serve:落在 Science 默认的 8000。
+        assert_eq!(
+            reason(json!({"port": 8000, "daemon": {"launch_context": "terminal"}})),
+            Some("port")
+        );
+        // 桌面 App 拉起的:端口对上了也算(它的环境里没有网关地址);端口缺失也不妨碍。
+        assert_eq!(
+            reason(json!({"port": OFFICIAL_PORT, "daemon": {"launch_context": "app-child"}})),
+            Some("app")
+        );
+        assert_eq!(
+            reason(json!({"daemon": {"launch_context": "app-child"}})),
+            Some("app")
+        );
+        // 两者都成立:取 app。
+        assert_eq!(
+            reason(json!({"port": 8000, "daemon": {"launch_context": "app-child"}})),
+            Some("app")
+        );
+        // 字段缺失:不判。
+        for detail in [
+            json!({"daemon": {"launch_context": "launchd"}}),
+            json!({"running": true}),
+            json!({"port": "8000"}),
+            Value::Null,
+        ] {
+            assert_eq!(reason(detail.clone()), None, "{detail}");
+        }
+        assert_eq!(
+            unmanaged_reason(&json!({"installed": true, "running": true})),
+            None
+        );
+        // 没在运行:不判,哪怕输出里带着这些字段。
+        assert_eq!(
+            unmanaged_reason(&status(
+                false,
+                json!({"port": 8000, "daemon": {"launch_context": "app-child"}})
+            )),
+            None
+        );
+        assert_eq!(
+            unmanaged_reason(&json!({"installed": false, "running": false})),
+            None
+        );
     }
 
     #[test]
