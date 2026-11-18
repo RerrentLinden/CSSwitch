@@ -1540,7 +1540,8 @@ pub fn handle_inference(
         .unwrap_or_default();
     let mode = profile.mode_for(instance);
     let path = dequery(target);
-    // 调用类型只读请求体、不改它:官方直通转发的仍是原样的字节。日志开关关着时不读。
+    // 调用类型只借用请求体读三个字段(`&[u8]`),官方直通转发的仍是这同一块原样的缓冲区。
+    // 日志开关关着时不读。
     let call_kind = if method == "POST" && path == "/v1/messages" && crate::request_log_enabled() {
         crate::call_kind::of_body(&body)
     } else {
@@ -1548,8 +1549,14 @@ pub fn handle_inference(
     };
 
     if instance == crate::profile::Instance::Official && *mode == crate::profile::Mode::Official {
-        let outcome =
-            crate::official_passthrough::forward_official(stream, method, target, &headers, body);
+        let outcome = crate::official_passthrough::forward(
+            stream,
+            method,
+            target,
+            &headers,
+            body,
+            crate::official_passthrough::DEFAULT_UPSTREAM,
+        );
         state.record_request(crate::control::log_entry(
             "inference",
             json!({

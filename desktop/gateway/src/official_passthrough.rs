@@ -122,69 +122,6 @@ pub struct ForwardOutcome {
     pub response_bytes: u64,
 }
 
-/// 只为离线验证留的口子:把单进程服务的官方直通指到本机的假上游(loopback 层用它核对转发出去的
-/// 字节)。官方直通带着用户真实的登录,所以只接受 `http://127.0.0.1:<端口>`;别的值让官方直通
-/// 拒绝转发(502),不回退到官方 —— 本想离线跑的验证不能因为写错一个字就连到真实服务上。
-/// 生效与否在服务启动时写进日志([`log_upstream_override`])。
-pub const UPSTREAM_OVERRIDE_ENV: &str = "CSSWITCH_OFFICIAL_UPSTREAM";
-
-/// 单进程服务的官方直通上游。环境变量在进程内只解析一次。
-fn serve_upstream() -> Result<&'static str, &'static str> {
-    static UPSTREAM: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-    UPSTREAM
-        .get_or_init(|| resolve_upstream(std::env::var_os(UPSTREAM_OVERRIDE_ENV).as_deref()))
-        .as_ref()
-        .map(String::as_str)
-        .map_err(String::as_str)
-}
-
-fn resolve_upstream(raw: Option<&std::ffi::OsStr>) -> Result<String, String> {
-    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
-        return Ok(DEFAULT_UPSTREAM.to_string());
-    };
-    raw.to_str()
-        .and_then(|value| value.strip_prefix("http://127.0.0.1:"))
-        .and_then(|port| port.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .map(|port| format!("http://127.0.0.1:{port}"))
-        .ok_or_else(|| {
-            format!("{UPSTREAM_OVERRIDE_ENV} 只接受 http://127.0.0.1:<端口>,官方直通拒绝转发")
-        })
-}
-
-/// 服务启动时调用一次:官方直通被改道、或改道配置无效,都要在日志里看得见。
-pub fn log_upstream_override() {
-    match serve_upstream() {
-        Ok(DEFAULT_UPSTREAM) => {}
-        Ok(upstream) => {
-            crate::log_line!("官方直通改道到 {upstream}({UPSTREAM_OVERRIDE_ENV},仅供离线验证)")
-        }
-        Err(error) => crate::log_line!("警告:{error}"),
-    }
-}
-
-/// 单进程服务的官方模式转发:上游是 [`DEFAULT_UPSTREAM`](离线验证时见
-/// [`UPSTREAM_OVERRIDE_ENV`])。
-pub fn forward_official(
-    stream: &mut TcpStream,
-    method: &str,
-    target: &str,
-    headers: &[(String, String)],
-    body: Vec<u8>,
-) -> ForwardOutcome {
-    match serve_upstream() {
-        Ok(upstream) => forward(stream, method, target, headers, body, upstream),
-        Err(error) => {
-            write_plain(stream, 502, "Bad Gateway", &format!("passthrough: {error}"));
-            ForwardOutcome {
-                status: 502,
-                sse: false,
-                response_bytes: 0,
-            }
-        }
-    }
-}
-
 /// 单进程服务的官方模式转发:请求已被上层读取,这里只做上游往返。
 /// 与诊断模式共用同一套 header 剥离与流式转发规则。
 pub fn forward(
@@ -782,29 +719,5 @@ mod tests {
         .unwrap();
         assert_eq!(opts.port, 8791);
         assert_eq!(opts.upstream, DEFAULT_UPSTREAM);
-    }
-
-    /// 改道带着用户真实的登录:只能到本机回环,写错了就拒绝转发,不回退到官方。
-    #[test]
-    fn upstream_override_only_redirects_to_loopback_and_fails_closed() {
-        use std::ffi::OsStr;
-        let resolve = |raw: &str| resolve_upstream(Some(OsStr::new(raw)));
-        assert_eq!(resolve_upstream(None).unwrap(), DEFAULT_UPSTREAM);
-        assert_eq!(resolve("").unwrap(), DEFAULT_UPSTREAM);
-        assert_eq!(
-            resolve("http://127.0.0.1:18999").unwrap(),
-            "http://127.0.0.1:18999"
-        );
-        for bad in [
-            "https://api.example.invalid",
-            "http://127.0.0.1.example.invalid:80",
-            "http://127.0.0.1:80@example.invalid",
-            "http://localhost:18999",
-            "http://127.0.0.1:18999/v1",
-            "http://127.0.0.1:0",
-            "http://127.0.0.1:",
-        ] {
-            assert!(resolve(bad).is_err(), "{bad} 不该被接受");
-        }
     }
 }
