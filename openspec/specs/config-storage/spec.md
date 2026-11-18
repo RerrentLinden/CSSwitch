@@ -42,3 +42,29 @@ CSSwitch 的服务配置落在 `~/.csswitch/` 下，这个目录同时被旧桌�
 
 - **WHEN** 配置被写入
 - **THEN** `service.v1.json` 的权限是 `0600`
+
+### Requirement: 配置文件的内容
+
+`~/.csswitch/service.v1.json` MUST 保存：`mode`（正式实例的模式）、`sandbox_mode`（免登录沙箱的渠道，`kimi` | `deepseek`）、端口、
+两个渠道的 base_url / key / 四槽（两个实例共用）、`request_log`（请求日志开关）、`web_search`（联网搜索总开关）、
+`skip_approvals`（跳过审批总开关）。`skip_approvals` 关着时 MUST NOT 写进文件。
+
+#### Scenario: 跳过审批关着时保存
+
+- **WHEN** 「跳过审批」总开关关着时保存配置
+- **THEN** 文件里没有 `skip_approvals` 键
+
+#### Scenario: 两个实例共用渠道配置
+
+- **WHEN** 正式实例与沙箱选了同一个渠道
+- **THEN** 它们用的是同一份 base_url、key 与四槽
+
+### Requirement: 目录下的其它文件
+
+`~/.csswitch/science-config/`（`0700`，文件 `0600`）MUST 只放交给 Science 的镜像配置，每次启动重写。
+`~/.csswitch/service.log` 与 `service.log.1`（`0600`）是安装版的服务日志；从源码运行时 MUST NOT 产生。
+
+#### Scenario: 从源码运行
+
+- **WHEN** 用 `./csswitch` 运行服务
+- **THEN** `~/.csswitch/` 下不产生 `service.log`

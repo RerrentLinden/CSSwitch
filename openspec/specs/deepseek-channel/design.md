@@ -1,20 +1,4 @@
-# DeepSeek 渠道
-
-端点:`https://api.deepseek.com/anthropic`(官方 Anthropic 兼容端点)。
-走与 Kimi 相同的契约驱动中继路径,差异全在 `RelayFlavor::DeepSeek` 上。
-
-## 契约
-
-| 项 | 值 |
-| --- | --- |
-| contract id | `deepseek-native` |
-| adapter / transport | `deepseek` / `anthropic_messages` |
-| 鉴权 | `x-api-key` |
-| 端点拼接 | `anthropic_v1`(base + `/v1/messages`) |
-| thinking policy | `deepseek_native` |
-
-默认模型预设:`deepseek-v4-pro`(默认 / 高质量 / Fable)、`deepseek-v4-flash`(快速)。
-四个槽都可在 WebUI 里改。
+# deepseek-channel 设计注记
 
 ## 六条补偿
 

@@ -38,7 +38,7 @@
 
 - 两个渠道共用 provider contract `kimi-anthropic-relay` 与同一套补偿；差异只有默认地址与模型预设。**实测证据全部来自 `api.kimi.com/coding`，开放平台按用户判定沿用、未独立实测。**
 - 开放平台原有的一批只服务它的处理已全部移除（`?beta=true`、强制 `anthropic-beta`、伪装 `claude-cli/*` UA、强制 `x-app: cli`、失败历史尾巴清理、thinking 强制 `enabled` 与思考续写存储）。**若开放平台实际依赖这些标识放行，表现将是请求被拒或能力降级**；恢复实现见 git 历史。
-- **web_search 已恢复统一 query-tool bridge**：2026-08-20 review 证明 K3、K3-256k、K2.7 的原生 inline planner/answer 行为不一致。Science 主请求把 typed search 映射为私有 query tool；需要搜索才发 forced nested server search，必要时有界 synthesis。旧 920 行实现未机械恢复；当前桥复用 transport/SSE/filter，保留原生路径作为 nested executor。逐条合同与真机证据见[渠道文档](../../docs/features/kimi-channels.md)。
+- **web_search 已恢复统一 query-tool bridge**：2026-08-20 review 证明 K3、K3-256k、K2.7 的原生 inline planner/answer 行为不一致。Science 主请求把 typed search 映射为私有 query tool；需要搜索才发 forced nested server search，必要时有界 synthesis。旧 920 行实现未机械恢复；当前桥复用 transport/SSE/filter，保留原生路径作为 nested executor。逐条合同见 [kimi-web-search-bridge 规格](../../openspec/specs/kimi-web-search-bridge/spec.md),真机证据见其[设计注记](../../openspec/specs/kimi-web-search-bridge/design.md)。
 - 当前已知边界：
   - 上游搜索轮**每轮**注入 `Search results for query:` 噪声头，不搜索的轮次**常发**无 id 幻影空搜索对——两条剥离规则是常态命中而非偶发补丁，日志 `noise=/pair=` 可见。
   - Science 会把 `compute snapshot` 机器上下文作为独立 user message 追加在真实问题之后；Kimi 主 query planner 会误取最后一条为主题。仅在 typed web_search 与精确硬件签名同时出现时交换尾部两条 text-only user message。

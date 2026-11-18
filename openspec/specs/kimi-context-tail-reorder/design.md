@@ -34,3 +34,18 @@ RULE_PROVIDER_KIMI_SCIENCE_CONTEXT_TAIL_REORDER =
 ```text
 direct A/B 证明尾部消息顺序敏感 → 仅在精确 Science 签名下交换完整消息 → 上游首次生成正确 query
 ```
+
+## 成因与真机证据（原 §3e）
+
+真实 Science 会把用户问题与本机 `compute snapshot` 放成末尾相邻的两条 user message,
+机器上下文在后。direct K3 A/B 保持正文不变只交换两条顺序时,原顺序让主 query planner 选择机器规格,
+反向顺序稳定选择用户的 Rust 主题,因此问题位于 Kimi 主 query planner 对消息顺序的解释。
+
+规则 `provider.kimi.science-context-tail-reorder` 只在 Kimi 请求声明 typed web_search、
+末尾两条都是 user、两条均为 text-only,且最后一条大小写无关命中
+`compute snapshot`、独立词 `cores` 与独立词 `RAM` 或带数字的 GiB 容量规格时,
+交换两条完整消息。它不删除或重建正文,也不改写 query；普通连续 user、历史工具结果、
+client tool 与兄弟 provider 均保持原样。真机候选在同一 K3 会话完成 Rust 搜索、
+历史复述、Python 搜索、跨搜索不联网比较与两轮连续计算；两张 query/card 和最终结果
+整页重载后均保留。该重排现在发生在 typed search 映射为私有 query tool 之前；bridge 搜索轮
+与响应整形正常叠加。

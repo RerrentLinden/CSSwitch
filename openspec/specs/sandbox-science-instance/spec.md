@@ -305,6 +305,16 @@ token、key、钥匙串密码 MUST NOT 进日志或控制面响应；`security` 
 沙箱只要在运行，切换就 MUST 先确认（未带 `force` → 拒绝）：路由按 `sandbox_mode` 每请求生效，只存不重启会让运行中的沙箱立刻被改道，
 而它手里还是旧渠道的模型目录。沙箱没有可靠的会话数（`status --data-dir` 的输出形状没有实测记录），所以不区分有没有会话。
 
+#### Scenario: 目标与当前相同
+
+- **WHEN** 请求的渠道就是当前的 `sandbox_mode`
+- **THEN** 不存盘、不重启
+
+#### Scenario: 切换完成之后
+
+- **WHEN** 沙箱渠道切换成功
+- **THEN** 不自动打开新标签页
+
 #### Scenario: 切成官方
 
 - **WHEN** 请求把沙箱渠道切成 `official`

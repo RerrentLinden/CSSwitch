@@ -210,6 +210,16 @@ MUST NOT 在链尾的 server tool policy 里摘：[kimi-context-tail-reorder](..
 - **WHEN** 总开关关闭，请求没有搜索声明
 - **THEN** 请求零改写
 
+### Requirement: 联网搜索只有走桥与关闭两档
+
+开关 MUST 只有「走桥」与「关闭」两档，MUST NOT 提供原生直通：Kimi 不把 typed web_search 作为可调用函数交给模型，
+而是在每次请求开头由服务端预搜索规划器决定搜不搜（2026-09-16 真机取证，见 [design.md](./design.md)）。
+
+#### Scenario: 开关开启
+
+- **WHEN** 总开关开启，Kimi 请求带 typed search 声明
+- **THEN** 声明被换成私有查询工具走桥，不原样发给上游
+
 ### Requirement: 联网搜索总开关不分渠道
 
 开关是全局的（`GatewayConfig.web_search` 取 `Profile.web_search`，不分渠道）：摘除 MUST NOT 按 flavor 分支，
@@ -230,6 +240,11 @@ Science 还没重启、沙箱还没重启、或 Science 版本不认识该选项
 
 - **WHEN** 总开关已关闭而 Science 或沙箱还没重启，请求仍带搜索声明
 - **THEN** 网关摘除声明，桥不触发
+
+#### Scenario: Science 一侧已经生效
+
+- **WHEN** 总开关关闭且 Science 已按新设置重启
+- **THEN** 请求里没有搜索声明，摘除规则不命中——日志里有没有这条规则正好区分「Science 自己不再声明」与「网关在兜」
 
 #### Scenario: 重新开启
 

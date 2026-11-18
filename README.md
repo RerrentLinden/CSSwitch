@@ -150,7 +150,7 @@ Science 只在启动时读配置,所以切换开关会重启正在运行的 Scie
   畸形 server tool 块修复、孤儿工具配对按计数补齐。
 
 补偿策略来自 provider contract,不靠环境变量传递。每条补偿的上游成因与实测证据
-见 [Kimi 渠道](docs/features/kimi-channels.md) 与 [DeepSeek 渠道](docs/features/deepseek-channel.md)。
+见 [Kimi 渠道](openspec/specs/kimi-channel/design.md) 与 [DeepSeek 渠道](openspec/specs/deepseek-channel/design.md)。
 
 ## 开发
 
@@ -163,7 +163,7 @@ bash packaging/build_app.sh   # 从干净的 commit 构建 dist/CSSwitch.app 与
 
 真机验收(官方登录、真实 provider key、工具轮次)见 [test/LIVE_ACCEPTANCE.md](test/LIVE_ACCEPTANCE.md)。
 
-架构与开发约定见 [docs/](docs/README.md);Agent 规则见 [AGENTS.md](AGENTS.md)。
+架构总览见 [docs/](docs/README.md),行为规格与开发约定见 [openspec/](openspec/specs/);Agent 规则见 [AGENTS.md](AGENTS.md)。
 
 ## 致谢与开源协议
 
@@ -175,7 +175,7 @@ bash packaging/build_app.sh   # 从干净的 commit 构建 dist/CSSwitch.app 与
 以及 web_search 429 的客户端工具桥接。2026-08-19 曾尝试退役旧
 `kimi_coding_search.rs` 改为原生 inline；fresh review 证明三个模型行为不一致，
 2026-08-20 恢复为当前精简的 query-tool bridge。退役/恢复判据与真机证据记录在
-[Kimi 渠道](docs/features/kimi-channels.md)。
+[Kimi 联网搜索桥](openspec/specs/kimi-web-search-bridge/design.md)。
 
 **[farion1231/cc-switch](https://github.com/farion1231/cc-switch)**(MIT,© 2025 Jason Young)
 及其 fork **[biociao/cc-switch](https://github.com/biociao/cc-switch)** ——
