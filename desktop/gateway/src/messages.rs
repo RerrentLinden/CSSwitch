@@ -24,12 +24,20 @@ pub struct UpstreamError {
     pub status: u16,
     pub upstream_status: Option<u16>,
     pub detail: String,
+    /// 上游错误响应带的 `retry-after`,只在取值合规时保留(见 [`forwardable_retry_after`])。
+    pub retry_after: Option<String>,
 }
 
-pub(crate) fn upstream_failure_metadata(operation: &'static str, error: &UpstreamError) -> String {
+/// 上游失败的日志行。`status` 是网关实际回给 Science 的状态码,可能与 `error.status`
+/// 不同(relay 路径把渠道 Key 被拒的 401 改报 403)。
+pub(crate) fn upstream_failure_metadata(
+    operation: &'static str,
+    status: u16,
+    error: &UpstreamError,
+) -> String {
     let base = format!(
-        "POST /v1/messages upstream_failure operation={operation} status={} upstream_status={:?}",
-        error.status, error.upstream_status
+        "POST /v1/messages upstream_failure operation={operation} status={status} upstream_status={:?}",
+        error.upstream_status
     );
     match upstream_error_diagnostic(error) {
         Some(diagnostic) => format!("{base} {diagnostic}"),
@@ -225,6 +233,7 @@ fn messages_post_url<'a>(
         status: 502,
         upstream_status: None,
         detail: "Anthropic upstream URL is invalid".into(),
+        retry_after: None,
     })?;
     let mut beta_query = transport.is_some_and(|transport| transport.beta_query);
     if !beta_query && !url.query_pairs().any(|(key, _)| key == "beta") {
@@ -303,6 +312,7 @@ fn inference_client(
         status: 502,
         upstream_status: None,
         detail: e.to_string(),
+        retry_after: None,
     })
 }
 
@@ -316,6 +326,7 @@ fn models_client(timeouts: ModelsTimeouts) -> Result<Client, UpstreamError> {
             status: 502,
             upstream_status: None,
             detail: e.to_string(),
+            retry_after: None,
         })
 }
 
@@ -363,6 +374,7 @@ fn post_with_timeouts(
         status: 502,
         upstream_status: None,
         detail: e.to_string(),
+        retry_after: None,
     })
 }
 
@@ -399,6 +411,7 @@ fn get_once(cfg: &GatewayConfig, url: &str) -> Result<UpstreamBody, UpstreamErro
         status: 502,
         upstream_status: None,
         detail: e.to_string(),
+        retry_after: None,
     })?;
     let status = resp.status().as_u16();
     let content_type = resp
@@ -422,6 +435,7 @@ fn get_once(cfg: &GatewayConfig, url: &str) -> Result<UpstreamBody, UpstreamErro
             },
             upstream_status: Some(status),
             detail,
+            retry_after: None,
         });
     }
     let body = read_body_with_deadline(resp, None, started, timeouts.total).map_err(|error| {
@@ -437,6 +451,7 @@ fn get_once(cfg: &GatewayConfig, url: &str) -> Result<UpstreamBody, UpstreamErro
             status: 502,
             upstream_status: None,
             detail,
+            retry_after: None,
         }
     })?;
     Ok(UpstreamBody {
@@ -468,6 +483,7 @@ pub fn get(cfg: &GatewayConfig, url: &str) -> Result<UpstreamBody, UpstreamError
         status: 502,
         upstream_status: None,
         detail: "upstream models request failed".to_string(),
+        retry_after: None,
     }))
 }
 
@@ -578,6 +594,39 @@ fn bounded_redacted_error_body(
     }
 }
 
+/// 上游错误响应的 `retry-after` 能不能原样交给 Science:1–5 位十进制数字(秒),或
+/// IMF-fixdate 写法的 HTTP 日期(`Wed, 21 Oct 2026 07:28:00 GMT`,只含可见 ASCII 与空格,
+/// 定长 29 字节)。其余取值一律不转 —— 包括 HTTP 日期的两种旧写法:发送方本就只该用
+/// IMF-fixdate。合规的值不含 CR / LF,可以直接写进响应头。
+pub(crate) fn forwardable_retry_after(value: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(value).ok()?;
+    let seconds = (1..=5).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit());
+    (seconds || is_imf_fixdate(value)).then(|| value.to_string())
+}
+
+fn is_imf_fixdate(value: &str) -> bool {
+    const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let digits =
+        |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+    let parts: Vec<&str> = value.split(' ').collect();
+    let [day_name, day, month, year, time, zone] = parts.as_slice() else {
+        return false;
+    };
+    let time: Vec<&str> = time.split(':').collect();
+    day_name
+        .strip_suffix(',')
+        .is_some_and(|name| DAY_NAMES.contains(&name))
+        && digits(day, 2)
+        && MONTHS.contains(month)
+        && digits(year, 4)
+        && time.len() == 3
+        && time.iter().all(|part| digits(part, 2))
+        && *zone == "GMT"
+}
+
 fn map_http_error(
     resp: Response,
     api_key: &str,
@@ -585,6 +634,10 @@ fn map_http_error(
     total: Duration,
 ) -> UpstreamError {
     let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| forwardable_retry_after(value.as_bytes()));
     let body = bounded_redacted_error_body(resp, api_key, started, total);
     let mapped = if (400..=599).contains(&status) {
         status
@@ -600,6 +653,7 @@ fn map_http_error(
         status: mapped,
         upstream_status: Some(status),
         detail,
+        retry_after,
     }
 }
 
@@ -638,6 +692,7 @@ fn post_nonstream_with_timeouts(
                 status: 502,
                 upstream_status: Some(status),
                 detail,
+                retry_after: None,
             }
         })?;
     Ok(UpstreamBody {
@@ -677,6 +732,7 @@ pub(crate) fn post_nonstream_before(
             status: 504,
             upstream_status: None,
             detail: "upstream request exceeded the cumulative total timeout".into(),
+            retry_after: None,
         })?;
     let mut timeouts = inference_timeouts(cfg);
     timeouts.total = remaining;
@@ -702,6 +758,7 @@ fn read_first_line(resp: &mut Response) -> Result<Vec<u8>, UpstreamError> {
                     status: 502,
                     upstream_status: None,
                     detail: e.to_string(),
+                    retry_after: None,
                 });
             }
         }
@@ -711,6 +768,7 @@ fn read_first_line(resp: &mut Response) -> Result<Vec<u8>, UpstreamError> {
             status: 502,
             upstream_status: Some(200),
             detail: "upstream 200 but empty body".to_string(),
+            retry_after: None,
         });
     }
     Ok(first)
@@ -747,6 +805,7 @@ pub fn open_stream(
             status: 502,
             upstream_status: Some(status),
             detail: "upstream 200 returned a non-SSE Content-Type".into(),
+            retry_after: None,
         });
     }
     Ok(UpstreamStream { response: resp })
@@ -763,10 +822,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        messages_post_url, models_timeout_secs, models_timeouts, post_nonstream_before,
-        post_with_timeouts, read_body_with_deadline, read_first_line, redact_error_body,
-        upstream_failure_metadata, AnthropicTransport, BodyReadFailure, InferenceTimeouts,
-        ModelsTimeouts, UpstreamError, INFERENCE_TIMEOUTS,
+        forwardable_retry_after, messages_post_url, models_timeout_secs, models_timeouts,
+        post_nonstream_before, post_with_timeouts, read_body_with_deadline, read_first_line,
+        redact_error_body, upstream_failure_metadata, AnthropicTransport, BodyReadFailure,
+        InferenceTimeouts, ModelsTimeouts, UpstreamError, INFERENCE_TIMEOUTS,
     };
     use crate::config::GatewayConfig;
     use crate::provider_contracts::AuthScheme;
@@ -1273,7 +1332,7 @@ mod tests {
         assert!(!error.detail.contains("other-secret"));
         assert!(error.detail.len() < 17_000);
         assert!(error.detail.contains("truncated"));
-        let metadata = upstream_failure_metadata("post_nonstream", &error);
+        let metadata = upstream_failure_metadata("post_nonstream", error.status, &error);
         assert!(!metadata.contains(key));
         assert!(!metadata.contains("other-secret"));
         assert!(!metadata.contains("padding"));
@@ -1284,14 +1343,49 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_is_forwarded_only_as_delay_seconds_or_an_imf_date() {
+        // 合规的值原样写进回给 Science 的响应头:放宽校验就可能把 CR / LF 写进头里。
+        for accepted in ["30", "120", "0", "99999", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+            assert_eq!(
+                forwardable_retry_after(accepted.as_bytes()).as_deref(),
+                Some(accepted)
+            );
+        }
+        for rejected in [
+            "",
+            "abc",
+            "1e3",
+            "-1",
+            "1.5",
+            "123456",
+            "30\r\nx-should-retry: false",
+            "Wed, 21 Oct 2026 07:28:00 GMT\r\nx: y",
+            "Wed, 21 Oct 2026 07:28:00 GMT and a long tail of extra text",
+            "Wednesday, 21-Oct-26 07:28:00 GMT",
+            "Wed Oct 21 07:28:00 2026",
+            "Wed, 21 Oct 2026 07:28:00 UTC",
+            "Wed, 21 Okt 2026 07:28:00 GMT",
+        ] {
+            assert_eq!(
+                forwardable_retry_after(rejected.as_bytes()),
+                None,
+                "{rejected:?}"
+            );
+        }
+        assert_eq!(forwardable_retry_after(b"\xff\xfe"), None);
+    }
+
+    #[test]
     fn upstream_failure_metadata_omits_transport_detail_with_url() {
         let metadata = upstream_failure_metadata(
             "open_stream",
+            502,
             &UpstreamError {
                 status: 502,
                 upstream_status: None,
                 detail: "request failed for https://private.invalid/path?token=must-not-leak"
                     .into(),
+                retry_after: None,
             },
         );
         assert!(!metadata.contains("private.invalid"));

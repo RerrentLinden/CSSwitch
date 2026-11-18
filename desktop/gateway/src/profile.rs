@@ -53,6 +53,14 @@ impl Mode {
         }
     }
 
+    /// 由 gateway adapter 反查渠道模式:[`Mode::contract`] 的逆映射。
+    pub fn for_adapter(adapter: &str) -> Option<Self> {
+        [Mode::Kimi, Mode::Deepseek].into_iter().find(|mode| {
+            mode.contract()
+                .is_some_and(|(candidate, _)| candidate == adapter)
+        })
+    }
+
     pub fn display_name(&self) -> &'static str {
         match self {
             Mode::Official => "官方 Claude",

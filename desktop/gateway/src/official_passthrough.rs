@@ -708,6 +708,52 @@ mod tests {
     }
 
     #[test]
+    fn official_401_reaches_science_with_status_and_body_bytes_unchanged() {
+        // 官方模式下的 401 确实是 Claude 登录问题:relay 路径的 401 → 403 改报不得漏到这里。
+        // 走的是服务在官方模式下调用的同一个 `forward`,只是上游换成本地假上游。
+        let body = b"{\"type\": \"error\", \"error\": {\"type\": \"authentication_error\", \"message\": \"invalid x-api-key\"}}\n";
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let head = read_request_head(&mut stream).unwrap();
+            read_request_body(&mut stream, &head.headers).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let downstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let downstream_addr = downstream.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(downstream_addr).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+        let (mut stream, _) = downstream.accept().unwrap();
+        let outcome = forward(
+            &mut stream,
+            "POST",
+            "/v1/messages",
+            &[("authorization".into(), "Bearer oauth-token".into())],
+            b"{}".to_vec(),
+            &upstream_url,
+        );
+        drop(stream);
+        upstream_thread.join().unwrap();
+        let response = client.join().unwrap();
+
+        assert_eq!(outcome.status, 401);
+        assert!(response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+        let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        assert_eq!(&response[split + 4..], body);
+    }
+
+    #[test]
     fn parse_args_requires_port_and_log() {
         assert!(parse_args(&[]).is_err());
         let opts = parse_args(&[
