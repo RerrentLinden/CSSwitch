@@ -87,6 +87,10 @@ sequenceDiagram
 `tool_use.id` 与 `tool_result.tool_use_id` **必须一一配对**。第三方端点内部会把
 消息转成 OpenAI 格式,那边的 `tool_call_id` 配对是硬约束,落单直接 400。
 
+已知边界:客户端工具在等用户授权（如 `request_network_access`）时,Science 仍可能继续发起推理,
+历史以未配对的 `tool_use` 结尾。`validate_relay_tool_history` 对所有 relay 渠道一视同仁地
+拒绝这种请求,返回 `400 relay history ends with unresolved tool calls`,不会转发到上游。
+
 服务端工具不同:它由**服务商执行**,客户端只是旁观者,两个块都落在 assistant 消息里:
 
 ```

@@ -24,7 +24,7 @@ scratchpad/
 .superpowers/
 
 # 本机 agent 工具目录,整个不入库。
-# .agents/ 里已入库的 rules、context 与 handoffs/README.md 继续跟踪;新增文件要 `git add -f`。
+# .agents/ 里已入库的 rules 与 handoffs/README.md 继续跟踪;新增文件要 `git add -f`。
 /.agents/
 /.codex/
 /.kimi-code/

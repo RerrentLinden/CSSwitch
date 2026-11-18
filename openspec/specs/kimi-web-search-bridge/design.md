@@ -35,6 +35,12 @@ Science 持久层的选收依据未知。诊断靠 adapter 日志的 `merged_sha
 另注意由此派生的测试陷阱:验收「重载后卡片仍在」必须在**发过追问之后**再重载,
 只在最新轮重载会得到假阳性（2026-08-19 的 K3/K2.7 分化即此成因）。
 
+K3-256k 搜索慢是上游 256k 服务池的属性,不是桥接开销（2026-08-20 同题受控对比）:
+差距全部在 nested（上游执行搜索）那一跳——`k3-256k` main 7.5s + nested 56.7s ≈ 64s,
+`k3` main 6.1s + nested 13.5s ≈ 20s;多次观测 `k3` 的 nested 稳定在 8–15s,
+`k3-256k` 在 15s / 26s / 57s / 100s+ 间波动。桥接的固有代价只有「首字节 ≈ main 时长」
+（约 6–10s）,三个模型相同。网关改不了单次上游调用的时长。
+
 ## 必需测试
 
 - 三模型 fake upstream：搜索严格 2/3 POST、不搜索 1 POST；nested forced/disabled、token caps、shared deadline。
