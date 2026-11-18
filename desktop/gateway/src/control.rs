@@ -227,7 +227,12 @@ fn handle_control(stream: &mut TcpStream, request: &Request, action: &str, state
 
 fn status_payload(state: &Arc<AppState>) -> Value {
     let profile = state.snapshot();
-    let science = crate::science::status();
+    let mut science = crate::science::status();
+    // 正在跑的 Science 不是经 CSSwitch 启动的:它的流量不经过网关,控制台据此提示先停再启动。
+    // 没命中时不出现。键名不叫 `mode`,理由见下面的 `sandbox_mode`。
+    if let Some(reason) = crate::science::unmanaged_reason(&science) {
+        science["unmanaged"] = json!({"reason": reason});
+    }
     json!({
         // 正在运行的这个服务进程的版本。安装版的启动器拿它与自己比对:
         // 换了新版应用而后台还是旧服务时,要提示而不是让人以为已经升级。
@@ -399,16 +404,10 @@ fn switch_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String
     if let Some(channel) = profile.channel(&mode) {
         channel.validate()?;
     }
-    profile.mode = mode.clone();
-    let overrides = launch_overrides(&profile, Instance::Official);
-    profile.save()?;
-    if let Ok(mut guard) = state.profile.write() {
-        *guard = profile;
-    }
 
     // Science 只在启动时读 base_url,所以切换必须重启 daemon。
     // 重启会打断进行中的会话(Science 侧标记为 "interrupted by a restart"),
-    // 因此有活跃会话时必须显式确认,不能默默切。
+    // 因此有活跃会话时必须显式确认,不能默默切。判定在存盘之前:被拒绝时任何状态都不变。
     let (running, active) = science_activity(&crate::science::status());
     let forced = payload
         .get("force")
@@ -416,6 +415,13 @@ fn switch_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String
         .unwrap_or(false);
     if running && active > 0 && !forced {
         return Err(active_sessions_refusal(active));
+    }
+
+    profile.mode = mode.clone();
+    let overrides = launch_overrides(&profile, Instance::Official);
+    profile.save()?;
+    if let Ok(mut guard) = state.profile.write() {
+        *guard = profile;
     }
     let restarted = if running {
         crate::science::stop()?;
@@ -442,21 +448,27 @@ fn switch_mode(request: &Request, state: &Arc<AppState>) -> Result<Value, String
 }
 
 /// 官方实例是否在运行、有几个会话正在进行。输入是 [`crate::science::status`] 的结果:
-/// `status` 子命令的原始输出在 `detail` 下,会话数在 `daemon.active_conversations`。
+/// `status` 子命令的原始输出在 `detail` 下,计数在 `daemon` 里。
+///
+/// `active_conversations` 是不重复的对话数,`active_frames` 是全部活跃 frame 数(含子 agent、
+/// Reviewer);Science 自己判断能否替换旧 daemon 看的是 frame 数。两项任一大于 0 都算有会话
+/// 正在进行。报给用户的数字取对话数,对话数为 0 时取 frame 数。
 fn science_activity(science: &Value) -> (bool, u64) {
-    let running = science
-        .get("running")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let active = science
-        .pointer("/detail/daemon/active_conversations")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    (running, active)
+    let count = |key: &str| {
+        science
+            .pointer(&format!("/detail/daemon/{key}"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let active = match count("active_conversations") {
+        0 => count("active_frames"),
+        conversations => conversations,
+    };
+    (reports_running(science), active)
 }
 
 /// 有会话正在进行时拒绝重启 Science 的文案。控制台按「会话正在进行」识别它并转成确认框,
-/// 切换模式与切换联网搜索共用同一句。
+/// 切换模式与两个启动开关(联网搜索、跳过审批)共用同一句。
 fn active_sessions_refusal(active: u64) -> String {
     format!("有 {active} 个会话正在进行,切换会重启 Science 并打断它们。确认后重试。")
 }
@@ -1175,6 +1187,37 @@ mod tests {
         assert!(
             active_sessions_refusal(2).contains("会话正在进行"),
             "控制台靠这几个字把拒绝转成确认框"
+        );
+    }
+
+    #[test]
+    fn running_frames_alone_count_as_sessions_in_progress() {
+        let status = |frames: u64, conversations: u64| {
+            json!({
+                "installed": true,
+                "running": true,
+                "detail": {"running": true, "daemon": {
+                    "active_frames": frames,
+                    "active_conversations": conversations,
+                }},
+            })
+        };
+        // 只有 frame 在跑:只看对话数时判成空闲,切换会不经确认就重启 Science、打断它。
+        // 数字取 frame 数,不说「有 0 个会话」。
+        let (running, active) = science_activity(&status(3, 0));
+        assert_eq!((running, active), (true, 3));
+        assert_eq!(
+            plan_launch_switch(true, false, running, active, false),
+            LaunchSwitchPlan::NeedsConfirmation { active: 3 }
+        );
+        assert!(active_sessions_refusal(active).contains("有 3 个会话正在进行"));
+        // 两项都有:报对话数(一个对话可以有好几个 frame)。
+        assert_eq!(science_activity(&status(5, 2)), (true, 2));
+        // 两项都为 0:不忙,直接重启。
+        let (running, active) = science_activity(&status(0, 0));
+        assert_eq!(
+            plan_launch_switch(true, false, running, active, false),
+            LaunchSwitchPlan::SaveAndRestart
         );
     }
 

@@ -58,8 +58,11 @@ trap cleanup EXIT
 # - `running` 标记文件决定 status 的回答:官方形态的 serve(不带 --data-dir)建它,
 #   官方形态的 stop(不带 --data-dir)清它。沙箱形态的 stop 什么也不做,留给服务的
 #   兜底 SIGTERM 去收口。
-# - `active` 标记文件让 status 报告有会话正在进行。输出形状与真实 `status` 一致
-#   (会话数在 daemon.active_conversations),否则「有会话先确认」测的就是假设。
+# - status 的输出形状与真实一致(端口在顶层,launch_context 与两个计数在 daemon 里),
+#   否则「有会话先确认」「不是经 CSSwitch 启动」测的就是假设。默认是经 CSSwitch 启动、
+#   空闲的样子:8686、launchd(安装版实测)、两个计数都是 0。标记文件改写其中几项:
+#   `active` → 2 个对话(2 个 frame);`frames-only` → 3 个 frame、0 个对话;
+#   `port` / `launch-context` → 文件内容就是报告的端口 / 启动来源。
 # - 官方形态的 serve 另记一行注入的 ANTHROPIC_BASE_URL。
 FAKE_SCI="$SANDBOX/fake-science"
 mkdir -p "$FAKE_SCI"
@@ -69,10 +72,14 @@ dir="$(dirname "$0")"
 echo "$*" >>"$dir/calls.log"
 case "$1" in
   status)
-    if [ ! -e "$dir/running" ]; then echo '{"running":false}'
-    elif [ -e "$dir/active" ]; then echo '{"running":true,"daemon":{"active_conversations":2}}'
-    else echo '{"running":true,"daemon":{"active_conversations":0}}'
-    fi ;;
+    if [ ! -e "$dir/running" ]; then echo '{"running":false}'; exit 0; fi
+    port=8686 context=launchd frames=0 conversations=0
+    [ -e "$dir/port" ] && port="$(cat "$dir/port")"
+    [ -e "$dir/launch-context" ] && context="$(cat "$dir/launch-context")"
+    [ -e "$dir/active" ] && frames=2 conversations=2
+    [ -e "$dir/frames-only" ] && frames=3 conversations=0
+    printf '{"running":true,"pid":4242,"version":"0.1.72","port":%s,"started_at":"2026-11-18T00:00:00Z","daemon":{"boot":"serving","launch_context":"%s","active_frames":%s,"active_conversations":%s}}\n' \
+      "$port" "$context" "$frames" "$conversations" ;;
   stop) [ "$#" -eq 1 ] && rm -f "$dir/running" ;;
   serve)
     case " $* " in
@@ -345,6 +352,51 @@ if [ -e "$SANDBOX/.csswitch/science-config" ]; then
   echo "  FAIL 开启态生成了镜像目录"; fail=1
 else
   echo "  ok   开启态不生成镜像"
+fi
+
+# ── 正在跑的 Science 是不是经 CSSwitch 启动的 ───────────────────────────────
+# 只从 status 的输出推导:端口不是 8686(手动 serve 落在 Science 默认的 8000),或
+# launch_context 是 app-child(桌面 App 拉起的,两者都成立取 app)。这样的 daemon 流量不经过网关。
+control_status() { body "http://127.0.0.1:$PORT/control/status"; }
+lacks "经 CSSwitch 启动的 Science 不带归属结果" '"unmanaged"' "$(control_status)"
+echo 8000 >"$FAKE_SCI/port"
+foreign="$(control_status)"
+has "端口不是 8686:标为不是经 CSSwitch 启动(port)" '"unmanaged":{"reason":"port"}' "$foreign"
+# 新键不得叫 mode:取顶层模式的脚本是贪婪匹配。
+check "带归属结果时状态里仍只有一个 mode 键" 1 \
+  "$(printf '%s' "$foreign" | grep -o '"mode":' | wc -l | tr -d ' ')"
+echo app-child >"$FAKE_SCI/launch-context"
+has "端口不符且是桌面 App 拉起的:取 app" '"unmanaged":{"reason":"app"}' "$(control_status)"
+rm -f "$FAKE_SCI/port"
+has "桌面 App 拉起的(端口对得上):标为 app" '"unmanaged":{"reason":"app"}' "$(control_status)"
+rm -f "$FAKE_SCI/launch-context"
+lacks "恢复成经 CSSwitch 启动的样子后不再带归属结果" '"unmanaged"' "$(control_status)"
+
+# ── 只有 frame 在跑也算有会话正在进行 ───────────────────────────────────────
+# active_frames > 0 而 active_conversations == 0:切换模式被拒(数字取 frame 数),任何状态不变;
+# 带确认后放行。之后切回官方模式,下面各节仍从「官方模式、Science 在跑、没有镜像」出发。
+touch "$FAKE_SCI/frames-only"
+cp "$SERVICE_JSON" "$SANDBOX/service.before-frames.json"
+before_restarts="$(restart_calls)"
+frames_refused="$(post switch '{"mode":"kimi"}')"
+has "只有 frame 在跑且未确认时拒绝切换模式" "有 3 个会话正在进行" "$frames_refused"
+check "被拒绝后模式不变" official "$(official_mode)"
+check "被拒绝后 Science 没有被重启" "$before_restarts" "$(restart_calls)"
+if cmp -s "$SERVICE_JSON" "$SANDBOX/service.before-frames.json" && [ ! -e "$MIRROR" ]; then
+  echo "  ok   被拒绝后配置文件逐字节不变,也没有生成镜像"
+else
+  echo "  FAIL 只有 frame 在跑时被拒绝,配置文件却变了或生成了镜像"; fail=1
+fi
+frames_forced="$(post switch '{"mode":"kimi","force":true}')"
+has "确认后放行并重启了 Science" '"science_restarted":true' "$frames_forced"
+check "确认后模式变为 Kimi" kimi "$(official_mode)"
+rm -f "$FAKE_SCI/frames-only"
+post switch '{"mode":"official"}' >/dev/null
+check "切回官方模式:启动参数回到主线" "$SERVE_PLAIN" "$(last_serve)"
+if [ -e "$MIRROR" ]; then
+  echo "  FAIL 切回官方模式后留下了镜像"; fail=1
+else
+  echo "  ok   切回官方模式后不留镜像"
 fi
 
 # 旧端点带 web_search:显式报错并指向新端点,不静默忽略。
