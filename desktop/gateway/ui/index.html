@@ -34,10 +34,13 @@
     border-radius: var(--radius); padding: 20px 22px; margin-bottom: 18px;
   }
   .card h2 { font-size: 15px; margin: 0 0 14px; letter-spacing: .3px; }
+  /* .row 可以嵌套:内层 .row 是一组标签或按钮,放不下时整组换行,组内再放不下才各自换行。 */
   .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   /* 免登录沙箱只有两个渠道可选(没有官方 Claude),两列排满。 */
   .modes.two { grid-template-columns: repeat(2, 1fr); }
+  /* 窄窗口里并排放不下卡片上的接口地址(会撑出横向滚动),改为一列。 */
+  @media (max-width: 599px) { .modes, .modes.two { grid-template-columns: 1fr; } }
   .mode {
     border: 1px solid var(--line); border-radius: 10px; padding: 14px;
     background: transparent; color: var(--ink); cursor: pointer; text-align: left;
@@ -122,11 +125,15 @@
     <p class="hint" style="margin-top:0">你自己登录的 Science 用哪个 AI。</p>
     <div class="modes" id="modes"></div>
     <div class="row" style="margin-top:16px">
-      <span class="pill"><span class="dot" id="sci-dot"></span><span id="sci-text">检查中…</span></span>
-      <span class="pill">网关 <code id="base-url">—</code></span>
-      <button class="act" id="btn-start">启动 Science</button>
-      <button class="act" id="btn-stop">停止</button>
-      <button class="act" id="btn-open">打开 Science</button>
+      <div class="row">
+        <span class="pill"><span class="dot" id="sci-dot"></span><span id="sci-text">检查中…</span></span>
+        <span class="pill">网关 <code id="base-url">—</code></span>
+      </div>
+      <div class="row">
+        <button class="act" id="btn-start">启动 Science</button>
+        <button class="act" id="btn-stop">停止</button>
+        <button class="act" id="btn-open">打开 Science</button>
+      </div>
       <button class="act" id="btn-quit" style="margin-left:auto">退出服务</button>
     </div>
     <div class="field" style="margin:16px 0 0">
@@ -148,9 +155,11 @@
     <div class="modes two" id="sb-modes" style="margin-bottom:16px"></div>
     <div class="row">
       <span class="pill"><span class="dot" id="sb-dot"></span><span id="sb-text">检查中…</span></span>
-      <button class="act primary" id="btn-sb-start">启动沙箱</button>
-      <button class="act" id="btn-sb-stop">停止</button>
-      <button class="act" id="btn-sb-open">打开沙箱</button>
+      <div class="row">
+        <button class="act primary" id="btn-sb-start">启动沙箱</button>
+        <button class="act" id="btn-sb-stop">停止</button>
+        <button class="act" id="btn-sb-open">打开沙箱</button>
+      </div>
     </div>
     <div class="msg" id="sb-msg"></div>
   </section>
