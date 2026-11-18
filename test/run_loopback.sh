@@ -317,6 +317,65 @@ else
   echo "  FAIL 沙箱渠道切换被拒后配置文件变了"; fail=1
 fi
 
+# ── 请求日志:调用类型 ──────────────────────────────────────────────────────
+# 每条推理请求按 metadata.user_id 的结构与请求形状标出调用类型:relay 明细行多一项 lane=
+# (恒在 rules= 之前),控制面的日志条目多一个 lane。会话与 frame 的 id 不进日志、不进接口。
+# 走沙箱入口:沙箱渠道是已配置的 Kimi(上游是不存在的域名,明细行在联网之前就已写出)。
+# 正式实例此刻是官方模式,它的入口会直通真实的 api.anthropic.com,这一层不打。
+LANE_ROOT=5e551011ab1e5e551011ab1e5e551011
+LANE_FRAME24=f4a3e000c0ffee00f4a3e000
+LANE_FRAME32="${LANE_FRAME24}0bad5eed"
+# 子 frame 上的标题调用(root:frame24:lane)。
+cat >"$SANDBOX/lane-relay.json" <<EOF
+{"model":"claude-opus-5","max_tokens":16,"stream":false,
+ "metadata":{"user_id":"{\"session_id\":\"$LANE_ROOT:$LANE_FRAME24:ttl\",\"frame_id\":\"$LANE_FRAME32\"}"},
+ "messages":[{"role":"user","content":"hi"}]}
+EOF
+# send_raw <入口路径> <请求体文件>:请求体按文件逐字节发送。
+send_raw() {
+  curl -s -o /dev/null --max-time 10 -X POST "http://127.0.0.1:$PORT$1" \
+    -H 'content-type: application/json' --data-binary @"$2"
+}
+# 条目在响应写完之后才记入:按条数等它出现。
+wait_inference_entries() { # wait_inference_entries <之前的条数>
+  for _ in $(seq 1 25); do
+    [ "$(inference_log_count)" -gt "$1" ] && return 0
+    sleep 0.2
+  done
+}
+# 最后一条日志条目的 detail(只在它是推理条目、且没有嵌套对象时取得到)。
+last_detail() {
+  body "http://127.0.0.1:$PORT/control/logs" | sed -nE 's/.*"detail":\{([^{}]*)\}\}\]\}$/\1/p'
+}
+relay_lines() { grep -c 'POST /v1/messages relay' "$SANDBOX/out.log"; }
+
+before="$(inference_log_count)"
+before_relay="$(relay_lines)"
+send_raw /sandbox/v1/messages "$SANDBOX/lane-relay.json"
+wait_inference_entries "$before"
+relay_line="$(grep 'POST /v1/messages relay' "$SANDBOX/out.log" | tail -n +"$((before_relay + 1))" | tail -1)"
+has "relay 明细行带调用类型,且在 rules= 之前" " lane=ttl rules=" "$relay_line"
+has "relay 的日志条目带调用类型(标题)" '"lane":"ttl"' "$(last_detail)"
+# 没有 metadata 的请求认不出:明细行是 lane=-,条目里没有类型。
+check "没有 metadata 的请求仍按实例与渠道记录" "sandbox kimi" "$(route_of /sandbox/v1/messages)"
+has "认不出的请求明细行是 lane=-" " lane=- rules=" "$(grep 'POST /v1/messages relay' "$SANDBOX/out.log" | tail -1)"
+has "认不出的请求条目里没有类型" '"lane":null' "$(last_detail)"
+# 会话与 frame 的 id 一律不出现,只有推导出的类型。
+for id in "$LANE_ROOT" "$LANE_FRAME24"; do
+  lacks "服务日志里没有会话 / frame id($id)" "$id" "$(cat "$SANDBOX/out.log")"
+  lacks "控制面日志接口里没有会话 / frame id($id)" "$id" "$(body "http://127.0.0.1:$PORT/control/logs")"
+done
+
+# 关掉「记录请求日志」:明细行与条目都不再产生。
+post logging '{"request_log":false}' >/dev/null
+before="$(inference_log_count)"
+before_relay="$(relay_lines)"
+send_raw /sandbox/v1/messages "$SANDBOX/lane-relay.json"
+sleep 1
+check "关掉请求日志后没有新的日志条目" "$before" "$(inference_log_count)"
+check "关掉请求日志后没有新的 relay 明细行" "$before_relay" "$(relay_lines)"
+has "重新开启请求日志" '"request_log":true' "$(post logging '{"request_log":true}')"
+
 # ── 模型清单:每个模型一条 ──────────────────────────────────────────────────
 # 清单由渠道的四槽配置在本地合成,不联网。这一节走沙箱入口:正式实例此刻是官方模式,
 # 它的入口会直通真实的 api.anthropic.com。沙箱渠道是 Kimi,只配了默认槽 m1。

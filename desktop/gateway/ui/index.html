@@ -89,6 +89,10 @@
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; }
   .logwrap { max-height: 300px; overflow: auto; }
+  .tag {
+    display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 6px;
+    background: var(--accent-soft); color: var(--muted); font-size: 12px; white-space: nowrap;
+  }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
   a { color: var(--accent); }
 </style>
@@ -220,6 +224,22 @@ const SLOTS = [
 ];
 // 请求日志里的实例名:正式实例(用户自己登录的 Science)与免登录沙箱。
 const INSTANCES = { official: '正式', sandbox: '沙箱' };
+// 请求日志里的调用类型(服务端的 detail.lane):主对话、子任务,其余是 Science 的后台调用。
+// 键是服务端给的代号;没收录的代号显示成「后台·<代号>」,没有代号时不显示。
+const LANES = {
+  main: '主对话', sub: '子任务', keepalive: '后台·保活', fork: '后台·分支',
+  ttl: '后台·标题', mem: '后台·记忆', amc: '后台·分类',
+  fold: '后台·滚动压缩', ucmp: '后台·压缩', rg: '后台·记忆整理', pi: '后台·注入筛查',
+  sniff: '后台·结束判断', csf: '后台·代码安全', lin: '后台·产物溯源', rca: '后台·审批摘要',
+  ann: '后台·批注', lead: '后台·引导', kllm: '后台·代码调用', skill: '后台·技能搜索',
+  traj: '后台·安全筛查',
+};
+function laneTag(lane) {
+  if (typeof lane !== 'string') return '';
+  const name = Object.hasOwn(LANES, lane) ? LANES[lane]
+    : (/^[a-z0-9]{1,6}$/.test(lane) ? '后台·' + lane : '');
+  return name ? `<span class="tag">${name}</span>` : '';
+}
 let state = null;
 let channel = 'kimi';
 let scienceUrl = null;
@@ -637,7 +657,7 @@ $('btn-logs').onclick = async () => {
     // 谁发来的、走了哪个渠道:两个实例各有各的模式,只写渠道分不清是哪一边。
     const route = detail.mode ? `${INSTANCES[detail.instance] || '—'} · ${detail.mode}` : '—';
     return `<tr>
-      <td>${time}</td><td>${route}</td><td>${detail.method || '—'}</td>
+      <td>${time}</td><td>${route}${laneTag(detail.lane)}</td><td>${detail.method || '—'}</td>
       <td><code>${detail.path || '—'}</code></td>
       <td>${detail.error ? '<span style="color:var(--err)">错误</span>' : (detail.status || '—')}</td>
       <td>${detail.ms != null ? detail.ms + ' ms' : '—'}</td>
