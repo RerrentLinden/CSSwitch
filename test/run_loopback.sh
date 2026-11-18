@@ -38,6 +38,7 @@ stop_launched() { # stop_launched <端口> <service.log 路径>
 }
 cleanup() {
   [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null
+  [ -n "${UP_NC:-}" ] && kill "$UP_NC" 2>/dev/null
   [ -n "${LEGACY_PID:-}" ] && kill "$LEGACY_PID" 2>/dev/null
   [ -n "${SB_PID:-}" ] && kill "$SB_PID" 2>/dev/null
   # 后台那个启动器要等它自己跑完(有超时,几秒):先放掉它占着的端口,它反而会真的起一个服务。
@@ -87,7 +88,11 @@ chmod +x "$FAKE_SCI/claude-science"
 # 隔离 HOME:服务的配置落在沙箱里。Science 二进制显式指向假脚本
 # (CLAUDE_SCIENCE_BIN 无效时 fail closed,不回落):这一层既不依赖本机是否装了
 # Science,也绝不触碰本机的真实实例。
+# 官方直通指向本机的假上游端口(只接受 127.0.0.1;没有假上游在听时连接被拒),
+# 正式实例处于官方模式时的推理请求因此不会出网。NO_PROXY 防止环境里的代理接走回环请求。
+UPSTREAM_PORT=$(( PORT + 5 ))
 HOME="$SANDBOX" CLAUDE_SCIENCE_BIN="$FAKE_SCI/claude-science" \
+  CSSWITCH_OFFICIAL_UPSTREAM="http://127.0.0.1:$UPSTREAM_PORT" NO_PROXY="127.0.0.1${NO_PROXY:+,$NO_PROXY}" \
   "$BIN" serve --port "$PORT" >"$SANDBOX/out.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 40); do
@@ -302,6 +307,117 @@ if cmp -s "$SERVICE_JSON" "$SANDBOX/service.before-sandbox-switch.json"; then
 else
   echo "  FAIL 沙箱渠道切换被拒后配置文件变了"; fail=1
 fi
+
+# ── 请求日志:调用类型 ──────────────────────────────────────────────────────
+# 每条推理请求按 metadata.user_id 的结构与请求形状标出调用类型:relay 明细行多一项 lane=
+# (恒在 rules= 之前),控制面的日志条目多一个 lane。会话与 frame 的 id 不进日志、不进接口;
+# 官方直通转发出去的仍是入站的原样字节。此刻正式实例是官方模式(直通指向本机假上游),
+# 沙箱渠道是已配置的 Kimi(上游是不存在的域名,明细行在联网之前就已写出)。
+LANE_ROOT=5e551011ab1e5e551011ab1e5e551011
+LANE_FRAME24=f4a3e000c0ffee00f4a3e000
+LANE_FRAME32="${LANE_FRAME24}0bad5eed"
+# 正式入口:根 frame 的保活。故意带空格与 \u 转义:任何「解析后重新序列化」都会改变字节。
+cat >"$SANDBOX/lane-official.json" <<EOF
+{ "model" : "claude-opus-5", "max_tokens" : 1, "stream" : false,
+  "metadata" : { "user_id" : "{\"session_id\":\"$LANE_ROOT\",\"frame_id\":\"$LANE_ROOT\"}" },
+  "messages" : [ { "role" : "user", "content" : "café" } ] }
+EOF
+# 沙箱入口:子 frame 上的标题调用(root:frame24:lane)。
+cat >"$SANDBOX/lane-relay.json" <<EOF
+{"model":"claude-opus-5","max_tokens":16,"stream":false,
+ "metadata":{"user_id":"{\"session_id\":\"$LANE_ROOT:$LANE_FRAME24:ttl\",\"frame_id\":\"$LANE_FRAME32\"}"},
+ "messages":[{"role":"user","content":"hi"}]}
+EOF
+# fake_upstream_once <记录文件>:假官方上游,只接一个连接,回一个固定的 200,收到的原样字节记进文件。
+UP_RESP='{"id":"msg_fake","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}'
+fake_upstream_once() {
+  printf 'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %s\r\nconnection: close\r\n\r\n%s' \
+    "${#UP_RESP}" "$UP_RESP" | nc -l 127.0.0.1 "$UPSTREAM_PORT" >"$1" 2>/dev/null &
+  UP_NC=$!
+  for _ in $(seq 1 25); do
+    lsof -nP -iTCP:"$UPSTREAM_PORT" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    sleep 0.2
+  done
+}
+# 等假上游收完这一个连接(服务读完响应就关连接,nc 随之退出);没等到就结束它。
+fake_upstream_done() {
+  for _ in $(seq 1 25); do
+    kill -0 "$UP_NC" 2>/dev/null || break
+    sleep 0.2
+  done
+  kill "$UP_NC" 2>/dev/null
+  wait "$UP_NC" 2>/dev/null
+  UP_NC=
+}
+# send_raw <入口路径> <请求体文件>:请求体按文件逐字节发送,输出 HTTP 状态码。
+send_raw() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "http://127.0.0.1:$PORT$1" \
+    -H 'content-type: application/json' --data-binary @"$2"
+}
+# 条目在响应写完之后才记入:按条数等它出现。
+wait_inference_entries() { # wait_inference_entries <之前的条数>
+  for _ in $(seq 1 25); do
+    [ "$(inference_log_count)" -gt "$1" ] && return 0
+    sleep 0.2
+  done
+}
+# 最后一条日志条目的 detail(只在它是推理条目、且没有嵌套对象时取得到)。
+last_detail() {
+  body "http://127.0.0.1:$PORT/control/logs" | sed -nE 's/.*"detail":\{([^{}]*)\}\}\]\}$/\1/p'
+}
+relay_lines() { grep -c 'POST /v1/messages relay' "$SANDBOX/out.log"; }
+
+# 改道没有生效就不发官方请求:那样会连到真实的 api.anthropic.com。
+if grep -q "官方直通改道到 http://127.0.0.1:$UPSTREAM_PORT" "$SANDBOX/out.log"; then
+  echo "  ok   官方直通改道到本机假上游,启动日志留痕"
+  fake_upstream_once "$SANDBOX/upstream-official.raw"
+  before="$(inference_log_count)"
+  check "官方直通经假上游返回 200" 200 "$(send_raw /v1/messages "$SANDBOX/lane-official.json")"
+  fake_upstream_done
+  wait_inference_entries "$before"
+  body_len="$(wc -c <"$SANDBOX/lane-official.json" | tr -d ' ')"
+  if tail -c "$body_len" "$SANDBOX/upstream-official.raw" | cmp -s - "$SANDBOX/lane-official.json" \
+    && grep -qi "^content-length: $body_len"$'\r'"\$" "$SANDBOX/upstream-official.raw"; then
+    echo "  ok   官方直通发往上游的请求体与入站字节一致"
+  else
+    echo "  FAIL 官方直通改动了请求体(入站 $body_len 字节)"; fail=1
+  fi
+  official_detail="$(last_detail)"
+  has "官方直通的日志条目带调用类型(保活)" '"lane":"keepalive"' "$official_detail"
+  has "这一条记的是正式实例的官方模式" '"instance":"official","mode":"official"' "$official_detail"
+else
+  echo "  FAIL 官方直通没有改道到本机假上游,跳过官方直通的调用类型检查"; fail=1
+fi
+
+before="$(inference_log_count)"
+before_relay="$(relay_lines)"
+send_raw /sandbox/v1/messages "$SANDBOX/lane-relay.json" >/dev/null
+wait_inference_entries "$before"
+relay_line="$(grep 'POST /v1/messages relay' "$SANDBOX/out.log" | tail -n +"$((before_relay + 1))" | tail -1)"
+has "relay 明细行带调用类型,且在 rules= 之前" " lane=ttl rules=" "$relay_line"
+has "relay 的日志条目带调用类型(标题)" '"lane":"ttl"' "$(last_detail)"
+# 没有 metadata 的请求认不出:明细行是 lane=-,条目里没有类型。
+check "没有 metadata 的请求仍按实例与渠道记录" "sandbox kimi" "$(route_of /sandbox/v1/messages)"
+has "认不出的请求明细行是 lane=-" " lane=- rules=" "$(grep 'POST /v1/messages relay' "$SANDBOX/out.log" | tail -1)"
+has "认不出的请求条目里没有类型" '"lane":null' "$(last_detail)"
+# 会话与 frame 的 id 一律不出现,只有推导出的类型。
+for id in "$LANE_ROOT" "$LANE_FRAME24"; do
+  lacks "服务日志里没有会话 / frame id($id)" "$id" "$(cat "$SANDBOX/out.log")"
+  lacks "控制面日志接口里没有会话 / frame id($id)" "$id" "$(body "http://127.0.0.1:$PORT/control/logs")"
+done
+
+# 关掉「记录请求日志」:明细行与条目都不再产生,转发照常。
+post logging '{"request_log":false}' >/dev/null
+before="$(inference_log_count)"
+before_relay="$(relay_lines)"
+fake_upstream_once "$SANDBOX/upstream-off.raw"
+check "关掉请求日志后官方直通照常转发" 200 "$(send_raw /v1/messages "$SANDBOX/lane-official.json")"
+fake_upstream_done
+send_raw /sandbox/v1/messages "$SANDBOX/lane-relay.json" >/dev/null
+sleep 1
+check "关掉请求日志后没有新的日志条目" "$before" "$(inference_log_count)"
+check "关掉请求日志后没有新的 relay 明细行" "$before_relay" "$(relay_lines)"
+has "重新开启请求日志" '"request_log":true' "$(post logging '{"request_log":true}')"
 
 # ── 模型清单:每个模型一条 ──────────────────────────────────────────────────
 # 清单由渠道的四槽配置在本地合成,不联网。这一节走沙箱入口:正式实例此刻是官方模式,
