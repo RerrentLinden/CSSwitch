@@ -6,6 +6,8 @@ DeepSeek 渠道把 Claude Science 的推理流量转到 DeepSeek 官方的 Anthr
 它走与 Kimi 相同的契约驱动中继路径，差异全在 `RelayFlavor::DeepSeek` 上。本规格约束这个渠道的契约、默认模型槽、六条补偿、
 thinking / effort 的处理边界与模型探测。补偿实现在 `desktop/gateway/src/deepseek_compat.rs`，每条带规则 ID 与单测。
 补偿的通用规则见 [provider-compensation](../provider-compensation/spec.md)。
+Key 被上游拒绝（401）与上游限流时回给 Science 的样子，见 [gateway-routing](../gateway-routing/spec.md)
+「relay 把上游 401 改报 403」「relay 错误响应只转发 retry-after」。
 
 ## Requirements
 

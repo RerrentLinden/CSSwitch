@@ -3,7 +3,7 @@
 ## Purpose
 
 CSSwitch 接管的是**用户自己的** Claude Science 实例、自己的登录、自己的对话库，不做数据隔离。
-本规格约束 Science daemon 的启动参数、环境、状态判定、切换与退出：这里每一条被违反，损害的都是用户的真实数据。
+本规格约束 Science daemon 的启动参数、环境、状态判定（含是否经 CSSwitch 启动、有没有会话正在进行）、切换与退出：这里每一条被违反，损害的都是用户的真实数据。
 改动 Science daemon 启动、停止、状态判定或配置存储时适用。启动覆盖项（镜像配置、联网搜索总开关）见
 [science-launch-overrides](../science-launch-overrides/spec.md)。
 
@@ -102,20 +102,79 @@ CSSwitch MUST NOT 写、读或伪造官方实例的任何 auth 状态。
 - **WHEN** daemon 未运行而 `status` 仍以 0 退出
 - **THEN** CSSwitch 按输出内容判定为未运行
 
+### Requirement: 识别不是经 CSSwitch 启动的 daemon
+
+正在运行的官方 daemon 不是经 CSSwitch 启动时，它的环境里没有网关地址，流量不经过 CSSwitch，控制台的选择对它不生效。
+CSSwitch MUST 只从已取得的 `status` 输出推导这一点，MUST NOT 为此另读文件、另起进程：
+
+- `daemon.launch_context == "app-child"` → `app`；
+- 顶层 `port` 不等于 8686 → `port`；
+- 两者都成立取 `app`。
+
+daemon 未运行、输出缺失，或不是 `app-child` 而端口缺失 / 不是数字时 MUST NOT 判：宁可漏报，也不把经 CSSwitch 启动的误报成别人的。
+
+#### Scenario: 报告 app-child
+
+- **WHEN** `status` 报告在运行且 `daemon.launch_context` 是 `app-child`（端口是不是 8686 都一样）
+- **THEN** 判定结果是 `app`
+
+#### Scenario: 端口不是 8686
+
+- **WHEN** `status` 报告在运行，端口是 8000，`launch_context` 不是 `app-child`
+- **THEN** 判定结果是 `port`
+
+#### Scenario: 经 CSSwitch 启动
+
+- **WHEN** `status` 报告在运行，端口是 8686，`launch_context` 是 `launchd` 或 `terminal`
+- **THEN** 判定结果为空
+
+#### Scenario: 判断不了
+
+- **WHEN** daemon 未运行，或输出里既没有 `app-child` 也没有数字端口
+- **THEN** 判定结果为空
+
+### Requirement: 归属结果只报告、不动 Science
+
+归属结果 MUST 放在 `GET /control/status` 的 `science.unmanaged = {"reason": "app" | "port"}`；判定结果为空时这一项 MUST NOT 出现。
+新键 MUST NOT 叫 `mode`（理由见 [sandbox-science-instance](../sandbox-science-instance/spec.md)「状态接口与日志的字段」）。
+CSSwitch MUST NOT 因此自动停止或重启 Science，也 MUST NOT 为此新增状态文件；由控制台提示用户（见 [console-webui](../console-webui/spec.md)「提示 Science 不是经 CSSwitch 启动的」）。
+
+#### Scenario: 端口不符时读状态
+
+- **WHEN** 正在运行的 daemon 报告端口 8000，请求 `GET /control/status`
+- **THEN** `science` 下有 `"unmanaged":{"reason":"port"}`，整个状态里仍只有一个 `mode` 键
+- **AND** Science 没有被停止或重启
+
+#### Scenario: 经 CSSwitch 启动时读状态
+
+- **WHEN** daemon 报告端口 8686、`launch_context` 是 `launchd`
+- **THEN** 状态里没有 `unmanaged`
+
 ### Requirement: 切换供应商要重启且先确认
 
 `base_url` 只在 daemon 启动时读取，切换供应商 MUST 重启 daemon。重启会打断进行中的会话
-（Science 侧显示 `This session was interrupted by a restart`），因此有活跃会话且请求未带 `force` 时 MUST 拒绝切换。
+（Science 侧显示 `This session was interrupted by a restart`），因此有会话正在进行且请求未带 `force` 时 MUST 拒绝切换。
 
-#### Scenario: 有活跃会话且未确认
+「有会话正在进行」MUST 是 `status` 输出里 `daemon.active_conversations` 与 `daemon.active_frames` 任一大于 0
+（frame 数含子 agent、Reviewer；Science 自己判断能否替换旧 daemon 看的是 frame 数）。拒绝文案报告的数字取对话数，
+对话数为 0 时取 frame 数。渠道校验与这项判定 MUST 都在存盘之前：被拒绝时配置与 Science 都不变。
+联网搜索与跳过审批两个启动开关沿用同一个定义，见 [science-launch-overrides](../science-launch-overrides/spec.md)。
+
+#### Scenario: 有会话正在进行且未确认
 
 - **WHEN** `daemon.active_conversations > 0` 且请求未带 `force`
-- **THEN** 切换被拒绝并报告会话数，不静默打断
-- **AND** 配置与 Science 都不变
+- **THEN** 切换被拒绝并报告对话数，不静默打断
+- **AND** 配置文件逐字节不变，Science 没有被重启
+
+#### Scenario: 只有 frame 在跑
+
+- **WHEN** `daemon.active_frames > 0` 而 `daemon.active_conversations == 0`，请求未带 `force`
+- **THEN** 切换被拒绝，文案里的数字是 frame 数
+- **AND** 配置文件逐字节不变，Science 没有被重启
 
 #### Scenario: 已确认
 
-- **WHEN** 有活跃会话且请求带 `force`
+- **WHEN** 有会话正在进行且请求带 `force`
 - **THEN** daemon 被重启并使用新的供应商
 
 ### Requirement: 渠道配置不完整时拒绝切换

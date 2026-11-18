@@ -9,6 +9,9 @@ science_config::launch_config(&overrides, source, mirror) -> Result<Option<PathB
   mirror(0600): ~/.csswitch/science-config/official.toml
 control::launch_overrides(profile, instance) -> LaunchOverrides   # 五个启动点唯一的取值处
 POST /control/web-search {"enabled": bool, "force"?: bool}
+POST /control/skip-approvals {"enabled": bool, "force"?: bool}   # 与上一条同一个 set_launch_switch
+control::plan_launch_switch(current, target, running, active, force) -> LaunchSwitchPlan   # 纯判定
+control::science_activity(&status) -> (running, active)   # 与切换模式共用的忙闲判定
 ```
 
 沙箱一侧：source 是 `<沙箱 data-dir>/config.toml`（只读），mirror 是 `~/.csswitch/science-config/sandbox.toml`，
@@ -27,7 +30,9 @@ POST /control/web-search {"enabled": bool, "force"?: bool}
   表数组的源（除覆盖的键外逐值相等、键在根表）；源里原本就有 `enable_web_search = true` 或自己的
   `default_model`（被覆盖，不得出现重复键）；源无法解析（报错、不写镜像、报错不含文件内容）；
   源读不了不等于空配置；源目录零写入；权限 `0600` / `0700`。
-- `control::tests`：切换判定纯函数的四条分支；请求体的 `enabled` / `force` 必须是布尔；
+- `control::tests`：切换判定纯函数的四条分支（`launch_switch_never_interrupts_sessions_without_consent`）；
+  只有 frame 在跑时同样需要确认、数字取 frame 数（`running_frames_alone_count_as_sessions_in_progress`）；
+  请求体的 `enabled` / `force` 必须是布尔；
   `launch_overrides` 对两个实例各取各的模式（正式实例官方、沙箱走渠道 → 正式实例 `None`、沙箱
   `claude-sonnet-19`；把沙箱写成取 `profile.mode`，或把正式实例写成取 `sandbox_mode`，这条会红）。
 - loopback 层的启动覆盖项：官方模式 + 开启态 `serve` 整行等于主线；官方模式 + 关闭态整行带
@@ -56,7 +61,8 @@ service.v1.json: web_search
 
 **生效时机**:网关一侧存盘后下一次请求即生效,且不依赖 Science 是否已重启、是否认识这个选项。
 Science 一侧要重启:`POST /control/web-search` 在官方实例运行时会重启它,有会话正在进行且未带
-`force` 时拒绝并且不改任何状态;镜像生成不出来同样在存盘之前报错。重启失败不回滚,原文报出
+`force` 时拒绝并且不改任何状态(「有会话正在进行」是对话数或 frame 数任一大于 0,与切换模式、跳过审批同一个
+`science_activity`;2026-11-18 起才把 frame 数算进来,依据见 [official-science-instance](../official-science-instance/design.md));镜像生成不出来同样在存盘之前报错。重启失败不回滚,原文报出
 (此时开关已改、Science 未按新设置运行;拨回开启再启动就是原始启动方式)。免登录沙箱不自动重启,
 响应里用 `sandbox_restart_required` 标出。
 

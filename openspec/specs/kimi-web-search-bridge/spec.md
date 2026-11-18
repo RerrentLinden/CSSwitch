@@ -171,6 +171,32 @@ MUST NOT 为元数据差异丢弃整轮已完成的回答。
 - **WHEN** 合并后的流很大
 - **THEN** 可以渲染；超大单帧仍显式失败
 
+### Requirement: 流已打开后的上游失败以 SSE 收尾
+
+桥里 main / nested / synthesis 任一次上游调用失败，MUST 与非桥路径用同一套回复（[gateway-routing](../gateway-routing/spec.md)
+「relay 把上游 401 改报 403」「relay 错误响应只转发 retry-after」）。
+
+流式路径在第一次上游调用之前就已写出 200 头与 `: bridge processing` 注释帧，状态码与响应头都改不了。此后上游回 401 时，
+MUST 以 `event: error` 收尾，`data` 是与非流式相同的那份 `permission_error` 正文；MUST NOT 退回成 `api_error`
+（Science 会把它当成服务端错误反复重试）。注释帧的位置不变。流式下 MUST NOT 指望带上 `retry-after`：响应头已经发出。
+非流式路径以 HTTP 状态返回，带的是失败那一次上游调用的合规 `retry-after`。
+
+#### Scenario: 流式搜索轮的 Key 被拒
+
+- **WHEN** 流式请求声明了 typed search 走桥，上游回 401
+- **THEN** 响应状态是 200，先有 `: bridge processing` 注释帧，随后是 `event: error`，`data` 与非流式的 403 正文相同
+- **AND** 流里没有 `api_error`
+
+#### Scenario: 非流式桥接的某一阶段被拒
+
+- **WHEN** 非流式桥接请求的主调用成功，nested 调用回 401 并带 `retry-after: 30`、`x-should-retry`、`anthropic-ratelimit-unified-status`
+- **THEN** Science 收到 403 与同一份 `permission_error` 正文，响应头带 `retry-after: 30`，不带另外两个
+
+#### Scenario: 流已打开后上游限流
+
+- **WHEN** 流式桥接请求在流已打开后某阶段收到 429
+- **THEN** 失败以流内 `event: error` 呈现，响应里没有 `retry-after`
+
 ### Requirement: 原生路径与响应过滤
 
 原生 typed 路径 SHALL 保留作为 nested executor；nested 响应继续经过 noise / phantom / adoption。
