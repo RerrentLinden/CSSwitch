@@ -29,8 +29,11 @@ scratchpad/
 /.codex/
 /.kimi-code/
 
-# OpenSpec:跟踪配置、规格与编码规范;进行中的变更留在本机
+# OpenSpec:跟踪配置、规格、编码规范、总览与任务证据;进行中的变更留在本机
 /openspec/*
 !/openspec/config.yaml
 !/openspec/specs/
 !/openspec/conventions/
+!/openspec/README.md
+!/openspec/ARCHITECTURE.md
+!/openspec/evidence/

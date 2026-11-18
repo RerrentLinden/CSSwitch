@@ -1,5 +1,5 @@
 #!/bin/bash
-# 由 social-preview.html 渲染 docs/assets/social-preview.png(1280×640,入库)。
+# 由 social-preview.html 渲染同目录的 social-preview.png(1280×640,入库)。
 #
 #   bash packaging/brand/build.sh
 #
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="$DIR/../../docs/assets/social-preview.png"
+OUT="$DIR/social-preview.png"
 CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 [ -x "$CHROME" ] || { echo "env-blocked: 找不到 Google Chrome($CHROME)" >&2; exit 3; }
 
@@ -47,4 +47,4 @@ if [ "$width" != 1280 ] || [ "$height" != 640 ]; then
 fi
 mkdir -p "$(dirname "$OUT")"
 cp "$PNG" "$OUT"
-echo "已生成 docs/assets/social-preview.png(${width}×${height})"
+echo "已生成 packaging/brand/social-preview.png(${width}×${height})"

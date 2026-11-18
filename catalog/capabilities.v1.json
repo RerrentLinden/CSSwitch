@@ -96,7 +96,7 @@
       "reason": "Kimi Code's Anthropic endpoint has no verified execution contract for these provider-owned declarations. CSSwitch drops only the typed forms and recomputes tool_choice; ordinary Python, Bash, Compute, web_search functions and host.mcp orchestration remain client-owned. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
         "desktop/gateway/src/anthropic_compat.rs",
-        "docs/evidence/08-03-kimi-protocol-compatibility/research/official-provider-capability-matrix.md"
+        "openspec/evidence/08-03-kimi-protocol-compatibility/research/official-provider-capability-matrix.md"
       ],
       "tests": [
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_all_unsupported_tools_remove_every_tool_choice_shape"
@@ -114,8 +114,8 @@
       "action": "normalize",
       "reason": "Claude Science sends a non-standard thinking type of `auto`. Live probes against api.kimi.com/coding show the k3 family silently returns no thinking blocks for `auto` (and for `adaptive`), while omitting the field entirely leaves the upstream default thinking on for all four published models. CSSwitch therefore removes only those two non-standard values and passes the standard `enabled`/`disabled` through untouched. Rewriting to `enabled` would also work upstream but would pull in the thinking-continuity store, which this upstream does not need: live multi-turn probes confirm it accepts history whose assistant thinking blocks were stripped, including messages carrying tool_use, so the DeepSeek chain-break defect does not apply here. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
-        "docs/evidence/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        "docs/evidence/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
+        "openspec/evidence/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
+        "openspec/evidence/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
@@ -136,8 +136,8 @@
       "action": "degrade",
       "reason": "Kimi for Coding rejects `tool_choice: {\"type\": \"tool\"}` with 400 `tool_choice 'specified' is incompatible with thinking enabled` whenever thinking is on, and its thinking is on by default, so a request that merely omits the field still fails. A captured Claude Science session reproduces this on every work-item classifier call. CSSwitch keeps the forced tool — the classifier depends on receiving structured output — and sets thinking to disabled for that one request instead. The `any` and `auto` forms are unaffected upstream and are deliberately left alone, unlike the DeepSeek policy which disables thinking for both. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
-        "docs/evidence/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        "docs/evidence/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
+        "openspec/evidence/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
+        "openspec/evidence/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
@@ -156,8 +156,8 @@
       "action": "degrade",
       "reason": "Kimi for Coding's Anthropic surface does not implement the `document` content block. Live probes show every source form fails identically — base64 application/pdf, text/plain, url, and a bare {\"type\":\"document\"} with no source — each returning the opaque `400 invalid_request_error: \"Invalid request Error\"`. A control block type that does not exist at all returns that same message, which places `document` in the parser's unknown-block path rather than a format mismatch. Because the block persists in conversation history, one attachment fails every later turn of the session. This is the payload of Claude Science's platform PDF-vision path: a captured session shows read_file(pages=[1]) returning tool_result {\"status\":\"queued_for_vision\"} followed by a \"[System] Attached file\" text block and the PDF as a `document` block. That payload is a real PDF rather than a pre-rendered image: media_type application/pdf, 134 KB against a 1.28 MB 21-page file on disk, i.e. the requested pages extracted into a smaller PDF. Rasterising it is the model provider's job — official Anthropic supports PDF document blocks natively — so on this upstream nothing arrives to render. That platform path therefore does not work on this channel, and CSSwitch cannot make it work — it replaces each block with an attributed note naming the media type so the turn survives instead of failing, and points at the route that does work. Reading PDFs is still possible: the agent can render pages locally and pass them as image blocks, which this upstream accepts; a live session read a scanned patent exactly that way. The loss is not a CSSwitch regression relative to sibling channels either — DeepSeek's endpoint accepts the same block but answers CANNOT_READ with or without it, for both a synthetic marker PDF and the real 133 KB patent. Image blocks are untouched. 开放平台与订阅制编码端点共用一个 contract：证据来自 api.kimi.com/coding 的实测，开放平台按用户判定沿用同一套补偿，未独立实测。",
       "evidence": [
-        "docs/evidence/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
-        "docs/evidence/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
+        "openspec/evidence/08-06-kimi-for-coding-channel/research/upstream-probe-2026-08-06.md",
+        "openspec/evidence/08-06-kimi-for-coding-channel/research/science-raw-capture-2026-08-06.md",
         "desktop/gateway/src/anthropic_compat.rs"
       ],
       "tests": [
@@ -178,8 +178,8 @@
       "action": "repair_web_search_history_pairing",
       "reason": "Science 历史可能只保留孤立 web_search_tool_result，或 Kimi 自己发出的 web_search server use/result ID 不一致；回放会 400 tool_call_id is not found。只绑定 name=web_search 的前置调用：错配时对齐、孤儿时补同 ID use；只有 idless result 的 content 精确为 [] 才删除，malformed content 不静默吞掉。",
       "evidence": [
-        "docs/evidence/08-19-search-error-triage/research/2026-08-19-live-evidence.md",
-        "docs/evidence/08-19-kimi-web-search-review/research/2026-08-20-bridge-implementation-live.md"
+        "openspec/evidence/08-19-search-error-triage/research/2026-08-19-live-evidence.md",
+        "openspec/evidence/08-19-kimi-web-search-review/research/2026-08-20-bridge-implementation-live.md"
       ],
       "tests": [
         "desktop/gateway/src/anthropic_compat.rs::tests::kimi_aligns_the_mismatched_web_search_result_id",
@@ -200,9 +200,9 @@
       "action": "bridge_web_search_via_private_query_tool",
       "reason": "K3、K3-256k、K2.7 对完整 Science envelope 的 inline server-search planner/answer 行为不一致。主请求把 typed search 映射为私有 query tool，让模型决定是否搜索；私有 tool 复用公开名 web_search（模型会在可见 thinking 里复述工具名，私有名必泄漏，2026-08-20 真机 2/2 复现），同名冲突按 name 显式拒绝。搜索时发 forced nested 原生 Web Search（全模型一致强制，无白名单），nested 无正文且无未决 client tool 才 bounded synthesis；搜索+普通工具混合轮跳过 synthesis 以 tool_use 交回 Science。非搜索一调用、搜索二/三调用；三阶段共享 180s deadline，证据 512KiB 上限同时作用于直通合并路径，无 retry/fallback。原生 typed 路径保留为 nested executor。",
       "evidence": [
-        "docs/evidence/08-19-kimi-web-search-review/research/2026-08-20-k27-adapter.md",
-        "docs/evidence/08-19-kimi-web-search-review/research/2026-08-20-bridge-implementation-live.md",
-        "docs/evidence/08-19-kimi-web-search-review/research/2026-08-20-bridge-code-review-live.md"
+        "openspec/evidence/08-19-kimi-web-search-review/research/2026-08-20-k27-adapter.md",
+        "openspec/evidence/08-19-kimi-web-search-review/research/2026-08-20-bridge-implementation-live.md",
+        "openspec/evidence/08-19-kimi-web-search-review/research/2026-08-20-bridge-code-review-live.md"
       ],
       "tests": [
         "desktop/gateway/src/kimi_web_search_adapter.rs::tests::the_kimi_contract_replaces_typed_search_for_every_model",

@@ -6,4 +6,4 @@
 - [已知问题与证据缺口](known-issues.md)
 - [历史 v0.5.0 文档审查说明](document-audit.md)
 
-context 是日期化快照，使用前先实时复核。稳定行为放入 [`rules/`](../rules/)，架构与运维正文放入 [`docs/`](../../docs/README.md)，短期下一步放入 [`handoffs/`](../handoffs/README.md)。
+context 是日期化快照，使用前先实时复核。稳定行为放入 [`rules/`](../rules/)，架构与运维正文放入 [`openspec/`](../../openspec/README.md)，短期下一步放入 [`handoffs/`](../handoffs/README.md)。
