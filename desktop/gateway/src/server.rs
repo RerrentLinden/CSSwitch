@@ -106,9 +106,25 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> bool {
+    write_response_with_headers(stream, status, reason, content_type, &[], body)
+}
+
+/// `extra_headers` 的名字与值都必须是校验过的(不含 CR / LF)。
+fn write_response_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> bool {
+    let extra: String = extra_headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     )
     .and_then(|_| stream.write_all(body))
@@ -121,6 +137,17 @@ fn write_json(stream: &mut TcpStream, status: u16, reason: &str, value: Value) {
     write_response(stream, status, reason, "application/json", &body);
 }
 
+/// Anthropic 形状的错误正文。
+fn error_body(error_type: &str, message: &str) -> Value {
+    json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message,
+        },
+    })
+}
+
 fn typed_error_json(
     stream: &mut TcpStream,
     status: u16,
@@ -128,18 +155,7 @@ fn typed_error_json(
     error_type: &str,
     message: &str,
 ) {
-    write_json(
-        stream,
-        status,
-        reason,
-        json!({
-            "type": "error",
-            "error": {
-                "type": error_type,
-                "message": message,
-            },
-        }),
-    );
+    write_json(stream, status, reason, error_body(error_type, message));
 }
 
 fn forbidden_json(stream: &mut TcpStream) {
@@ -162,22 +178,89 @@ fn api_error_json(stream: &mut TcpStream, status: u16, detail: &str) {
     typed_error_json(stream, status, status_reason(status), "api_error", detail);
 }
 
+/// relay 路径上一次上游失败回给 Science 的样子。非流式、开流前失败与 Kimi 搜索桥各阶段都由
+/// [`relay_failure_reply`] 构造,日志行里的 `status=` 也取这里的状态码。官方直通不经过这里:
+/// 那条路上的 401 确实是 Claude 登录问题,原样到达 Science。
+struct RelayFailureReply {
+    status: u16,
+    body: Value,
+    /// 只带这一个上游响应头;其余(`anthropic-ratelimit-*`、`x-should-retry`、`request-id` 等)
+    /// 一律不转,否则第三方的限流会被 Science 当成 Claude 订阅的用量暂停 / 额度不足。
+    retry_after: Option<String>,
+}
+
+fn relay_failure_reply(cfg: &GatewayConfig, error: &messages::UpstreamError) -> RelayFailureReply {
+    let retry_after = error.retry_after.clone();
+    if error.upstream_status == Some(401) {
+        // Science 把推理接口的 401 一律当成自己的登录失效:丢掉正文,以「请登出再登录」结束
+        // 这一轮。渠道 Key 被拒与 Claude 登录无关,改报 403:Science 对不带 error_code 的 403
+        // 不重试、不碰登录状态,并把正文显示给用户。
+        let message = channel_key_rejected_message(channel_display_name(cfg));
+        return RelayFailureReply {
+            status: 403,
+            body: with_display_message(error_body("permission_error", &message)),
+            retry_after,
+        };
+    }
+    RelayFailureReply {
+        status: error.status,
+        body: error_body("api_error", &error.detail),
+        retry_after,
+    }
+}
+
+/// 渠道在界面上的名字,与控制台的模式标签一致(Kimi / DeepSeek)。
+fn channel_display_name(cfg: &GatewayConfig) -> &'static str {
+    crate::profile::Mode::for_adapter(&cfg.provider).map_or("第三方", |mode| mode.display_name())
+}
+
+fn channel_key_rejected_message(channel: &str) -> String {
+    format!(
+        "{channel} 渠道拒绝了 API Key(上游返回 401)。请在 CSSwitch 控制台的「渠道配置」里检查这个渠道的 Key。"
+    )
+}
+
+/// 在错误正文顶层再放一份 `error.message`,让 Science 显示这句话本身。
+///
+/// Science 内嵌的 SDK 生成错误文字时,正文顶层有 `message` 就用它,否则把整段 JSON 字符串化
+/// 后显示;它做错误分类读的是 `error.message`,不受这份副本影响。只用在写给用户看的文案上;
+/// 哪天 Science 自己能好好显示错误正文,删掉这个函数与它的调用即可。
+fn with_display_message(mut body: Value) -> Value {
+    if let Some(message) = body.pointer("/error/message").cloned() {
+        body["message"] = message;
+    }
+    body
+}
+
+fn write_relay_failure(stream: &mut TcpStream, reply: RelayFailureReply) {
+    let retry_after = reply
+        .retry_after
+        .as_deref()
+        .map(|value| ("retry-after", value));
+    write_response_with_headers(
+        stream,
+        reply.status,
+        status_reason(reply.status),
+        "application/json",
+        retry_after.as_slice(),
+        &json_bytes(reply.body),
+    );
+}
+
 fn report_upstream_failure(
     stream: &mut TcpStream,
+    cfg: &GatewayConfig,
     operation: &'static str,
     error: &messages::UpstreamError,
 ) {
-    crate::log_line!("{}", messages::upstream_failure_metadata(operation, error));
+    let reply = relay_failure_reply(cfg, error);
+    let metadata = messages::upstream_failure_metadata(operation, reply.status, error);
+    crate::log_line!("{metadata}");
     crate::debug_capture::write(
         "error.txt",
-        format!(
-            "{}\n{}",
-            messages::upstream_failure_metadata(operation, error),
-            error.detail
-        )
-        .as_bytes(),
+        format!("{metadata}\n{}", error.detail).as_bytes(),
     );
-    api_error_json(stream, error.status, &error.detail);
+    write_relay_failure(stream, reply);
 }
 
 fn status_reason(status: u16) -> &'static str {
@@ -338,17 +421,11 @@ fn strip_stats_suffix(stats: &kimi_search_noise::StripStats) -> String {
 }
 
 fn stream_error_event(detail: &str) -> Vec<u8> {
-    format!(
-        "event: error\ndata: {}\n\n",
-        json!({
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": detail,
-            },
-        })
-    )
-    .into_bytes()
+    sse_error_event(&error_body("api_error", detail))
+}
+
+fn sse_error_event(body: &Value) -> Vec<u8> {
+    format!("event: error\ndata: {body}\n\n").into_bytes()
 }
 
 fn forward_stream_body<R, F>(
@@ -875,7 +952,7 @@ fn handle_stream(
     let mut upstream = match messages::open_stream(cfg, body, transport) {
         Ok(upstream) => upstream,
         Err(error) => {
-            report_upstream_failure(stream, "open_stream", &error);
+            report_upstream_failure(stream, cfg, "open_stream", &error);
             return;
         }
     };
@@ -923,6 +1000,30 @@ fn adapter_error(stream: &mut TcpStream, head_written: bool, status: u16, detail
         }
     } else {
         api_error_json(stream, status, detail);
+    }
+}
+
+/// 桥里某一次上游调用失败:与非桥路径同一套改报(含渠道 Key 被拒与 `retry-after`)。
+/// 流式响应的头在第一次上游调用之前就已发出,这时状态码与响应头都改不了,只能把同一份
+/// 正文作为 SSE 错误事件收尾。
+fn adapter_upstream_failure(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    head_written: bool,
+    operation: &'static str,
+    error: &messages::UpstreamError,
+) {
+    let reply = relay_failure_reply(cfg, error);
+    crate::log_line!(
+        "{}",
+        messages::upstream_failure_metadata(operation, reply.status, error)
+    );
+    if head_written {
+        if write_chunk(stream, &sse_error_event(&reply.body)).is_ok() {
+            finish_chunked_stream(stream);
+        }
+    } else {
+        write_relay_failure(stream, reply);
     }
 }
 
@@ -1021,11 +1122,13 @@ fn handle_kimi_web_search_adapter(
             }
         },
         Err(error) => {
-            crate::log_line!(
-                "{}",
-                messages::upstream_failure_metadata("kimi_web_search_adapter_main", &error)
+            adapter_upstream_failure(
+                stream,
+                cfg,
+                head_written,
+                "kimi_web_search_adapter_main",
+                &error,
             );
-            adapter_error(stream, head_written, error.status, &error.detail);
             return;
         }
     };
@@ -1092,8 +1195,7 @@ fn handle_kimi_web_search_adapter(
                     "kimi_web_search_adapter_synthesis"
                 }
             };
-            crate::log_line!("{}", messages::upstream_failure_metadata(operation, &error));
-            adapter_error(stream, head_written, error.status, &error.detail);
+            adapter_upstream_failure(stream, cfg, head_written, operation, &error);
             return;
         }
     };
@@ -1408,7 +1510,7 @@ fn handle_messages(
                     &resp.body,
                 );
             }
-            Err(e) => report_upstream_failure(stream, "post_nonstream", &e),
+            Err(e) => report_upstream_failure(stream, cfg, "post_nonstream", &e),
         }
     }
 }
@@ -1619,9 +1721,10 @@ mod tests {
 
     use super::{
         forward_stream_body, handle_kimi_web_search_adapter, handle_messages, merged_shape,
-        pair_key_prefix, relay_server_tool_types, relay_thinking_type, stream_error_event,
-        stream_strip_rules, strip_stats_suffix, StreamTermination,
+        pair_key_prefix, relay_failure_reply, relay_server_tool_types, relay_thinking_type,
+        stream_error_event, stream_strip_rules, strip_stats_suffix, StreamTermination,
     };
+    use crate::messages::UpstreamError;
 
     /// 从 `handle_messages` 一路打到 fake 上游,返回上游真正收到的 `tools`。
     /// 请求声明了 typed `web_search` 与一个普通客户端工具 `Bash`。
@@ -1986,6 +2089,193 @@ mod tests {
         for model in ["k3", "k3-256k", "kimi-for-coding"] {
             run_kimi_query_adapter_fake(model);
         }
+    }
+
+    fn relay_config(provider: &str, upstream_url: String) -> crate::config::GatewayConfig {
+        crate::config::GatewayConfig {
+            provider: provider.into(),
+            port: 0,
+            auth_secret: None,
+            api_key: Some("fake-key".into()),
+            upstream_url,
+            models_url: None,
+            relay_thinking: None,
+            provider_contract: None,
+            intent: crate::config::GatewayIntent::Formal,
+            static_model_resolver: None,
+            shim_mode: "off".into(),
+            launch_id: "relay-failure-test".into(),
+            web_search: true,
+        }
+    }
+
+    fn key_rejected_body(channel: &str) -> Value {
+        let message = format!(
+            "{channel} 渠道拒绝了 API Key(上游返回 401)。请在 CSSwitch 控制台的「渠道配置」里检查这个渠道的 Key。"
+        );
+        json!({
+            "type": "error",
+            "error": {"type": "permission_error", "message": message},
+            "message": message,
+        })
+    }
+
+    #[test]
+    fn relay_upstream_401_is_reported_as_a_readable_403_naming_the_channel() {
+        // Science 把推理接口的 401 当成自己的登录失效,只显示「请登出再登录」。渠道 Key 被拒
+        // 必须改报 403,正文里点名渠道,顶层另带一份 message 供 Science 直接显示;不得带
+        // error.details(带 error_code 的 403 会被 Science 归进别的分支),也不得带出上游正文。
+        for (provider, channel) in [("relay", "Kimi"), ("deepseek", "DeepSeek")] {
+            let reply = relay_failure_reply(
+                &relay_config(provider, String::new()),
+                &UpstreamError {
+                    status: 401,
+                    upstream_status: Some(401),
+                    detail: r#"upstream 401: {"error":{"message":"invalid key fake-key"}}"#.into(),
+                    retry_after: Some("30".into()),
+                },
+            );
+            assert_eq!(reply.status, 403, "{provider}");
+            assert_eq!(reply.body, key_rejected_body(channel), "{provider}");
+            assert!(!reply.body.to_string().contains("fake-key"));
+            assert_eq!(reply.retry_after.as_deref(), Some("30"));
+        }
+    }
+
+    #[test]
+    fn other_relay_failures_keep_their_status_and_body() {
+        for (status, upstream_status) in [
+            (403, Some(403)),
+            (404, Some(404)),
+            (429, Some(429)),
+            (500, Some(500)),
+            (529, Some(529)),
+            (502, Some(307)),
+            (502, None),
+        ] {
+            let detail = format!("upstream detail for {status}");
+            let reply = relay_failure_reply(
+                &relay_config("relay", String::new()),
+                &UpstreamError {
+                    status,
+                    upstream_status,
+                    detail: detail.clone(),
+                    retry_after: Some("17".into()),
+                },
+            );
+            assert_eq!(reply.status, status, "{upstream_status:?}");
+            assert_eq!(
+                reply.body,
+                json!({"type": "error", "error": {"type": "api_error", "message": detail}}),
+                "{upstream_status:?}"
+            );
+            assert_eq!(reply.retry_after.as_deref(), Some("17"));
+        }
+    }
+
+    fn raw_json_response(status_line: &str, extra_headers: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// 跑一轮 Kimi 搜索桥:上游第 `n` 次调用回 `respond(n, 请求)`。返回 Science 一侧收到的原始响应。
+    fn run_bridge(
+        downstream_stream: bool,
+        calls: usize,
+        respond: fn(usize, &Value) -> Vec<u8>,
+    ) -> String {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_url = format!("http://{}/v1/messages", upstream.local_addr().unwrap());
+        let upstream_thread = thread::spawn(move || {
+            for call in 0..calls {
+                let (mut stream, _) = upstream.accept().unwrap();
+                let request = read_http_json(&mut stream);
+                stream.write_all(&respond(call, &request)).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let mut main_request = json!({
+            "model": "k3", "max_tokens": 1024, "stream": downstream_stream,
+            "messages": [{"role": "user", "content": "latest Rust?"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        });
+        let prepared = crate::kimi_web_search_adapter::prepare_request(
+            &mut main_request,
+            crate::anthropic_compat::RelayFlavor::Kimi,
+        )
+        .unwrap()
+        .unwrap();
+        let cfg = relay_config("relay", upstream_url);
+        let downstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let downstream_addr = downstream_listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(downstream_addr).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+        let (mut downstream, _) = downstream_listener.accept().unwrap();
+        handle_kimi_web_search_adapter(
+            &mut downstream,
+            &cfg,
+            main_request,
+            None,
+            downstream_stream,
+            prepared,
+        );
+        drop(downstream);
+        upstream_thread.join().unwrap();
+        String::from_utf8(client.join().unwrap()).unwrap()
+    }
+
+    fn key_rejected_with_rate_headers() -> Vec<u8> {
+        raw_json_response(
+            "401 Unauthorized",
+            "retry-after: 30\r\nx-should-retry: false\r\nanthropic-ratelimit-unified-status: rejected\r\n",
+            r#"{"error":{"message":"invalid key fake-key"}}"#,
+        )
+    }
+
+    #[test]
+    fn bridge_stage_401_is_reported_like_any_other_relay_401() {
+        // 非流式:主轮成功、嵌套搜索轮被拒。回给 Science 的是失败那一次的改报与 retry-after,
+        // 上游别的响应头一个不带。
+        let response = run_bridge(false, 2, |call, request| {
+            if call == 0 {
+                let internal = request["tools"][0]["name"].as_str().unwrap();
+                let body = json!({
+                    "id": "main", "type": "message", "role": "assistant", "model": "k3",
+                    "content": [{"type": "tool_use", "id": "internal_1", "name": internal,
+                                 "input": {"query": "Rust stable release"}}],
+                    "stop_reason": "tool_use", "stop_sequence": null,
+                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                });
+                raw_json_response("200 OK", "", &body.to_string())
+            } else {
+                key_rejected_with_rate_headers()
+            }
+        });
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{head}");
+        assert!(head.contains("\r\nretry-after: 30\r\n"), "{head}");
+        assert!(!head.contains("x-should-retry"), "{head}");
+        assert!(!head.contains("anthropic-ratelimit"), "{head}");
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            key_rejected_body("Kimi")
+        );
+
+        // 流式:响应头在第一次上游调用之前就已发出,只能以同一份正文的 SSE 错误事件收尾 ——
+        // 不能退回成 Science 会反复重试的 api_error。
+        let response = run_bridge(true, 1, |_, _| key_rejected_with_rate_headers());
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        let expected = format!("event: error\ndata: {}\n\n", key_rejected_body("Kimi"));
+        assert!(response.contains(&expected), "{response}");
+        assert!(!response.contains("api_error"), "{response}");
+        assert!(!response.contains("fake-key"), "{response}");
     }
 
     #[test]
