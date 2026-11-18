@@ -18,6 +18,10 @@ daemon 控制逻辑后跑一遍。
 
 ## B. 第三方模式(Kimi / DeepSeek 各跑一遍)
 
+**已有的真机记录(2026-11-18,四个分支合并后的开发构建,代码与 `main@0513908` 一致,不是安装版):**
+对真实 Kimi 渠道发过 4 条请求 —— 非流式、流式、客户端工具调用、联网搜索桥各一条,全部正常。
+这只是 §J–§M 那几项改动之后的回归,不是本节的完整验收:DeepSeek 未执行,下面各步没有逐项记录。
+
 1. 控制台「渠道配置」填 base_url 与 API Key,点「获取可用模型」应列出真实模型。
 2. 四槽按需填写;留空槽应继承默认槽。保存。
 3. 切换到该模式,确认 Science 自动重启并给出新登录链接。
@@ -301,3 +305,135 @@ Science 拿到隧道之后能做成什么,只有真机能回答。
    判据:列出仓库里的技能;没有 `Proxy refused to open a tunnel`。
 2. 对控制台分别 `CONNECT` 一个第三方主机与 `api.anthropic.com`(`curl --noproxy '' -x http://127.0.0.1:8788 -w '%{http_connect}'`)。
    判据:前者 200,后者 404。
+
+## J. 渠道 Key 被拒与限流
+
+离线门禁证明的是网关一侧:relay 路径上游回 401 时改报 403 + 点名渠道的正文,Kimi 搜索桥流已打开时以同一份正文的
+SSE 错误事件收尾,错误响应只带合规的 `retry-after`(合同见
+[gateway-routing](../openspec/specs/gateway-routing/spec.md)、[kimi-web-search-bridge](../openspec/specs/kimi-web-search-bridge/spec.md))。
+Science 收到之后显示什么、会不会重试、会不会让人重新登录 Claude,只有真机能回答。
+
+**已有的真机记录(2026-11-18,真实 Science 0.1.72 + 假上游,临时目录里的隔离免登录沙箱;被测的是四个分支合并后的
+开发构建,代码与 `main@0513908` 一致,不是安装版):**
+
+| 场景 | 改动前 Science 显示 | 合并后的构建 |
+| --- | --- | --- |
+| Key 被拒,联网搜索开着(走 Kimi 搜索桥) | `Claude is temporarily unavailable — retrying in Ns`,3 分钟内重试 9 次仍在继续 | 只失败一次,显示「Kimi 渠道拒绝了 API Key(上游返回 401)。请在 CSSwitch 控制台的「渠道配置」里检查这个渠道的 Key。」 |
+| Key 被拒,联网搜索关着 | `Your Claude session is no longer valid. Please sign out and sign in again.` | 显示 `403` 与同一句说明 |
+| 上游回 429 并带 `retry-after: 12`,同时带两个会被误读的限额头 | — | 显示 `Claude is at capacity — retrying`,12.45 秒后重试成功;没有出现订阅额度类提示 |
+
+这一轮的边界:
+
+- 401 与 429 都来自假上游;真实供应商拒绝 Key、真实限流时的响应没有在真机上看过。
+- 前两项只在 Kimi 渠道上看过。DeepSeek 的改报只有单测与 loopback(沙箱入口非流式)。
+- 未执行:官方模式下 Claude 登录失效时 401 原样到达(只有单测);Kimi 搜索桥流已打开之后的 429
+  (这条路径带不了 `retry-after`,Science 按自己的节奏重试);HTTP 日期写法的 `retry-after`。
+
+前提:用隔离的免登录沙箱(临时 HOME),渠道地址指向一个能按需回 401、429 并带指定响应头的假上游;
+不要拿真实 Key 去制造 401。「记录请求日志」保持开启,每一步用**全新会话**。
+
+1. 假上游对推理请求回 401;联网搜索开着,渠道是 Kimi(主对话走搜索桥),发一条消息。
+   判据:只失败一次,显示上表那句点名 Kimi 的说明;不出现 `Claude is temporarily unavailable`,也不反复重试;
+   服务日志有 `upstream_failure operation=kimi_web_search_adapter_main status=403 upstream_status=Some(401)`。
+2. 关掉联网搜索,重复第 1 步。
+   判据:显示 `403` 与同一句说明;不出现 `Your Claude session is no longer valid`。
+3. 假上游回 429,带 `retry-after: <N>`、`anthropic-ratelimit-unified-status`、`x-should-retry`。
+   判据:显示 `Claude is at capacity — retrying`,约 N 秒后重试;不出现订阅额度或用量暂停类的提示。
+4. 渠道换成 DeepSeek,重复第 2 步。判据:说明里点名的是 DeepSeek。
+
+## K. 归属识别与忙闲判定
+
+离线门禁证明的是:从 `status` 输出推导「不是经 CSSwitch 启动的」(端口不是 8686,或 `launch_context` 是 `app-child`),
+以及只有 frame 在跑时切换模式被拒且配置文件逐字节不变(合同见
+[official-science-instance](../openspec/specs/official-science-instance/spec.md))。真实 Science 在各种拉起方式下报什么、
+控制台的提示与确认框在真实页面上是否出现,要在真机上看。
+
+**已有的隔离验收(2026-11-18,临时目录里的真实控制台,`claude-science` 的 status 输出用替身;被测的是四个分支合并后的
+开发构建,代码与 `main@0513908` 一致,不是安装版):**
+
+| 观察 | 结果 |
+| --- | --- |
+| 替身报 `app-child`,或报 8686 以外的端口 | 状态接口带 `unmanaged`,控制台「当前连接」卡片出现提示行 |
+| 替身报 8686 + `launchd` | 不出现 |
+| 把一台经 CSSwitch 启动的真实 Science 0.1.72 实例的 status 输出原样喂进来 | 不误报 |
+| 只有 frame 在跑(对话数为 0) | 切换模式与联网搜索开关都被拒并弹出确认,配置文件哈希不变 |
+
+**真实场景(2026-11-18 晚间,真机观察):** 机器重启并登录后,Claude Science 的桌面 App 自己拉起了 daemon,
+进程命令行是 `claude-science serve --app`,`status` 报 `port: 8765`、`daemon.launch_context: "launchd"`(不是 `app-child`)、
+`daemon.skip_approvals: false`;这个 daemon 没有带 CSSwitch 的网关地址。当时在跑的是旧安装版 0.11.0,
+它的控制台仍显示「Science 运行中」和 Kimi 模式,没有任何提示。
+
+把这份真实的 status 输出原样喂给 0.12.0 的构建(除版本号外代码与 `main@0513908` 相同;隔离的临时 HOME,
+status 由包装脚本转述),`/control/status` 给出 `science.unmanaged = {"reason": "port"}`。
+这个真实场景是靠**端口**认出来的。`app-child` 在这次观察里没有出现:它的依据仍只是对 0.1.72 的静态分析
+(以 `--stdio` 启动时报这个值),「桌面 App 拉起」不等于 `app-child`。
+
+这一轮的边界:
+
+- 隔离验收里的 status 输出全部来自替身;只有一份是真实实例输出的原样转述。
+- 晚间的真实场景里,新构建没有直接面对那个 daemon:判定是用转述的 status 输出重放的,只记录了 `/control/status` 的结果。
+- 未执行:真实的 `app-child` 样本;手动 `serve --port 8686` 起的 daemon(已知识别不出);只有 frame 在跑时切换
+  「跳过审批」;用真实 Science 的子 agent 造出「只有 frame 在跑」。
+
+前提:服务起在隔离的临时 HOME 与临时端口上;`CLAUDE_SCIENCE_BIN` 指向一个按需转述 status 输出的替身
+(真实输出的形状见 `test/run_loopback.sh` 的假 `claude-science`)。不要让被测服务去停用户真实的 Science。
+
+1. 替身报 8686 + `launchd`、两个计数都是 0。
+   判据:`/control/status` 里没有 `unmanaged`;控制台没有提示行。
+2. 替身报其它端口(如 8000、8765)。
+   判据:`science.unmanaged.reason` 是 `port`;「当前连接」卡片出现「Science 不是经 CSSwitch 启动的,当前选择没有生效。
+   先「停止」再「启动 Science」。」;等一个轮询周期,恢复成 8686 后提示消失。
+3. 替身报 `launch_context: "app-child"`。判据:`reason` 是 `app`。
+4. 把一台经 CSSwitch 启动的真实 Science 的 status 输出原样喂进来。判据:没有 `unmanaged`。
+5. 替身报 `active_frames > 0`、`active_conversations == 0`,依次切换模式、联网搜索、跳过审批。
+   判据:都弹确认框,文案里的数字是 frame 数;取消后配置文件哈希不变,替身没有收到 stop / serve。
+6. 真机上遇到 Science 被别的方式拉起时(例如重启后由桌面 App 拉起),记下 `status` 输出里的 `port` 与
+   `daemon.launch_context`,补进上面的记录。
+
+## L. 请求日志的调用类型
+
+离线门禁证明的是:按真实格式构造的 `metadata.user_id` 能被认出,relay 明细行在 `rules=` 之前带 `lane=`,
+控制面条目带 `detail.lane`,会话与 frame 的 id 不出现(合同见 [request-log](../openspec/specs/request-log/spec.md))。
+真实 Science 发出的请求是不是这个格式、一条消息带出哪些调用,只有真机能回答。
+
+**已有的真机记录(2026-11-18,真实 Science 0.1.72 发出的流量 + 假上游,临时目录里的隔离免登录沙箱;被测的是四个分支
+合并后的开发构建,代码与 `main@0513908` 一致,不是安装版):**
+
+| 观察 | 结果 |
+| --- | --- |
+| 一条消息带出的请求 | 4 次,网关日志依次是 `lane=ttl`、`lane=main`、`lane=sniff`、`lane=ttl`,与假上游一侧独立推导的结果一致 |
+| 控制台「请求日志」 | 显示「后台·标题」「主对话」「后台·结束判断」 |
+| 服务日志与控制面接口 | 搜不到 32 位十六进制的 id |
+
+这一轮的边界:
+
+- 只在沙箱入口(第三方渠道)看过。官方直通一侧没有真机记录,也没有离线的整链路测试。
+- 子任务、保活、分支与其它代号这一轮没有出现。
+- 开着 thinking 的缓存保活(`max_tokens` 不是 1)认不出,会显示成主对话(已知)。
+
+前提:「记录请求日志」保持开启;每一步用**全新会话**。
+
+1. 发一条消息。判据:每条 relay 明细行在 `rules=` 之前有 `lane=`;用户那一轮是 `lane=main`;
+   控制台在「实例 · 渠道」后面显示对应的标签。
+2. 让它起一个子 agent。判据:子 agent 自己那几轮(不带代号)的请求是 `lane=sub`,控制台显示「子任务」。
+3. 在服务日志与 `/control/logs` 里搜 32 位十六进制串。判据:搜不到。
+4. 关掉「记录请求日志」再发一条。判据:没有新的明细行与新的条目。
+
+## M. 控制台窄窗口
+
+`cargo test` 不覆盖 HTML/CSS,窄窗口布局只能在浏览器里看(合同见 [console-webui](../openspec/specs/console-webui/spec.md)
+「窄窗口按组换行」)。
+
+**已有的记录(2026-11-18):**
+
+- 无头浏览器(隔离环境,不是真机):360 / 480 / 600 / 900 / 1200 px 五个宽度、Science 未运行 / 运行中 / 未安装三种状态
+  下截图并断言 —— 无横向滚动,无元素越出卡片;600 px 下三个操作按钮同在一行;900 / 1200 px 下各元素坐标与改动前一致。
+- 真机:四个分支合并后的开发构建(代码与 `main@0513908` 一致,不是安装版),在约 614 px 宽的浏览器面板里实看
+  (当时显示着归属提示):三个按钮同在一行,「退出服务」靠右,无横向滚动。
+
+这一轮的边界:真机只看了一个宽度;「沙箱运行中」状态没有截图。
+
+1. 窗口约 600 px 宽。判据:「启动 Science」「停止」「打开 Science」同在一行,「退出服务」靠右,无横向滚动。
+2. 窄于 600 px(如 480、360 px)。判据:两组模式卡片都是单列;无横向滚动;没有元素越出卡片。
+3. 900 px 及以上。判据:各元素的位置与改动前一致(模式卡片仍是三列 / 两列)。
+4. 沙箱运行中重复第 1、2 步(未执行过)。
