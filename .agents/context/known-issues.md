@@ -51,7 +51,7 @@
 - 上游不实现 Anthropic `document` 内容块（控制组判定为解析器未知块分支）。该块是 Science 平台 PDF 视觉通道的载荷，故**该平台路径在本渠道不可用**；CSSwitch 替换为署名占位文本保住该轮。读 PDF 仍可行：Agent 渲染页面为 `image` 块传入。占位文本必须署名来源（未署名时模型曾把正确结论当编造撤回）。
 - 已在最终 bridge release 上分别验证 `k3`、`k3-256k`、`kimi-for-coding` 的搜索、同会话不联网追问与整页重载（2026-08-20 内置浏览器）。未知模型、图片/视频输入、原生流式结构化输出未验证。
 - **K3-256k 搜索慢已定性为上游 256k 服务池属性，非桥接开销**（2026-08-20 补正，此前"首字节延迟为已知代价"的说法不准确）：同题受控对比（宇树股价），差距全部在 nested（上游执行搜索）那一跳——`k3-256k` main 7.5s + nested 56.7s ≈ 64s，`k3` main 6.1s + nested 13.5s ≈ 20s；多次观测 `k3` nested 稳定 8–15s，`k3-256k` nested 在 15s / 26s / 57s / 100s+ 间波动。桥接固有代价只有"首字节 ≈ main 时长"（约 6–10s），对三个模型相同。网关无法改变单次上游调用时长；nested 执行端点可指定是唯一调节点（产品决策，未动）。已向 Kimi 官方反馈。
-- 真机验收细节与逐条判据见 [test/LIVE_ACCEPTANCE.md](../../test/LIVE_ACCEPTANCE.md)；本轮修复的任务证据在 `docs/evidence/08-19-kimi-search-hang/`。
+- 真机验收细节与逐条判据见 [test/LIVE_ACCEPTANCE.md](../../test/LIVE_ACCEPTANCE.md)；本轮修复的任务证据在 `openspec/evidence/08-19-kimi-search-hang/`。
 
 ## 测试
 

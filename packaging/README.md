@@ -71,7 +71,7 @@ bash packaging/icon/build_icon.sh              # 需要 Google Chrome(无头渲�
 
 ## 宣传图
 
-[brand/](brand/) 里是 `docs/assets/social-preview.png`(1280×640,README 页首)的源文件:
+[brand/](brand/) 里是宣传图 `social-preview.png`(1280×640,README 页首)和它的源文件:
 
 ```bash
 bash packaging/brand/build.sh   # 需要 Google Chrome

@@ -4,7 +4,7 @@
 
 v0.8.0 之后请从以下入口判断当前状态：
 
-- 维护文档：[文档总入口](../../docs/README.md)
+- 维护文档：[文档总入口](../../openspec/README.md)
 - 当前版本：[当前发布快照](current-release.md)
 - 已建立与未建立的层：[v0.8.0 发布证据](../../docs/evidence/releases/v0.8.0.md)
 - 当前缺口：[已知问题](known-issues.md)

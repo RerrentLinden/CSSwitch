@@ -1,6 +1,6 @@
 # CSSwitch
 
-![CSSwitch:给 Claude Science 换模型供应商](docs/assets/social-preview.png)
+![CSSwitch:给 Claude Science 换模型供应商](packaging/brand/social-preview.png)
 
 给 [Claude Science](https://claude.com) 换模型供应商的本地小工具:官方 Claude、
 Kimi、DeepSeek 三选一,配置在浏览器里点,对话仍然留在你自己的 Science 实例里。
@@ -167,7 +167,7 @@ bash packaging/build_app.sh   # 从干净的 commit 构建 dist/CSSwitch.app 与
 
 真机验收(官方登录、真实 provider key、工具轮次)见 [test/LIVE_ACCEPTANCE.md](test/LIVE_ACCEPTANCE.md)。
 
-架构总览见 [docs/](docs/README.md),行为规格与开发约定见 [openspec/](openspec/specs/);Agent 规则见 [AGENTS.md](AGENTS.md)。
+架构总览、行为规格、开发约定与任务证据都在 [openspec/](openspec/README.md);Agent 规则见 [AGENTS.md](AGENTS.md)。
 
 ## 致谢与开源协议
 

@@ -5,7 +5,7 @@
 CSSwitch 是一个本地 Rust 服务进程，把用户自己的 Claude Science 实例的推理流量转到官方 Anthropic、Kimi 或 DeepSeek，并在必要处做窄补偿。
 本规格约束这个进程对外的路由表、三种模式各自怎么转发、两个实例怎么各走各的、CONNECT 隧道，以及上游失败与凭证的处理。
 改动 `control.rs` 的路由、`server.rs` 的模式分支与上游失败的回复、`connect.rs` 或 `messages.rs` 的错误处理时适用。
-总览见 [docs/ARCHITECTURE.md](../../../docs/ARCHITECTURE.md)。
+总览见 [ARCHITECTURE.md](../../ARCHITECTURE.md)。
 
 ## Requirements
 

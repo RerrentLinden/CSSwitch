@@ -40,22 +40,22 @@ Science daemon 由服务用 CLI 拉起,两个实例拿到的 base_url 不同,网
 
 ## 往哪里看
 
-行为合同在 [`openspec/specs/`](../openspec/specs/),每个能力一个目录:`spec.md` 是需求与场景,
+行为合同在 [`openspec/specs/`](specs/),每个能力一个目录:`spec.md` 是需求与场景,
 `design.md` 是由来、实测证据、必需测试与反例。
 
 | 想了解 | 能力 |
 | --- | --- |
-| 路由表、三种模式、CONNECT 隧道、上游失败与凭证的处理 | [gateway-routing](../openspec/specs/gateway-routing/spec.md) |
-| 官方实例的启动参数、环境、切换与退出 | [official-science-instance](../openspec/specs/official-science-instance/spec.md) |
-| 镜像配置、联网搜索总开关(Science 一侧) | [science-launch-overrides](../openspec/specs/science-launch-overrides/spec.md) |
-| 免登录沙箱、两个实例各选各的 | [sandbox-science-instance](../openspec/specs/sandbox-science-instance/spec.md) |
-| 四槽、模型名解析、模型清单 | [model-menu](../openspec/specs/model-menu/spec.md) |
-| Kimi 渠道的契约与补偿 | [kimi-channel](../openspec/specs/kimi-channel/spec.md) |
-| Kimi 联网搜索的桥接、配对键与尾随上下文 | [kimi-web-search-bridge](../openspec/specs/kimi-web-search-bridge/spec.md)、[kimi-search-pair-adoption](../openspec/specs/kimi-search-pair-adoption/spec.md)、[kimi-context-tail-reorder](../openspec/specs/kimi-context-tail-reorder/spec.md) |
-| DeepSeek 渠道的契约与补偿 | [deepseek-channel](../openspec/specs/deepseek-channel/spec.md) |
-| 补偿的通用规则、Science 发出的消息形状 | [provider-compensation](../openspec/specs/provider-compensation/spec.md) |
-| 向 SSE 流注入内容块 | [sse-block-injection](../openspec/specs/sse-block-injection/spec.md) |
-| 安装版、启动器、日志落盘 | [installed-app-launcher](../openspec/specs/installed-app-launcher/spec.md) |
-| 请求日志 | [request-log](../openspec/specs/request-log/spec.md) |
-| 配置文件 | [config-storage](../openspec/specs/config-storage/spec.md) |
-| 控制台 | [console-webui](../openspec/specs/console-webui/spec.md) |
+| 路由表、三种模式、CONNECT 隧道、上游失败与凭证的处理 | [gateway-routing](specs/gateway-routing/spec.md) |
+| 官方实例的启动参数、环境、切换与退出 | [official-science-instance](specs/official-science-instance/spec.md) |
+| 镜像配置、联网搜索总开关(Science 一侧) | [science-launch-overrides](specs/science-launch-overrides/spec.md) |
+| 免登录沙箱、两个实例各选各的 | [sandbox-science-instance](specs/sandbox-science-instance/spec.md) |
+| 四槽、模型名解析、模型清单 | [model-menu](specs/model-menu/spec.md) |
+| Kimi 渠道的契约与补偿 | [kimi-channel](specs/kimi-channel/spec.md) |
+| Kimi 联网搜索的桥接、配对键与尾随上下文 | [kimi-web-search-bridge](specs/kimi-web-search-bridge/spec.md)、[kimi-search-pair-adoption](specs/kimi-search-pair-adoption/spec.md)、[kimi-context-tail-reorder](specs/kimi-context-tail-reorder/spec.md) |
+| DeepSeek 渠道的契约与补偿 | [deepseek-channel](specs/deepseek-channel/spec.md) |
+| 补偿的通用规则、Science 发出的消息形状 | [provider-compensation](specs/provider-compensation/spec.md) |
+| 向 SSE 流注入内容块 | [sse-block-injection](specs/sse-block-injection/spec.md) |
+| 安装版、启动器、日志落盘 | [installed-app-launcher](specs/installed-app-launcher/spec.md) |
+| 请求日志 | [request-log](specs/request-log/spec.md) |
+| 配置文件 | [config-storage](specs/config-storage/spec.md) |
+| 控制台 | [console-webui](specs/console-webui/spec.md) |
