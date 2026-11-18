@@ -37,3 +37,90 @@ match body.get("tool_choice") {
 body.get("tool_choice").and_then(Value::as_object)
     .and_then(|c| c.get("type")).and_then(Value::as_str) == Some("tool")
 ```
+
+## 背景：Science 发出的消息长什么样
+
+Claude Science 说的是 Anthropic Messages 协议。第三方端点自称"Anthropic 兼容",
+但兼容层各有缺口。这一节与下一节讲清两件事:**Science 到底发出什么形状的消息**,
+以及 **CSSwitch 在中间把哪些形状改成了上游能接受的样子**。
+
+一次请求的 body 是一棵三层的树:
+
+```
+请求 body
+├── model / max_tokens / stream
+├── thinking          ← Science 发非标准的 {"type":"auto"}
+├── tools[]           ← 客户端工具与服务端工具混在一起
+├── tool_choice       ← 多数轮次不带;分类器调用带 {"type":"tool"}
+└── messages[]        ← 完整历史,每轮都要重发一遍
+    └── content[]     ← 块的数组,全部复杂度所在
+```
+
+关键认知:**API 是无状态的**。服务端不记得上一轮,`messages[]` 每次都要带上完整
+历史。所以历史里任何一处结构损坏,都不是"这一轮失败",而是**此后每一轮都失败**。
+
+### content[] 里会出现的块
+
+| 块类型 | 谁产生 | 用途 |
+| --- | --- | --- |
+| `text` | 双方 | 普通文本 |
+| `thinking` | 模型 | 推理过程,带 `signature` |
+| `tool_use` | 模型 | 请求调用客户端工具,带 `id` |
+| `tool_result` | 客户端 | 工具执行结果,带 `tool_use_id` |
+| `server_tool_use` | 模型 | 请求服务端执行(如 web_search) |
+| `web_search_tool_result` | **服务商** | 服务端搜索结果 |
+| `image` | 客户端 | 图片 |
+| `document` | 客户端 | PDF 等附件 —— **Science 的平台视觉通道** |
+
+### 工具调用横跨两条消息
+
+```mermaid
+sequenceDiagram
+    participant M as 模型
+    participant C as Science 客户端
+    M->>C: assistant [thinking, tool_use id=tu_01]
+    Note over C: 本地执行 bash / python
+    C->>M: user [tool_result tool_use_id=tu_01]
+    M->>C: assistant [text 最终回答]
+```
+
+`tool_use.id` 与 `tool_result.tool_use_id` **必须一一配对**。第三方端点内部会把
+消息转成 OpenAI 格式,那边的 `tool_call_id` 配对是硬约束,落单直接 400。
+
+服务端工具不同:它由**服务商执行**,客户端只是旁观者,两个块都落在 assistant 消息里:
+
+```
+assistant: [ server_tool_use id=srv_01 name=web_search input={query},
+             web_search_tool_result tool_use_id=srv_01 content=[...] ]
+```
+
+## CSSwitch 在中间做了什么
+
+```mermaid
+flowchart LR
+    S[Claude Science] -->|ANTHROPIC_BASE_URL| G[CSSwitch 网关]
+    G --> R{模式}
+    R -->|官方| A[api.anthropic.com 零改写直通]
+    R -->|Kimi| K[api.kimi.com/coding]
+    R -->|DeepSeek| D[api.deepseek.com/anthropic]
+```
+
+官方模式**逐字节直通**,不做任何补偿——官方 API 就是协议本身,没有缺口可补。
+第三方模式才进入补偿链。
+
+补偿有三条铁律:
+
+- **窄**:只改上游确实会拒收的组合,能过的原样送;
+- **可见**:每条补偿有规则 ID,日志里能看到哪条生效;
+- **失败显式**:补不了就把上游错误原样交回,不伪造成功。
+
+## 补偿链
+
+补偿都是窄规则,统一形态:端点/flavor 门控 + 规则 ID + 单测。
+命中的规则会打进请求日志,便于判断"哪条在起效"。
+
+- Kimi:`anthropic_compat.rs`(请求侧)+ `kimi_search_noise.rs`
+  (搜索轮响应侧:噪声头 / 幻影对剥离、配对键采钥)
+- DeepSeek:`deepseek_compat.rs`
+- 策略(如 thinking 政策)来自 provider contract,不靠环境变量传递。
+  环境变量只作显式 override 并留日志。

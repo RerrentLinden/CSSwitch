@@ -1,7 +1,7 @@
 # 打包
 
 把 CSSwitch 打成可以拖进「应用程序」的 macOS 应用。设计与合同见
-[docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)「安装版与启动器」,发布规则见
+[installed-app-launcher](../openspec/specs/installed-app-launcher/spec.md),发布规则见
 [.agents/rules/release.md](../.agents/rules/release.md)。
 
 ## 构建

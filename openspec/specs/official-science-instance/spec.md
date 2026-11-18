@@ -48,7 +48,8 @@ CSSwitch 接管的是**用户自己的** Claude Science 实例、自己的登录
 ### Requirement: 跳过审批参数跟随总开关
 
 `--dangerously-skip-approvals` MUST 只在「跳过审批」总开关开着时追加在末尾（两个实例同一个值，`science::SKIP_APPROVALS_FLAG` 只定义一次）。
-这是用户明确要的 bypass 模式；关着时参数逐项不变。它不进镜像、不影响 `needs_mirror()`。
+这是用户明确要的 bypass 模式（Science 官方开关，权限卡一律自动批准）；总开关 `skip_approvals` 默认关，关着时参数逐项不变。
+它不进镜像、不影响 `needs_mirror()`。切换规矩与联网搜索总开关相同。
 
 #### Scenario: 跳过审批总开关开着
 
@@ -64,6 +65,7 @@ CSSwitch 接管的是**用户自己的** Claude Science 实例、自己的登录
 
 `--port` / `--sandbox-port` MUST 固定 8686 / 8687。不用 `0`（控制台地址要稳定可收藏），也不沿用 Science 默认的 8000 / 8001
 （常被本机其它开发服务占用）；两个端口都 MUST 显式给出，不依赖「port+1」的推导。
+手动 `claude-science serve` 仍用 Science 自己的默认 8000，与经 CSSwitch 启动的地址不同；两者都绑 loopback。
 
 #### Scenario: 启动官方实例
 
@@ -151,7 +153,7 @@ daemon 未运行时执行 stop SHALL 视为成功（stderr 含 not running / no 
 
 ### Requirement: 退出服务先停实例
 
-退出服务（`/control/quit`）MUST 先并行停掉**正在运行的**官方实例与沙箱，再退出进程。
+退出服务（`/control/quit`，控制台按钮与 `./csswitch stop` 共用）MUST 先并行停掉**正在运行的**官方实例与沙箱，再退出进程。
 未安装 / 未运行不算失败；沙箱未运行时不碰其目录；停止失败 MUST NOT 拦截退出，原文随响应的 `errors` 返回。
 
 #### Scenario: 两个实例都在运行
@@ -168,3 +170,8 @@ daemon 未运行时执行 stop SHALL 视为成功（stderr 含 not running / no 
 
 - **WHEN** 某个实例停止失败
 - **THEN** 服务仍然退出，失败原文在响应的 `errors` 里
+
+#### Scenario: 终端里按 Ctrl-C
+
+- **WHEN** 用户在终端里用 Ctrl-C 结束服务进程
+- **THEN** 只有服务进程结束，实例不被停止

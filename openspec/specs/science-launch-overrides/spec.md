@@ -131,6 +131,7 @@ Science 自己配置里的任何值（包括手写的 `enable_web_search = false
 ### Requirement: 镜像安全写出
 
 镜像带着用户原配置的全部内容。写出 MUST 走同目录临时文件 → `0600` → rename，所在目录 MUST 是 `0700`。
+`~/.csswitch/science-config/` 是派生文件，可直接删除。
 
 #### Scenario: 镜像的权限
 
@@ -195,6 +196,11 @@ MUST NOT 写镜像，MUST NOT 回退成空配置。报错给路径、行列与�
 
 - **WHEN** 开关切换成功而免登录沙箱在运行
 - **THEN** 沙箱不被自动重启，响应里 `sandbox_restart_required` 为真
+
+#### Scenario: 官方模式下关闭
+
+- **WHEN** 正式实例处于官方模式，总开关被关闭
+- **THEN** 关闭效果完全来自 Science 一侧的镜像配置，网关的零改写直通不变
 
 #### Scenario: 关闭开关后 Science 起不来
 

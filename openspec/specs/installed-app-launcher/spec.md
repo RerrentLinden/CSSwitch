@@ -57,6 +57,16 @@ MUST NOT 加 shell 脚本主可执行文件（签名存在扩展属性里，拷�
 - **WHEN** 带显式子命令运行，同时 `CSSWITCH_APP_LAUNCH=1`
 - **THEN** 子命令优先
 
+#### Scenario: launch 子命令
+
+- **WHEN** 以 `launch` 子命令运行
+- **THEN** 它是启动器（供终端与测试显式调用）
+
+#### Scenario: --version
+
+- **WHEN** 以 `--version` 运行
+- **THEN** 打印版本号后退出
+
 #### Scenario: 启动器拉起服务
 
 - **WHEN** 启动器拉起服务进程
@@ -131,6 +141,16 @@ MUST NOT 加 shell 脚本主可执行文件（签名存在扩展属性里，拷�
 
 - **WHEN** 登录 shell 超时、非零退出，或输出里没有标记（或标记后面不是 NUL）
 - **THEN** 那个 shell 被结束，日志写原因，沿用继承环境照常启动，而不是当成空环境
+
+#### Scenario: 环境里没有 SHELL
+
+- **WHEN** 环境里没有 `SHELL`
+- **THEN** 用 `/bin/zsh` 读取登录 shell 环境
+
+#### Scenario: 登录 shell 超过 5 秒
+
+- **WHEN** 登录 shell 5 秒内没有返回
+- **THEN** 它被结束，启动继续
 
 ### Requirement: 安装版日志落盘与轮转
 
@@ -227,3 +247,54 @@ fd 重定向之后外部改名不改变进程在写的文件；按路径量大�
 
 - **WHEN** `gen.py` 的图形被修改
 - **THEN** 三张 SVG、`AppIcon.icns` 与控制台里的内联图形一并更新
+
+### Requirement: 启动器拉起服务的流程
+
+启动器 MUST 从 `service.v1.json` 取端口（默认 8788），以 `<自己> serve --port N --log-file ~/.csswitch/service.log` 拉起服务：
+stdin 接 `/dev/null`，stdout / stderr 接日志文件（追加），`setsid` 脱离启动器。随后每 200 ms 查一次状态，最长 10 秒；子进程提前退出即失败。
+启动器在 exec 之前 MUST 把这两个 fd 接到日志文件，参数解析失败、panic 这类最早期的输出不会丢。
+
+#### Scenario: 服务就绪
+
+- **WHEN** 拉起的服务在 10 秒内就绪
+- **THEN** 启动器打开控制台并以 0 退出
+
+#### Scenario: 子进程提前退出
+
+- **WHEN** 拉起的服务在就绪前退出
+- **THEN** 启动失败，提示原因、日志路径与日志最后一行，退出 1
+
+### Requirement: 提示框只在两种情况出现
+
+提示 MUST 只出现在两种情况：服务起不来、版本不一致。提示用 `display alert`，120 秒无人理会 MUST 自动消失，启动器不会一直挂着。
+版本不一致时 SHALL 提示用户到控制台「退出服务」后重新打开。
+
+#### Scenario: 提示框无人理会
+
+- **WHEN** 提示框 120 秒没有人点
+- **THEN** 提示框自动消失，启动器继续退出
+
+#### Scenario: 版本不一致的提示
+
+- **WHEN** 后台服务的版本与应用不同
+- **THEN** 提示内容是到控制台「退出服务」后重新打开
+
+### Requirement: 版本号的流向
+
+版本号只有一个来源 `desktop/gateway/Cargo.toml`。它 MUST 流向 `--version`、状态接口的 `version`、控制台页眉，
+以及构建脚本写进 Info.plist 的两个版本键。
+
+#### Scenario: 改了版本号后构建
+
+- **WHEN** `Cargo.toml` 的版本号被修改并重新构建
+- **THEN** `--version`、状态接口、控制台页眉与 Info.plist 显示同一个新版本
+
+### Requirement: 签名与分发
+
+应用 MUST 是 ad-hoc 签名（`codesign --sign -`），架构跟随构建机。没有 Developer ID 签名与公证，
+经下载分发时首次打开需要用户在系统设置里放行。
+
+#### Scenario: 下载后首次打开
+
+- **WHEN** 用户首次打开经下载得到的应用
+- **THEN** 需要先在系统设置里放行

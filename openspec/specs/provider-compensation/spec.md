@@ -9,6 +9,20 @@
 
 ## Requirements
 
+### Requirement: 补偿的统一形态
+
+补偿 MUST 都是窄规则，统一形态：端点 / flavor 门控 + 规则 ID + 单测。命中的规则 MUST 打进请求日志，便于判断「哪条在起效」。
+
+#### Scenario: 一条补偿命中
+
+- **WHEN** 请求命中某条补偿
+- **THEN** 请求日志里有这条补偿的规则 ID
+
+#### Scenario: 兄弟渠道的请求
+
+- **WHEN** 请求走的是另一个 provider
+- **THEN** 这条补偿不生效
+
 ### Requirement: 判据等于实测拒收边界
 
 补偿的判据 MUST 由实测边界决定。从其它项目移植语义时，MUST 独立复测边界再落判据；

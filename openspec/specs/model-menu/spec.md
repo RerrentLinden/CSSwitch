@@ -6,7 +6,7 @@
 用户选的模型与实际到达的模型就不是同一个。本规格约束清单的组成、默认条目、显示名与解析的一致性。
 改动 `static_profile.rs` 的 `models_response` / `MENU_POSITIONS`，或 `/v1/models`（含 `/sandbox/v1/models`）返回的任何字段时适用。
 
-Science 一侧的依据（0.1.60，只读静态检查，出处见 `docs/ARCHITECTURE.md`「模型解析」）：
+Science 一侧的依据（0.1.60，只读静态检查，出处见 [design.md](./design.md)「模型解析」）：
 
 - 主菜单三个位置按 id 的写法分配：`claude-opus*` / `claude-sonnet*` / `claude-haiku*` 各取能被
   `^claude-(opus|sonnet|haiku)-N(-M)?(-YYYYMMDD)?$` 解析的最新一条；其余进 More models。
@@ -15,6 +15,38 @@ Science 一侧的依据（0.1.60，只读静态检查，出处见 `docs/ARCHITEC
   （2026-10-10 真机确认 `k3-256k`）。
 
 ## Requirements
+
+### Requirement: 四槽生成静态模型目录
+
+用户为每个渠道填四个槽（默认 / 高质量 / 快速 / Fable），每槽是「上游模型 ID + 显示名」，空槽继承默认槽。
+服务 MUST 据此生成一份静态模型目录：每个不同的模型 ID 产出一条 route，selector 形如 `claude-csswitch-<model-id>`；
+四个角色绑到对应 selector：默认槽 = sonnet，高质量 = opus，快速 = haiku，Fable = fable。
+目录 MUST 带指纹校验，生成与解析共用同一套算法。
+
+#### Scenario: 空槽
+
+- **WHEN** 高质量、快速或 Fable 槽留空
+- **THEN** 该槽的角色绑定到默认槽的模型
+
+#### Scenario: 两个槽填同一个模型
+
+- **WHEN** 两个槽的模型 ID 相同
+- **THEN** 目录里只有一条 route，两个角色都绑到它
+
+### Requirement: 模型名的解析顺序
+
+请求里的模型名 MUST 按这个顺序解析（`StaticProfileResolver::resolve`）：精确 selector → 历史别名 →
+`claude-<opus|sonnet|haiku|fable>-<版本>` 这种写法按家族名落到角色绑定。
+
+#### Scenario: Science 的辅助调用
+
+- **WHEN** Science 的辅助调用用官方名字（如 `claude-haiku-4-5-20251001`）发来请求
+- **THEN** 请求按家族名落到快速槽的模型
+
+#### Scenario: 精确 selector
+
+- **WHEN** 请求的 model 是某条 route 的 selector
+- **THEN** 直接解析到这条 route
 
 ### Requirement: 清单按位置去重组成
 

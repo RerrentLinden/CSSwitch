@@ -197,7 +197,7 @@ Kimi 与 DeepSeek 两个渠道都已填好 Key;「记录请求日志」保持开
    `正式 · official` 与 `沙箱 · kimi` 的条目,沙箱的条目没有错误。
    若沙箱的请求在日志里记成了 `正式 · …`,或沙箱里直接报错而日志里没有 `沙箱 · …` 的条目:
    Science 没有按带前缀的 base_url 发请求。记下 Science 版本并停在这里,备选方案见
-   [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)「两个实例各选各的」。
+   [sandbox-science-instance](../openspec/specs/sandbox-science-instance/design.md)「两个实例各选各的」。
 2. 沙箱运行中,在沙箱卡片点 DeepSeek,在确认框里**取消**。
    判据:弹出了确认框;取消后选中态仍是 Kimi,沙箱没有重启(原来的会话还能继续),
    `./csswitch status` 里的沙箱渠道仍是 Kimi。

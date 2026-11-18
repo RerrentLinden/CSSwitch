@@ -76,3 +76,80 @@ match args.get(1).map(String::as_str) {
 // 启动器拉起服务:显式 serve + 移除变量
 command.args(["serve", "--port", &port, "--log-file"]).arg(log).env_remove(APP_LAUNCH_ENV);
 ```
+
+## 应用包与入口
+
+`bash packaging/build_app.sh` 产出的应用包只有三样东西:
+
+```text
+CSSwitch.app/Contents/
+├── Info.plist             LSUIElement=true(不进 Dock)
+│                          LSEnvironment: CSSWITCH_APP_LAUNCH=1
+├── MacOS/CSSwitch         csswitch-gateway 二进制本身,包内唯一的可执行文件
+└── Resources/AppIcon.icns
+```
+
+同一个二进制既是启动器也是服务,由入口区分(`main.rs`):
+
+| 调用方式 | 角色 |
+| --- | --- |
+| 无参数,且环境里 `CSSWITCH_APP_LAUNCH=1` | 启动器 |
+| `launch` | 启动器(同上,供终端与测试显式调用) |
+| `--version` | 打印版本号后退出 |
+| 无参数 / `serve [--port N] [--log-file PATH]` | 前台服务 |
+| `official-passthrough …` 及其余 | 不变 |
+
+`CSSWITCH_APP_LAUNCH` 只由 Info.plist 设置,而且只在没有参数时起作用;启动器拉起服务时显式带
+`serve` 并把这个变量从子进程环境里去掉。不用「可执行文件是否在 `.app` 里」来判断:那是隐式约定,
+从终端直接运行包内二进制时行为会与预期相反。
+
+## 启动流程与细节
+
+**启动器做完就退出**(`launcher.rs`)。LaunchServices 以「应用主进程是否还活着」判断应用是否在
+运行;主进程若就是常驻服务,第二次双击不会再执行任何代码,控制台也就打不开。流程:
+
+```text
+1. 端口取自 service.v1.json(默认 8788)
+2. GET /control/status(回环,不走代理;连接超时 1 秒,等回话最长 5 秒)
+     是 CSSwitch 的状态 ─┬ version 与自己相同 → 打开控制台 → 退出 0
+                         └ 不同或没有        → 提示先退出旧服务 → 打开控制台 → 退出 0
+     连不上 / 不是 CSSwitch → 继续
+3. 读登录 shell 的环境,按白名单并进子进程环境
+4. 拉起 <自己> serve --port N --log-file ~/.csswitch/service.log
+     stdin=/dev/null;stdout / stderr=日志文件(追加);setsid 脱离启动器
+5. 每 200 ms 查一次,最长 10 秒;子进程提前退出即失败
+     就绪 → 打开控制台 → 退出 0
+     失败 → 提示框(原因、日志路径、日志最后一行)→ 退出 1
+```
+
+- **登录 shell 环境**:从 Finder 启动的进程只有 launchd 的环境(PATH 只有系统目录,没有 shell 里
+  配置的代理)。网关的上游请求只认环境变量代理,免登录沙箱按 PATH 找本机 `gh` —— 不处理的话,
+  安装版会比 `./csswitch` 悄悄少功能。取法是 `$SHELL -l -i -c 'printf "%s\0" <标记>; /usr/bin/env -0'`
+  (`SHELL` 缺失时用 `/bin/zsh`,独立会话,5 秒超时即结束),只解析标记之后的内容,只导入
+  `PATH`、`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 及其小写形式、`CLAUDE_SCIENCE_BIN`;
+  shell 里有就覆盖继承值(置空也算有),没有就保留继承值。`ANTHROPIC_*` 等模型与凭证类变量不导入。
+  超时、非零退出、找不到标记都不终止启动:沿用继承环境,并在日志里写明原因。日志只记导入了
+  哪些变量名,不记值(代理地址可能带口令)。
+- **什么算「服务已在跑」**:状态接口回 200、是 JSON 且有字符串 `mode`。别的程序占着端口时
+  不算,启动器照常去拉起服务,由它撞上端口并把系统的原始报错带进提示框。
+  没有监听时回环连接立刻被拒,不会等;连上之后给 5 秒,是因为状态接口要先执行一次
+  `claude-science status` 才回话,冷启动时可能超过一秒 —— 等得太短会把正在运行的服务判成
+  没在跑,随后的拉起必然因端口被占而失败。
+- **版本不一致**:服务常驻后台,换了新版应用再双击,连上的仍是旧服务。状态接口带 `version`
+  (`CARGO_PKG_VERSION`),启动器比对;不同、或更早的服务根本不报告版本号,都提示用户到控制台
+  「退出服务」后重新打开。不自动重启:退出会停掉 Science 与沙箱、打断进行中的会话。
+- **打开控制台与提示**用 `/usr/bin/open` 与 `/usr/bin/osascript`(`display alert`,标题与正文经
+  argv 传入,不拼进脚本)。提示只出现在两种情况:服务起不来、版本不一致;提示框 120 秒无人
+  理会自动消失,启动器不会一直挂着。`CSSWITCH_APP_HELPER_DIR` 可把这两个命令换成别的目录里的
+  同名文件,只供隔离测试使用,生效时写日志。
+- **日志落盘**(`service_log.rs`):带 `--log-file` 的服务把自己的 stdout / stderr 接到该文件
+  (追加,0600,路径是符号链接时拒绝),并起一个后台线程每 60 秒检查一次正在写的那个文件,超过
+  5 MiB 就改名为 `service.log.1`(覆盖上一份)、0600 新建同名文件、`dup2` 到 fd 1 / 2。
+  所以上限是「5 MiB + 一分钟的写入量」再加一份历史。轮转必须在服务进程内做:fd 重定向之后,
+  外部改名不会改变进程正在写的文件。启动器在 exec 之前也把这两个 fd 接到同一个文件,
+  参数解析失败、panic 这类最早期的输出不会丢。不带 `--log-file` 时这些都不发生。
+- **版本号**只有一个来源:`desktop/gateway/Cargo.toml`。它流向 `--version`、状态接口的
+  `version`、控制台页眉,以及构建脚本写进 Info.plist 的两个版本键。
+
+应用是 ad-hoc 签名(`codesign --sign -`),bundle id `io.github.rerrentlinden.csswitch`,架构跟随
+构建机。没有 Developer ID 签名与公证,经下载分发时首次打开需要用户在系统设置里放行。

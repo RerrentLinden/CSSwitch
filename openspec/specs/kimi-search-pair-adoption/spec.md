@@ -49,7 +49,7 @@ Kimi 响应出现相邻的 `server_tool_use` + `web_search_tool_result` 时适�
 
 ### Requirement: 幻影对的判定
 
-两半都无键且 result 的 `content` **存在、为数组并显式 `[]`** 才是幻影对，SHALL 剥离整对。
+两半都无键且 result 的 `content` **存在、为数组并显式 `[]`** 才是幻影对，SHALL 剥离整对（规则 `provider.kimi.empty-search-pair-strip`）。
 字段缺失、null、string、object 等 schema 异常 MUST NOT 按空数组删除。带键的空结果是合法零结果搜索，MUST 保留。
 
 #### Scenario: 无键且结果是显式空数组
